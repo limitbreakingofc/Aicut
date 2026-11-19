@@ -43,13 +43,20 @@ pub struct HardwareProfile {
     pub total_memory_mb: u64,
     pub available_memory_mb: u64,
     pub gpus: Vec<GpuInfo>,
+    /// Maximum CUDA version supported by the installed NVIDIA driver (e.g. "13.2", "12.8").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cuda_version: Option<String>,
     pub recommended_accel: AccelBackend,
     pub recommendation_summary: String,
 }
 
 impl HardwareProfile {
-    /// Detects the host OS, CPU architecture, memory, and GPUs to select
-    /// the optimal builds for yt-dlp, FFmpeg, and future AI modules.
+    pub fn cuda_major_minor(&self) -> Option<(u32, u32)> {
+        self.cuda_version.as_deref().and_then(parse_major_minor)
+    }
+
+    /// Detects the host OS, CPU architecture, memory, GPUs, and CUDA version to select
+    /// the optimal builds for yt-dlp, FFmpeg, whisper.cpp, and future AI modules.
     pub fn detect() -> Self {
         let mut sys = System::new_all();
         sys.refresh_all();
@@ -84,8 +91,14 @@ impl HardwareProfile {
         let available_memory_mb = sys.available_memory() / (1024 * 1024);
 
         let gpus = detect_gpus(&os);
+        let cuda_version = if gpus.iter().any(|g| g.vendor == GpuVendor::Nvidia) {
+            detect_cuda_version()
+        } else {
+            None
+        };
         let recommended_accel = pick_recommended_accel(&os, &gpus);
-        let recommendation_summary = build_summary(&platform_tag, recommended_accel, &gpus);
+        let recommendation_summary =
+            build_summary(&platform_tag, recommended_accel, &gpus, cuda_version.as_deref());
 
         Self {
             os,
@@ -98,6 +111,7 @@ impl HardwareProfile {
             total_memory_mb,
             available_memory_mb,
             gpus,
+            cuda_version,
             recommended_accel,
             recommendation_summary,
         }
@@ -250,20 +264,83 @@ fn pick_recommended_accel(os: &str, gpus: &[GpuInfo]) -> AccelBackend {
     }
 }
 
-fn build_summary(platform_tag: &str, accel: AccelBackend, gpus: &[GpuInfo]) -> String {
+fn detect_cuda_version() -> Option<String> {
+    // 1. Primary: `nvidia-smi` reports the max CUDA version supported by the installed driver (e.g. "CUDA Version: 13.2")
+    let mut smi = Command::new("nvidia-smi");
+    crate::process::configure_std_command(&mut smi);
+    if let Ok(output) = smi.output() {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(ver) = parse_cuda_version_from_nvidia_smi(&stdout) {
+                return Some(ver);
+            }
+        }
+    }
+
+    // 2. Fallback: `nvcc --version` (CUDA Toolkit version if installed on PATH)
+    let mut nvcc = Command::new("nvcc");
+    crate::process::configure_std_command(&mut nvcc);
+    if let Ok(output) = nvcc.arg("--version").output() {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(idx) = stdout.find("release ") {
+                let rest = &stdout[idx + "release ".len()..];
+                let token = rest
+                    .split(|c: char| !c.is_ascii_digit() && c != '.')
+                    .next()
+                    .unwrap_or("")
+                    .trim_end_matches('.');
+                if parse_major_minor(token).is_some() {
+                    return Some(token.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn parse_cuda_version_from_nvidia_smi(text: &str) -> Option<String> {
+    let idx = text.find("CUDA Version:")?;
+    let rest = text[idx + "CUDA Version:".len()..].trim_start();
+    let token = rest
+        .split(|c: char| !c.is_ascii_digit() && c != '.')
+        .next()?
+        .trim_end_matches('.');
+    parse_major_minor(token)?;
+    Some(token.to_string())
+}
+
+pub fn parse_major_minor(version: &str) -> Option<(u32, u32)> {
+    let mut parts = version.trim().split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    Some((major, minor))
+}
+
+fn build_summary(
+    platform_tag: &str,
+    accel: AccelBackend,
+    gpus: &[GpuInfo],
+    cuda_version: Option<&str>,
+) -> String {
     let gpu_label = gpus
         .first()
         .map(|g| g.name.as_str())
         .unwrap_or("No dedicated GPU detected");
     match accel {
-        AccelBackend::CudaNvenc => format!(
-            "Profile {platform_tag} with NVIDIA GPU ({gpu_label}): prefers NVENC/CUDA-enabled tool builds."
-        ),
+        AccelBackend::CudaNvenc => {
+            let cuda_tag = cuda_version
+                .map(|v| format!(" · CUDA {v}"))
+                .unwrap_or_default();
+            format!(
+                "Profile {platform_tag} with NVIDIA GPU ({gpu_label}{cuda_tag}): automatically picks the highest compatible CUDA/NVENC tool builds."
+            )
+        }
         AccelBackend::AmfDirectml => format!(
-            "Profile {platform_tag} with AMD GPU ({gpu_label}): prefers AMF/DirectML-compatible tool builds."
+            "Profile {platform_tag} with AMD GPU ({gpu_label}): prefers AMF/DirectML/Vulkan-compatible tool builds."
         ),
         AccelBackend::QsvOpenvino => format!(
-            "Profile {platform_tag} with Intel GPU ({gpu_label}): prefers QuickSync/OpenVINO-compatible tool builds."
+            "Profile {platform_tag} with Intel GPU ({gpu_label}): prefers QuickSync/OpenVINO/Vulkan-compatible tool builds."
         ),
         AccelBackend::Metal => format!(
             "Profile {platform_tag} with Apple Silicon ({gpu_label}): prefers native ARM64/Metal builds."
@@ -293,5 +370,13 @@ mod tests {
         assert_eq!(classify_vendor("NVIDIA GeForce RTX 4080"), GpuVendor::Nvidia);
         assert_eq!(classify_vendor("AMD Radeon RX 7900 XTX"), GpuVendor::Amd);
         assert_eq!(classify_vendor("Intel(R) Arc(TM) A770"), GpuVendor::Intel);
+    }
+
+    #[test]
+    fn parses_cuda_version_from_nvidia_smi_banner() {
+        let banner = "| NVIDIA-SMI 580.12   Driver Version: 580.12   CUDA Version: 13.2     |";
+        let parsed = parse_cuda_version_from_nvidia_smi(banner).unwrap();
+        assert_eq!(parsed, "13.2");
+        assert_eq!(parse_major_minor(&parsed), Some((13, 2)));
     }
 }

@@ -222,11 +222,32 @@ impl ToolManager {
                 (build.to_string(), hw_note.to_string())
             }
             ToolInstallStrategy::WhisperCppOfficialRelease => match (tag, accel) {
-                ("win-x64", AccelBackend::CudaNvenc) => (
-                    "whisper.cpp Win64 CUDA 12 (GPU NVIDIA)".to_string(),
-                    "GPU NVIDIA detectada: seleciona build oficial CUDA 12 para transcrição ultrarrápida na GPU."
-                        .to_string(),
-                ),
+                ("win-x64", AccelBackend::CudaNvenc) => {
+                    let cuda_label = self
+                        .hardware
+                        .cuda_version
+                        .as_deref()
+                        .map(|v| format!("CUDA {v}"))
+                        .unwrap_or_else(|| "CUDA".to_string());
+                    (
+                        format!("whisper.cpp Win64 {cuda_label} (GPU NVIDIA)"),
+                        format!(
+                            "GPU NVIDIA ({cuda_label}) detectada: seleciona automaticamente a maior build CUDA compatível (≤ {cuda_label}) publicada."
+                        ),
+                    )
+                }
+                ("win-arm64", AccelBackend::CudaNvenc) => {
+                    let cuda_label = self
+                        .hardware
+                        .cuda_version
+                        .as_deref()
+                        .map(|v| format!("CUDA {v}"))
+                        .unwrap_or_else(|| "CUDA".to_string());
+                    (
+                        format!("whisper.cpp Win ARM64 {cuda_label}"),
+                        format!("Windows ARM64 com NVIDIA ({cuda_label}): seleciona a maior build CUDA compatível."),
+                    )
+                }
                 ("win-x64", AccelBackend::AmfDirectml | AccelBackend::QsvOpenvino) => (
                     "whisper.cpp Win64 Vulkan / OpenBLAS".to_string(),
                     "GPU AMD/Intel detectada: prefere build Vulkan se disponível ou OpenBLAS SIMD otimizado."
@@ -627,7 +648,12 @@ impl ToolManager {
                 .unwrap_or("latest")
                 .to_string();
 
-            if let Some((name, url, kind)) = select_best_whisper_asset(assets, tag, accel) {
+            if let Some((name, url, kind)) = select_best_whisper_asset(
+                assets,
+                tag,
+                accel,
+                self.hardware.cuda_major_minor(),
+            ) {
                 return Ok(ResolvedDownload {
                     url,
                     version,
@@ -710,11 +736,32 @@ impl ToolManager {
     }
 }
 
-/// Picks the optimal `whisper.cpp` binary asset from a GitHub release's asset list based on hardware.
+/// Extracts `(major, minor)` CUDA version from a release asset filename (e.g.
+/// `whisper-bin-win-cuda-13.4.0-x64.zip` -> `(13, 4)`, `whisper-cublas-12.4.0-bin-x64.zip` -> `(12, 4)`).
+pub fn parse_cuda_version_from_asset(filename: &str) -> Option<(u32, u32)> {
+    let lower = filename.to_lowercase();
+    for marker in ["cuda-", "cublas-"] {
+        if let Some(idx) = lower.find(marker) {
+            let rest = &lower[idx + marker.len()..];
+            let ver_token = rest
+                .split(|c: char| !c.is_ascii_digit() && c != '.')
+                .next()?;
+            let mut parts = ver_token.split('.');
+            let major: u32 = parts.next()?.parse().ok()?;
+            let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            return Some((major, minor));
+        }
+    }
+    None
+}
+
+/// Picks the optimal `whisper.cpp` binary asset from a GitHub release's asset list based on hardware
+/// and the user's exact detected NVIDIA CUDA driver version (preferring the highest compatible CUDA <= driver_cuda).
 pub fn select_best_whisper_asset(
     assets: &[serde_json::Value],
     platform_tag: &str,
     accel: AccelBackend,
+    driver_cuda: Option<(u32, u32)>,
 ) -> Option<(String, String, ArchiveKind)> {
     let entries: Vec<(String, String)> = assets
         .iter()
@@ -732,19 +779,49 @@ pub fn select_best_whisper_asset(
             .map(|(n, u)| (n.clone(), u.clone(), kind))
     };
 
+    let pick_best_cuda = |arch_token: &str| -> Option<(String, String, ArchiveKind)> {
+        let mut cuda_candidates: Vec<((u32, u32), &String, &String)> = entries
+            .iter()
+            .filter_map(|(n, u)| {
+                let lower = n.to_lowercase();
+                if lower.ends_with(".zip")
+                    && lower.contains(arch_token)
+                    && (lower.contains("cuda") || lower.contains("cublas"))
+                {
+                    let ver = parse_cuda_version_from_asset(&lower).unwrap_or((0, 0));
+                    Some((ver, n, u))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if cuda_candidates.is_empty() {
+            return None;
+        }
+        // Highest CUDA version first
+        cuda_candidates.sort_by(|a, b| b.0.cmp(&a.0));
+
+        if let Some(max_supported) = driver_cuda {
+            if let Some((_, n, u)) = cuda_candidates
+                .iter()
+                .find(|(ver, _, _)| *ver == (0, 0) || *ver <= max_supported)
+            {
+                return Some(((*n).clone(), (*u).clone(), ArchiveKind::WhisperZip));
+            }
+            // Driver is older than all published CUDA builds -> fall back to CPU/OpenBLAS safely
+            return None;
+        }
+
+        // Unknown driver version: pick the highest available CUDA build
+        let (_, n, u) = cuda_candidates[0];
+        Some((n.clone(), u.clone(), ArchiveKind::WhisperZip))
+    };
+
     match platform_tag {
         "win-x64" => {
             if accel == AccelBackend::CudaNvenc {
-                if let Some(m) = find_matching(
-                    &|n| n.ends_with(".zip") && n.contains("x64") && (n.contains("cuda-12") || n.contains("cublas-12")),
-                    ArchiveKind::WhisperZip,
-                ) {
-                    return Some(m);
-                }
-                if let Some(m) = find_matching(
-                    &|n| n.ends_with(".zip") && n.contains("x64") && (n.contains("cuda") || n.contains("cublas")),
-                    ArchiveKind::WhisperZip,
-                ) {
+                if let Some(m) = pick_best_cuda("x64") {
                     return Some(m);
                 }
             }
@@ -760,14 +837,24 @@ pub fn select_best_whisper_asset(
                 &|n| n == "whisper-blas-bin-x64.zip",
                 ArchiveKind::WhisperZip,
             )
-            .or_else(|| {
-                find_matching(&|n| n == "whisper-bin-x64.zip", ArchiveKind::WhisperZip)
-            })
+            .or_else(|| find_matching(&|n| n == "whisper-bin-x64.zip", ArchiveKind::WhisperZip))
         }
-        "win-arm64" => find_matching(
-            &|n| n.ends_with(".zip") && n.contains("win") && n.contains("arm64") && n.contains("cpu"),
-            ArchiveKind::WhisperZip,
-        ),
+        "win-arm64" => {
+            if accel == AccelBackend::CudaNvenc {
+                if let Some(m) = pick_best_cuda("arm64") {
+                    return Some(m);
+                }
+            }
+            find_matching(
+                &|n| {
+                    n.ends_with(".zip")
+                        && n.contains("win")
+                        && n.contains("arm64")
+                        && n.contains("cpu")
+                },
+                ArchiveKind::WhisperZip,
+            )
+        }
         "linux-x64" => find_matching(
             &|n| n.ends_with(".tar.gz") && n.contains("ubuntu") && n.contains("x64"),
             ArchiveKind::WhisperTarGz,
@@ -970,21 +1057,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn selects_best_whisper_asset_by_hardware() {
+    fn selects_best_whisper_asset_by_hardware_and_cuda_version() {
         let assets = vec![
             serde_json::json!({"name": "whisper-bin-x64.zip", "browser_download_url": "https://x/cpu.zip"}),
             serde_json::json!({"name": "whisper-blas-bin-x64.zip", "browser_download_url": "https://x/blas.zip"}),
+            serde_json::json!({"name": "whisper-bin-win-cuda-11.8.0-x64.zip", "browser_download_url": "https://x/cuda11.zip"}),
             serde_json::json!({"name": "whisper-bin-win-cuda-12.4.0-x64.zip", "browser_download_url": "https://x/cuda12.zip"}),
+            serde_json::json!({"name": "whisper-bin-win-cuda-13.4.0-x64.zip", "browser_download_url": "https://x/cuda13.zip"}),
             serde_json::json!({"name": "whisper-bin-ubuntu-x64.tar.gz", "browser_download_url": "https://x/ubuntu.tar.gz"}),
         ];
 
-        let nv = select_best_whisper_asset(&assets, "win-x64", AccelBackend::CudaNvenc).unwrap();
-        assert_eq!(nv.0, "whisper-bin-win-cuda-12.4.0-x64.zip");
+        // CUDA 13.5 driver picks CUDA 13.4 build
+        let nv13 = select_best_whisper_asset(&assets, "win-x64", AccelBackend::CudaNvenc, Some((13, 5))).unwrap();
+        assert_eq!(nv13.0, "whisper-bin-win-cuda-13.4.0-x64.zip");
 
-        let cpu = select_best_whisper_asset(&assets, "win-x64", AccelBackend::CpuOnly).unwrap();
+        // CUDA 13.2 driver picks CUDA 12.4 build (never picks incompatible 13.4!)
+        let nv132 = select_best_whisper_asset(&assets, "win-x64", AccelBackend::CudaNvenc, Some((13, 2))).unwrap();
+        assert_eq!(nv132.0, "whisper-bin-win-cuda-12.4.0-x64.zip");
+
+        // CUDA 12.0 driver picks CUDA 11.8 build
+        let nv120 = select_best_whisper_asset(&assets, "win-x64", AccelBackend::CudaNvenc, Some((12, 0))).unwrap();
+        assert_eq!(nv120.0, "whisper-bin-win-cuda-11.8.0-x64.zip");
+
+        let cpu = select_best_whisper_asset(&assets, "win-x64", AccelBackend::CpuOnly, None).unwrap();
         assert_eq!(cpu.0, "whisper-blas-bin-x64.zip");
 
-        let lin = select_best_whisper_asset(&assets, "linux-x64", AccelBackend::CpuOnly).unwrap();
+        let lin = select_best_whisper_asset(&assets, "linux-x64", AccelBackend::CpuOnly, None).unwrap();
         assert_eq!(lin.0, "whisper-bin-ubuntu-x64.tar.gz");
     }
 }

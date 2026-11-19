@@ -108,6 +108,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </h2>
             <span className="pill accent">
               {hardware.platform_tag} · {accelLabel[hardware.recommended_accel] ?? hardware.recommended_accel}
+              {hardware.cuda_version ? ` (CUDA ${hardware.cuda_version})` : ""}
             </span>
           </div>
 
@@ -145,6 +146,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </div>
               <div style={{ fontSize: 12, color: "var(--text-secondary)" }}>
                 {accelLabel[hardware.recommended_accel] ?? hardware.recommended_accel}
+                {hardware.cuda_version ? ` · CUDA ${hardware.cuda_version}` : ""}
               </div>
             </div>
           </div>
