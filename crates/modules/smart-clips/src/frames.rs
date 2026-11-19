@@ -148,7 +148,7 @@ pub async fn extract_storyboard_sheets(
     let target_frames = (max_sheets.max(1) * tiles_per_sheet) as f64;
     let fps = (target_frames / duration_sec.max(1.0)).clamp(0.03, 1.0);
     let vf = format!(
-        "fps={fps:.5},scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2,tile=3x3"
+        "fps={fps:.5},scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2,setsar=1,tile=3x3"
     );
     let pattern = out_dir.join("sheet_%03d.jpg");
 
@@ -162,9 +162,11 @@ pub async fn extract_storyboard_sheets(
             &format!("{duration_sec:.3}"),
             "-vf",
             &vf,
+            "-frames:v",
+            &max_sheets.max(1).to_string(),
             "-q:v",
             "5",
-            "-vsync",
+            "-fps_mode",
             "vfr",
         ])
         .arg(&pattern)

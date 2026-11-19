@@ -81,6 +81,9 @@ jobs:
           body: |
             ## Aicut ${{ steps.tag.outputs.name }} — Estúdio Modular AI-First para Windows 11
 
+            ### Correções da v0.4.1
+            - **Compatibilidade com FFmpeg 8 (`N-129xxx`):** substituída a flag removida `-vsync vfr` por `-fps_mode vfr` na extração de storyboards visuais do modo Local Free, além de `-frames:v 1` nas miniaturas e ajuste seguro de escala no layout `FitBlur`.
+
             ### Novidades da v0.4.0 — Cortes Shorts IA (Visual + Narrativa até 3 min)
             - **Novo Módulo `Cortes Shorts IA` (`smart-clips`)**: assiste vídeos e lives usando **IA visual multimodal**, segue sua descrição editorial e encontra cortes coerentes com **Início (gancho 5s) → Meio → Fim** de até **3 minutos (180s)**, com snap cirúrgico em fronteiras de palavras.
             - **Motor Dual-Engine (Nuvem + 100% Local Grátis)**:

@@ -256,7 +256,7 @@ async fn run_ffmpeg_render(
                     .to_string(),
             );
             filter_parts.push(
-                "[fg_in]scale=1080:-2:force_original_aspect_ratio=decrease[fg]".to_string(),
+                "[fg_in]scale=1080:1920:force_original_aspect_ratio=decrease[fg]".to_string(),
             );
             filter_parts.push("[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[vlayout]".to_string());
         }
@@ -345,7 +345,7 @@ async fn generate_thumbnail(ffmpeg_bin: &Path, video_path: &Path, thumb_path: &P
     configure_tokio_command(&mut cmd);
     cmd.args(["-y", "-ss", "1.0", "-i"])
         .arg(video_path)
-        .args(["-vframes", "1", "-vf", "scale=360:-2", "-q:v", "4"])
+        .args(["-frames:v", "1", "-vf", "scale=360:-2", "-q:v", "4"])
         .arg(thumb_path)
         .output()
         .await
