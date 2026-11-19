@@ -22,6 +22,8 @@ pub enum ToolInstallStrategy {
     FfmpegHardwareBundle,
     /// Downloads the official ggml-org/whisper.cpp release matching GPU/CPU hardware (CUDA 12 / Vulkan / OpenBLAS / ARM64 / Linux).
     WhisperCppOfficialRelease,
+    /// Downloads the official ggml-org/llama.cpp release matching GPU/CPU hardware (CUDA + cudart / Vulkan / Metal / CPU).
+    LlamaCppOfficialRelease,
     /// Companion binary provided alongside another managed tool (e.g. ffprobe inside ffmpeg bundle).
     CompanionOf(String),
     /// Placeholder for future module-provided tools.
@@ -64,6 +66,7 @@ pub struct ToolStatus {
 #[derive(Debug, Clone)]
 pub struct ResolvedDownload {
     pub url: String,
+    pub companion_url: Option<String>,
     pub version: String,
     pub build_label: String,
     pub archive_kind: ArchiveKind,
@@ -76,6 +79,8 @@ pub enum ArchiveKind {
     FfmpegTarGz,
     WhisperZip,
     WhisperTarGz,
+    LlamaZip,
+    LlamaTarGz,
 }
 
 pub struct ToolManager {
@@ -145,6 +150,10 @@ impl ToolManager {
         let in_whisper_dir = self.bin_dir.join("whisper").join(&managed_name);
         if in_whisper_dir.is_file() {
             return Some((in_whisper_dir, true));
+        }
+        let in_llama_dir = self.bin_dir.join("llama").join(&managed_name);
+        if in_llama_dir.is_file() {
+            return Some((in_llama_dir, true));
         }
         // Fallback for older whisper.cpp builds where the executable was named `main`
         if binary_name == "whisper-cli" {
@@ -275,6 +284,46 @@ impl ToolManager {
                     "Build oficial ggml-org/whisper.cpp.".to_string(),
                 ),
             },
+            ToolInstallStrategy::LlamaCppOfficialRelease => match (tag, accel) {
+                ("win-x64", AccelBackend::CudaNvenc) => {
+                    let cuda_label = self
+                        .hardware
+                        .cuda_version
+                        .as_deref()
+                        .map(|v| format!("CUDA {v}"))
+                        .unwrap_or_else(|| "CUDA".to_string());
+                    (
+                        format!("llama.cpp Win64 {cuda_label} + cudart (GPU NVIDIA)"),
+                        format!(
+                            "GPU NVIDIA ({cuda_label}) detectada: baixa automaticamente a maior build CUDA compatível (≤ {cuda_label}) + bibliotecas cudart para rodar modelos visuais GGUF na GPU."
+                        ),
+                    )
+                }
+                ("win-x64", AccelBackend::AmfDirectml | AccelBackend::QsvOpenvino) => (
+                    "llama.cpp Win64 Vulkan (GPU AMD/Intel)".to_string(),
+                    "GPU AMD/Intel detectada: seleciona build oficial Vulkan para acelerar modelos visuais GGUF na GPU.".to_string(),
+                ),
+                ("win-x64", _) => (
+                    "llama.cpp Win64 CPU AVX2".to_string(),
+                    "Build oficial CPU otimizada para Windows 11.".to_string(),
+                ),
+                ("win-arm64", _) => (
+                    "llama.cpp Win ARM64 Native".to_string(),
+                    "Build oficial nativa para Windows 11 ARM64.".to_string(),
+                ),
+                ("macos-arm64", _) => (
+                    "llama.cpp macOS ARM64 Metal".to_string(),
+                    "Apple Silicon detectado: build oficial com aceleração Metal.".to_string(),
+                ),
+                ("linux-x64", _) => (
+                    "llama.cpp Linux x64 Official".to_string(),
+                    "Build oficial pré-compilada Linux x64.".to_string(),
+                ),
+                _ => (
+                    format!("llama.cpp ({tag})"),
+                    "Build oficial ggml-org/llama.cpp.".to_string(),
+                ),
+            },
             ToolInstallStrategy::Custom { homepage } => (
                 format!("Hardware-matched ({tag})"),
                 format!("Gerenciado pelo módulo proprietário ({homepage})."),
@@ -294,9 +343,14 @@ impl ToolManager {
         let resolved = self.resolve_binary(&def.binary_name);
         let (installed, binary_path, managed_by_aicut, installed_version) = match resolved {
             Some((path, managed)) => {
-                // For managed whisper.cpp, read stored version marker if available
+                // For managed whisper.cpp or llama.cpp, read stored version marker if available
                 let marker_ver = if def.id == "whisper" && managed {
                     std::fs::read_to_string(self.bin_dir.join("whisper").join(".version"))
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                } else if def.id == "llama-server" && managed {
+                    std::fs::read_to_string(self.bin_dir.join("llama").join(".version"))
                         .ok()
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
@@ -379,6 +433,13 @@ impl ToolManager {
                         }
                     }
                 }
+                ToolInstallStrategy::LlamaCppOfficialRelease => {
+                    if let Ok(resolved) = self.resolve_llama_release().await {
+                        if let Ok(mut cache) = self.latest_cache.write() {
+                            cache.insert(def.id.clone(), resolved.version);
+                        }
+                    }
+                }
                 ToolInstallStrategy::CompanionOf(_) | ToolInstallStrategy::Custom { .. } => {}
             }
         }
@@ -426,6 +487,9 @@ impl ToolManager {
                 ToolInstallStrategy::FfmpegHardwareBundle => self.resolve_ffmpeg_release().await?,
                 ToolInstallStrategy::WhisperCppOfficialRelease => {
                     self.resolve_whisper_release().await?
+                }
+                ToolInstallStrategy::LlamaCppOfficialRelease => {
+                    self.resolve_llama_release().await?
                 }
                 ToolInstallStrategy::CompanionOf(_) => {
                     return Err(AicutError::internal("Companion tool resolution loop"));
@@ -492,6 +556,29 @@ impl ToolManager {
                     let whisper_dir = self.bin_dir.join("whisper");
                     extract_whisper_from_targz(&tmp_path, &whisper_dir)?;
                     let _ = std::fs::write(whisper_dir.join(".version"), &resolved.version);
+                    let _ = std::fs::remove_file(&tmp_path);
+                }
+                ArchiveKind::LlamaZip => {
+                    let llama_dir = self.bin_dir.join("llama");
+                    extract_llama_from_zip(&tmp_path, &llama_dir)?;
+                    let _ = std::fs::remove_file(&tmp_path);
+                    if let Some(ref comp_url) = resolved.companion_url {
+                        self.jobs.append_log(
+                            &job.id,
+                            format!("Baixando bibliotecas CUDA runtime (cudart) de {comp_url}"),
+                        );
+                        let comp_tmp = self.bin_dir.join(format!(".download-{}-cudart.tmp", job.id));
+                        self.download_file(comp_url, &comp_tmp, &job.id, &cancel)
+                            .await?;
+                        extract_llama_from_zip(&comp_tmp, &llama_dir)?;
+                        let _ = std::fs::remove_file(&comp_tmp);
+                    }
+                    let _ = std::fs::write(llama_dir.join(".version"), &resolved.version);
+                }
+                ArchiveKind::LlamaTarGz => {
+                    let llama_dir = self.bin_dir.join("llama");
+                    extract_llama_from_targz(&tmp_path, &llama_dir)?;
+                    let _ = std::fs::write(llama_dir.join(".version"), &resolved.version);
                     let _ = std::fs::remove_file(&tmp_path);
                 }
             }
@@ -583,6 +670,7 @@ impl ToolManager {
 
         Ok(ResolvedDownload {
             url: download_url,
+            companion_url: None,
             version: tag_name,
             build_label: asset_name.to_string(),
             archive_kind: ArchiveKind::SingleBinary,
@@ -594,12 +682,14 @@ impl ToolManager {
         match tag {
             "win-x64" => Ok(ResolvedDownload {
                 url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip".to_string(),
+                companion_url: None,
                 version: "latest-win64-gpl".to_string(),
                 build_label: "ffmpeg-master-latest-win64-gpl.zip (NVENC/AMF/QSV)".to_string(),
                 archive_kind: ArchiveKind::FfmpegZip,
             }),
             "win-arm64" => Ok(ResolvedDownload {
                 url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-winarm64-gpl.zip".to_string(),
+                companion_url: None,
                 version: "latest-winarm64-gpl".to_string(),
                 build_label: "ffmpeg-master-latest-winarm64-gpl.zip".to_string(),
                 archive_kind: ArchiveKind::FfmpegZip,
@@ -656,6 +746,7 @@ impl ToolManager {
             ) {
                 return Ok(ResolvedDownload {
                     url,
+                    companion_url: None,
                     version,
                     build_label: name,
                     archive_kind: kind,
@@ -666,6 +757,61 @@ impl ToolManager {
         Err(AicutError::new(
             "WHISPER_ASSET_NOT_FOUND",
             format!("No prebuilt whisper.cpp binary found for platform '{tag}'."),
+        ))
+    }
+
+    /// Queries the latest releases of `ggml-org/llama.cpp` and picks the highest-quality
+    /// hardware-compatible binary archive (plus matching `cudart` runtime zip for Windows CUDA).
+    async fn resolve_llama_release(&self) -> AicutResult<ResolvedDownload> {
+        let resp = self
+            .http
+            .get("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10")
+            .send()
+            .await
+            .map_err(|e| {
+                AicutError::internal(format!("Failed querying llama.cpp releases: {e}"))
+            })?;
+
+        let releases: Vec<serde_json::Value> = resp
+            .json()
+            .await
+            .map_err(|e| AicutError::internal(format!("Invalid llama.cpp releases JSON: {e}")))?;
+
+        let tag = self.hardware.platform_tag.as_str();
+        let accel = self.hardware.recommended_accel;
+
+        for rel in &releases {
+            let Some(assets) = rel.get("assets").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            if assets.is_empty() {
+                continue;
+            }
+            let version = rel
+                .get("tag_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("latest")
+                .to_string();
+
+            if let Some((name, url, companion_url, kind)) = select_best_llama_assets(
+                assets,
+                tag,
+                accel,
+                self.hardware.cuda_major_minor(),
+            ) {
+                return Ok(ResolvedDownload {
+                    url,
+                    companion_url,
+                    version,
+                    build_label: name,
+                    archive_kind: kind,
+                });
+            }
+        }
+
+        Err(AicutError::new(
+            "LLAMA_ASSET_NOT_FOUND",
+            format!("No prebuilt llama.cpp binary found for platform '{tag}'."),
         ))
     }
 
@@ -867,6 +1013,170 @@ pub fn select_best_whisper_asset(
     }
 }
 
+/// Picks the optimal `llama.cpp` binary asset (plus optional matching `cudart` companion zip on
+/// Windows CUDA) from a `ggml-org/llama.cpp` release's asset list based on hardware & CUDA driver.
+pub fn select_best_llama_assets(
+    assets: &[serde_json::Value],
+    platform_tag: &str,
+    accel: AccelBackend,
+    driver_cuda: Option<(u32, u32)>,
+) -> Option<(String, String, Option<String>, ArchiveKind)> {
+    let entries: Vec<(String, String)> = assets
+        .iter()
+        .filter_map(|a| {
+            let name = a.get("name")?.as_str()?.to_string();
+            let url = a.get("browser_download_url")?.as_str()?.to_string();
+            Some((name, url))
+        })
+        .collect();
+
+    let find_matching = |pred: &dyn Fn(&str) -> bool, kind: ArchiveKind| {
+        entries
+            .iter()
+            .find(|(n, _)| pred(&n.to_lowercase()))
+            .map(|(n, u)| (n.clone(), u.clone(), None, kind))
+    };
+
+    let pick_best_win_cuda = |arch_token: &str| -> Option<(String, String, Option<String>, ArchiveKind)> {
+        let mut cuda_candidates: Vec<((u32, u32), &String, &String)> = entries
+            .iter()
+            .filter_map(|(n, u)| {
+                let lower = n.to_lowercase();
+                if lower.ends_with(".zip")
+                    && lower.starts_with("llama-")
+                    && lower.contains("bin-win")
+                    && lower.contains("cuda")
+                    && lower.contains(arch_token)
+                {
+                    let ver = parse_cuda_version_from_asset(&lower).unwrap_or((0, 0));
+                    Some((ver, n, u))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if cuda_candidates.is_empty() {
+            return None;
+        }
+        cuda_candidates.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let chosen = if let Some(max_supported) = driver_cuda {
+            cuda_candidates
+                .iter()
+                .find(|(ver, _, _)| *ver == (0, 0) || *ver <= max_supported)
+                .copied()?
+        } else {
+            cuda_candidates[0]
+        };
+
+        let (chosen_ver, name, url) = chosen;
+        let cudart_url = entries.iter().find_map(|(cn, cu)| {
+            let cl = cn.to_lowercase();
+            if cl.ends_with(".zip")
+                && cl.starts_with("cudart-llama-")
+                && cl.contains("win")
+                && cl.contains(arch_token)
+            {
+                let cver = parse_cuda_version_from_asset(&cl).unwrap_or((0, 0));
+                if cver == chosen_ver {
+                    return Some(cu.clone());
+                }
+            }
+            None
+        });
+
+        Some((name.clone(), url.clone(), cudart_url, ArchiveKind::LlamaZip))
+    };
+
+    match platform_tag {
+        "win-x64" => {
+            if accel == AccelBackend::CudaNvenc {
+                if let Some(m) = pick_best_win_cuda("x64") {
+                    return Some(m);
+                }
+            }
+            if matches!(
+                accel,
+                AccelBackend::CudaNvenc | AccelBackend::AmfDirectml | AccelBackend::QsvOpenvino
+            ) {
+                if let Some(m) = find_matching(
+                    &|n| {
+                        n.ends_with(".zip")
+                            && n.starts_with("llama-")
+                            && n.contains("bin-win-vulkan-x64")
+                    },
+                    ArchiveKind::LlamaZip,
+                ) {
+                    return Some(m);
+                }
+            }
+            find_matching(
+                &|n| {
+                    n.ends_with(".zip")
+                        && n.starts_with("llama-")
+                        && n.contains("bin-win-cpu-x64")
+                },
+                ArchiveKind::LlamaZip,
+            )
+            .or_else(|| {
+                find_matching(
+                    &|n| {
+                        n.ends_with(".zip")
+                            && n.starts_with("llama-")
+                            && n.contains("bin-win")
+                            && n.contains("x64")
+                            && (n.contains("avx2") || n.contains("openblas"))
+                    },
+                    ArchiveKind::LlamaZip,
+                )
+            })
+        }
+        "win-arm64" => find_matching(
+            &|n| {
+                n.ends_with(".zip")
+                    && n.starts_with("llama-")
+                    && n.contains("bin-win")
+                    && n.contains("arm64")
+            },
+            ArchiveKind::LlamaZip,
+        ),
+        "macos-arm64" => find_matching(
+            &|n| {
+                (n.ends_with(".zip") || n.ends_with(".tar.gz"))
+                    && n.starts_with("llama-")
+                    && n.contains("bin-macos-arm64")
+            },
+            ArchiveKind::LlamaZip,
+        )
+        .map(|(n, u, c, _)| {
+            let kind = if n.ends_with(".tar.gz") {
+                ArchiveKind::LlamaTarGz
+            } else {
+                ArchiveKind::LlamaZip
+            };
+            (n, u, c, kind)
+        }),
+        "linux-x64" => find_matching(
+            &|n| {
+                (n.ends_with(".tar.gz") || n.ends_with(".zip"))
+                    && n.starts_with("llama-")
+                    && n.contains("bin-ubuntu-x64")
+            },
+            ArchiveKind::LlamaTarGz,
+        )
+        .map(|(n, u, c, _)| {
+            let kind = if n.ends_with(".zip") {
+                ArchiveKind::LlamaZip
+            } else {
+                ArchiveKind::LlamaTarGz
+            };
+            (n, u, c, kind)
+        }),
+        _ => None,
+    }
+}
+
 pub fn platform_binary_name(base: &str) -> String {
     if cfg!(windows) && !base.ends_with(".exe") {
         format!("{base}.exe")
@@ -1052,6 +1362,81 @@ fn extract_whisper_from_targz(archive_path: &Path, whisper_dir: &Path) -> AicutR
     Ok(())
 }
 
+/// Extracts `llama-server` and all companion DLLs/shared libraries into `llama_dir`.
+fn extract_llama_from_zip(zip_path: &Path, llama_dir: &Path) -> AicutResult<()> {
+    std::fs::create_dir_all(llama_dir)?;
+    let file = std::fs::File::open(zip_path)?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| AicutError::internal(format!("Failed reading llama.cpp zip: {e}")))?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| AicutError::internal(format!("Zip entry error: {e}")))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry.name().replace('\\', "/");
+        let file_name = name.rsplit('/').next().unwrap_or("");
+        if file_name.is_empty() {
+            continue;
+        }
+        let lower = file_name.to_lowercase();
+        let keep = lower == "llama-server.exe"
+            || lower == "llama-server"
+            || lower == "llama-mtmd-cli.exe"
+            || lower == "llama-mtmd-cli"
+            || lower.ends_with(".dll")
+            || lower.ends_with(".dylib")
+            || lower.ends_with(".so")
+            || lower.contains(".so.");
+        if keep {
+            let out_path = llama_dir.join(file_name);
+            let tmp_out = llama_dir.join(format!(".{file_name}.new"));
+            let mut out = std::fs::File::create(&tmp_out)?;
+            std::io::copy(&mut entry, &mut out)?;
+            out.flush()?;
+            replace_file(&tmp_out, &out_path)?;
+            make_executable(&out_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn extract_llama_from_targz(archive_path: &Path, llama_dir: &Path) -> AicutResult<()> {
+    std::fs::create_dir_all(llama_dir)?;
+    let file = std::fs::File::open(archive_path)?;
+    let dec = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(dec);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let path = entry.path()?.into_owned();
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        if file_name.is_empty() {
+            continue;
+        }
+        let keep = file_name == "llama-server"
+            || file_name == "llama-mtmd-cli"
+            || file_name.contains(".so")
+            || file_name.ends_with(".dylib");
+        if keep {
+            let out_path = llama_dir.join(&file_name);
+            let tmp_out = llama_dir.join(format!(".{file_name}.new"));
+            entry.unpack(&tmp_out)?;
+            replace_file(&tmp_out, &out_path)?;
+            make_executable(&out_path)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1084,5 +1469,45 @@ mod tests {
 
         let lin = select_best_whisper_asset(&assets, "linux-x64", AccelBackend::CpuOnly, None).unwrap();
         assert_eq!(lin.0, "whisper-bin-ubuntu-x64.tar.gz");
+    }
+
+    #[test]
+    fn selects_best_llama_assets_with_cudart_and_fallbacks() {
+        let assets = vec![
+            serde_json::json!({"name": "llama-b5500-bin-win-cpu-x64.zip", "browser_download_url": "https://x/cpu.zip"}),
+            serde_json::json!({"name": "llama-b5500-bin-win-vulkan-x64.zip", "browser_download_url": "https://x/vulkan.zip"}),
+            serde_json::json!({"name": "llama-b5500-bin-win-cuda-12.4-x64.zip", "browser_download_url": "https://x/cuda12.zip"}),
+            serde_json::json!({"name": "cudart-llama-bin-win-cuda-12.4-x64.zip", "browser_download_url": "https://x/cudart12.zip"}),
+            serde_json::json!({"name": "llama-b5500-bin-win-cuda-13.1-x64.zip", "browser_download_url": "https://x/cuda13.zip"}),
+            serde_json::json!({"name": "cudart-llama-bin-win-cuda-13.1-x64.zip", "browser_download_url": "https://x/cudart13.zip"}),
+            serde_json::json!({"name": "llama-b5500-bin-ubuntu-x64.zip", "browser_download_url": "https://x/ubuntu.zip"}),
+        ];
+
+        // NVIDIA CUDA 13.5 driver picks CUDA 13.1 + matching cudart 13.1
+        let nv13 = select_best_llama_assets(&assets, "win-x64", AccelBackend::CudaNvenc, Some((13, 5))).unwrap();
+        assert_eq!(nv13.0, "llama-b5500-bin-win-cuda-13.1-x64.zip");
+        assert_eq!(nv13.2.as_deref(), Some("https://x/cudart13.zip"));
+
+        // NVIDIA CUDA 12.6 driver picks CUDA 12.4 + matching cudart 12.4
+        let nv12 = select_best_llama_assets(&assets, "win-x64", AccelBackend::CudaNvenc, Some((12, 6))).unwrap();
+        assert_eq!(nv12.0, "llama-b5500-bin-win-cuda-12.4-x64.zip");
+        assert_eq!(nv12.2.as_deref(), Some("https://x/cudart12.zip"));
+
+        // Old NVIDIA driver (CUDA 11.2) safely falls back to Vulkan
+        let old_nv = select_best_llama_assets(&assets, "win-x64", AccelBackend::CudaNvenc, Some((11, 2))).unwrap();
+        assert_eq!(old_nv.0, "llama-b5500-bin-win-vulkan-x64.zip");
+        assert!(old_nv.2.is_none());
+
+        // AMD picks Vulkan
+        let amd = select_best_llama_assets(&assets, "win-x64", AccelBackend::AmfDirectml, None).unwrap();
+        assert_eq!(amd.0, "llama-b5500-bin-win-vulkan-x64.zip");
+
+        // CPU picks win-cpu-x64
+        let cpu = select_best_llama_assets(&assets, "win-x64", AccelBackend::CpuOnly, None).unwrap();
+        assert_eq!(cpu.0, "llama-b5500-bin-win-cpu-x64.zip");
+
+        // Linux picks ubuntu-x64
+        let lin = select_best_llama_assets(&assets, "linux-x64", AccelBackend::CpuOnly, None).unwrap();
+        assert_eq!(lin.0, "llama-b5500-bin-ubuntu-x64.zip");
     }
 }

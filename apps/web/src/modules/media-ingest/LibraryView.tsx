@@ -12,6 +12,7 @@ import {
   Play,
   RefreshCw,
   Save,
+  Scissors,
   Search,
   Sparkles,
   Subtitles,
@@ -41,6 +42,7 @@ interface LibraryViewProps {
   onRefresh: () => void;
   onNavigate: (route: RouteId) => void;
   onTranscribeMedia: (mediaId: string) => void;
+  onSmartClipMedia: (mediaId: string) => void;
   onNotify: (level: "info" | "success" | "warning" | "error", title: string, message: string) => void;
 }
 
@@ -58,6 +60,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   onRefresh,
   onNavigate,
   onTranscribeMedia,
+  onSmartClipMedia,
   onNotify,
 }) => {
   const [sourceFilter, setSourceFilter] = useState<"all" | "download" | "local" | "generated">("all");
@@ -512,17 +515,34 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                 )}
 
                 {!isTextKind(selectedAsset.kind) && (
-                  <button
-                    type="button"
-                    className="btn btn-primary"
-                    onClick={() => {
-                      const id = selectedAsset.id;
-                      onSelectMedia(null);
-                      onTranscribeMedia(id);
-                    }}
-                  >
-                    <Mic size={15} /> Transcrever com IA Local (Gerar Legenda / Timeline)
-                  </button>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <button
+                      type="button"
+                      className="btn btn-primary"
+                      style={{ flex: 1 }}
+                      onClick={() => {
+                        const id = selectedAsset.id;
+                        onSelectMedia(null);
+                        onTranscribeMedia(id);
+                      }}
+                    >
+                      <Mic size={15} /> Transcrever IA Local
+                    </button>
+                    {(selectedAsset.kind === "video" || selectedAsset.kind === "video_only") && (
+                      <button
+                        type="button"
+                        className="btn btn-primary"
+                        style={{ flex: 1 }}
+                        onClick={() => {
+                          const id = selectedAsset.id;
+                          onSelectMedia(null);
+                          onSmartClipMedia(id);
+                        }}
+                      >
+                        <Scissors size={15} /> Cortes Shorts IA (até 3 min)
+                      </button>
+                    )}
+                  </div>
                 )}
 
                 {selectedAsset.parent_media_id && (

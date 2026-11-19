@@ -150,6 +150,78 @@ pub struct TranscriptRecord {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SmartClipSegment {
+    pub start_sec: f64,
+    pub end_sec: f64,
+    #[serde(default)]
+    pub role: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ClipNarrativeArc {
+    #[serde(default)]
+    pub beginning: String,
+    #[serde(default)]
+    pub middle: String,
+    #[serde(default)]
+    pub end: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ClipScores {
+    #[serde(default)]
+    pub match_description: u8,
+    #[serde(default)]
+    pub visual_interest: u8,
+    #[serde(default)]
+    pub narrative_coherence: u8,
+    #[serde(default)]
+    pub hook_strength: u8,
+}
+
+impl ClipScores {
+    pub fn overall(&self) -> f32 {
+        (self.match_description as f32 * 0.35)
+            + (self.narrative_coherence as f32 * 0.30)
+            + (self.visual_interest as f32 * 0.20)
+            + (self.hook_strength as f32 * 0.15)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SmartClipPlan {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub hook_first_5s: String,
+    #[serde(default)]
+    pub visual_evidence: String,
+    #[serde(default)]
+    pub why_interesting: String,
+    #[serde(default)]
+    pub narrative_arc: ClipNarrativeArc,
+    pub segments: Vec<SmartClipSegment>,
+    pub total_duration_sec: f64,
+    #[serde(default)]
+    pub scores: ClipScores,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rendered_media_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SmartClipRun {
+    pub id: String,
+    pub media_id: String,
+    pub media_title: String,
+    pub provider: String,
+    pub model_id: String,
+    pub description: String,
+    pub max_duration_sec: f64,
+    pub clips: Vec<SmartClipPlan>,
+    pub created_at: DateTime<Utc>,
+}
+
 pub struct MediaRepository {
     conn: Mutex<Connection>,
 }
@@ -218,6 +290,20 @@ impl MediaRepository {
                 value_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS smart_clip_runs (
+                id TEXT PRIMARY KEY,
+                media_id TEXT NOT NULL,
+                media_title TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                description TEXT NOT NULL,
+                max_duration_sec REAL NOT NULL,
+                clips_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_smart_clip_runs_media_id ON smart_clip_runs(media_id);
             ",
         )?;
 
@@ -606,6 +692,90 @@ impl MediaRepository {
         Ok(changed > 0)
     }
 
+    // ---- Smart Clip Runs ----
+
+    pub fn insert_clip_run(&self, run: &SmartClipRun) -> AicutResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AicutError::internal("DB lock poisoned"))?;
+        conn.execute(
+            "INSERT INTO smart_clip_runs (
+                id, media_id, media_title, provider, model_id, description,
+                max_duration_sec, clips_json, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(id) DO UPDATE SET
+                clips_json = excluded.clips_json",
+            params![
+                run.id,
+                run.media_id,
+                run.media_title,
+                run.provider,
+                run.model_id,
+                run.description,
+                run.max_duration_sec,
+                serde_json::to_string(&run.clips)?,
+                run.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_clip_run(&self, id: &str) -> AicutResult<Option<SmartClipRun>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AicutError::internal("DB lock poisoned"))?;
+        let item = conn
+            .query_row(
+                "SELECT id, media_id, media_title, provider, model_id, description,
+                        max_duration_sec, clips_json, created_at
+                 FROM smart_clip_runs WHERE id = ?1",
+                params![id],
+                row_to_clip_run,
+            )
+            .optional()?;
+        Ok(item)
+    }
+
+    pub fn list_clip_runs(&self, media_id: Option<&str>) -> AicutResult<Vec<SmartClipRun>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AicutError::internal("DB lock poisoned"))?;
+        let items = if let Some(mid) = media_id {
+            let mut stmt = conn.prepare(
+                "SELECT id, media_id, media_title, provider, model_id, description,
+                        max_duration_sec, clips_json, created_at
+                 FROM smart_clip_runs WHERE media_id = ?1 ORDER BY created_at DESC",
+            )?;
+            let rows = stmt
+                .query_map(params![mid], row_to_clip_run)?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, media_id, media_title, provider, model_id, description,
+                        max_duration_sec, clips_json, created_at
+                 FROM smart_clip_runs ORDER BY created_at DESC",
+            )?;
+            let rows = stmt
+                .query_map([], row_to_clip_run)?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        Ok(items)
+    }
+
+    pub fn delete_clip_run(&self, id: &str) -> AicutResult<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AicutError::internal("DB lock poisoned"))?;
+        let changed = conn.execute("DELETE FROM smart_clip_runs WHERE id = ?1", params![id])?;
+        Ok(changed > 0)
+    }
+
     // ---- Download Presets ----
 
     pub fn list_presets(&self) -> AicutResult<Vec<DownloadPreset>> {
@@ -810,6 +980,24 @@ fn row_to_transcript(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranscriptReco
         duration_sec: row.get(5)?,
         full_text: row.get(6)?,
         segments: serde_json::from_str(&seg_str).unwrap_or_default(),
+        created_at: DateTime::parse_from_rfc3339(&created_str)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+    })
+}
+
+fn row_to_clip_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<SmartClipRun> {
+    let clips_str: String = row.get(7)?;
+    let created_str: String = row.get(8)?;
+    Ok(SmartClipRun {
+        id: row.get(0)?,
+        media_id: row.get(1)?,
+        media_title: row.get(2)?,
+        provider: row.get(3)?,
+        model_id: row.get(4)?,
+        description: row.get(5)?,
+        max_duration_sec: row.get(6)?,
+        clips: serde_json::from_str(&clips_str).unwrap_or_default(),
         created_at: DateTime::parse_from_rfc3339(&created_str)
             .map(|d| d.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now()),

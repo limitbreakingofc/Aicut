@@ -7,6 +7,7 @@ import {
   Download,
   Film,
   Mic,
+  Scissors,
   Settings,
   X,
 } from "lucide-react";
@@ -32,6 +33,7 @@ import type {
 import { IngestView } from "./modules/media-ingest/IngestView";
 import { LibraryView } from "./modules/media-ingest/LibraryView";
 import { TranscribeView } from "./modules/transcribe/TranscribeView";
+import { SmartClipsView } from "./modules/smart-clips/SmartClipsView";
 import { JobsView } from "./modules/core/JobsView";
 import { ModulesView } from "./modules/core/ModulesView";
 import { AiConnectView } from "./modules/core/AiConnectView";
@@ -55,6 +57,7 @@ export function App() {
   const [media, setMedia] = useState<MediaAsset[]>([]);
   const [selectedMediaId, setSelectedMediaId] = useState<string | null>(null);
   const [transcribeTargetId, setTranscribeTargetId] = useState<string | null>(null);
+  const [smartClipsTargetId, setSmartClipsTargetId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [filterKind, setFilterKind] = useState<string | null>(null);
 
@@ -285,6 +288,7 @@ export function App() {
     { id: "ingest", label: "Baixar & Importar", icon: <Download size={16} /> },
     { id: "library", label: "Biblioteca", icon: <Film size={16} />, badge: media.length },
     { id: "transcribe", label: "Transcrever IA", icon: <Mic size={16} /> },
+    { id: "smart-clips", label: "Cortes Shorts IA", icon: <Scissors size={16} /> },
     {
       id: "jobs",
       label: "Fila de Tarefas",
@@ -300,7 +304,8 @@ export function App() {
     { label: "Ir para Baixar & Importar (yt-dlp / PC)", hint: "Aba 1", run: () => navigate("ingest") },
     { label: "Ir para Biblioteca de Mídia", hint: "Aba 2", run: () => navigate("library") },
     { label: "Ir para Transcrever com IA Local (Whisper)", hint: "Aba 3", run: () => navigate("transcribe") },
-    { label: "Ir para Fila de Tarefas", hint: "Aba 4", run: () => navigate("jobs") },
+    { label: "Ir para Cortes Shorts IA (Visual até 3 min)", hint: "Aba 4", run: () => navigate("smart-clips") },
+    { label: "Ir para Fila de Tarefas", hint: "Aba 5", run: () => navigate("jobs") },
     { label: "Ir para Módulos & Action Playground", hint: "Aba 5", run: () => navigate("modules") },
     { label: "Ir para Conectar IA (MCP / OpenAPI / CLI)", hint: "Aba 6", run: () => navigate("ai-connect") },
     { label: "Ir para Configurações (Hardware & Ferramentas)", hint: "Menu", run: () => navigate("settings") },
@@ -323,7 +328,7 @@ export function App() {
           <span className="brand-mark">A</span>
           <span>Aicut</span>
           <span style={{ color: "var(--text-muted)", fontWeight: 400, fontSize: 12 }}>
-            v0.3.0 · Modular AI Studio
+            v0.4.0 · Modular AI Studio
           </span>
         </div>
 
@@ -423,6 +428,10 @@ export function App() {
                 setTranscribeTargetId(mediaId);
                 navigate("transcribe");
               }}
+              onSmartClipMedia={(mediaId) => {
+                setSmartClipsTargetId(mediaId);
+                navigate("smart-clips");
+              }}
               onNotify={pushToast}
             />
           )}
@@ -435,6 +444,24 @@ export function App() {
               hardware={hardware}
               preselectedMediaId={transcribeTargetId}
               onNavigate={navigate}
+              onNotify={pushToast}
+              onRefreshTools={refreshTools}
+              onRefreshMedia={refreshMedia}
+            />
+          )}
+
+          {route === "smart-clips" && (
+            <SmartClipsView
+              media={media}
+              tools={tools}
+              jobs={jobs}
+              hardware={hardware}
+              preselectedMediaId={smartClipsTargetId}
+              onNavigate={navigate}
+              onSelectMedia={(mediaId) => {
+                setSelectedMediaId(mediaId);
+                navigate("library");
+              }}
               onNotify={pushToast}
               onRefreshTools={refreshTools}
               onRefreshMedia={refreshMedia}

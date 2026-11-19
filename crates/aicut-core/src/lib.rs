@@ -21,8 +21,9 @@ pub use hardware::{AccelBackend, GpuInfo, GpuVendor, HardwareProfile};
 pub use jobs::{JobManager, JobProgress, JobRecord, JobStatus};
 pub use kernel::AicutKernel;
 pub use media::{
-    DownloadPreset, MediaAsset, MediaKind, MediaListFilter, MediaMetadata, MediaRepository,
-    MediaSourceType, TranscriptRecord, TranscriptSegment, TranscriptWord,
+    ClipNarrativeArc, ClipScores, DownloadPreset, MediaAsset, MediaKind, MediaListFilter,
+    MediaMetadata, MediaRepository, MediaSourceType, SmartClipPlan, SmartClipRun,
+    SmartClipSegment, TranscriptRecord, TranscriptSegment, TranscriptWord,
 };
 pub use module::{AicutModule, ModuleHealth, ModuleInfo, ModuleManifest};
 pub use process::{configure_std_command, configure_tokio_command};

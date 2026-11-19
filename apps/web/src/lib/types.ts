@@ -6,6 +6,7 @@ export type RouteId =
   | "ingest"
   | "library"
   | "transcribe"
+  | "smart-clips"
   | "jobs"
   | "modules"
   | "ai-connect"
@@ -290,4 +291,85 @@ export interface WorkspaceConfig {
   models_dir: string;
   bin_dir: string;
   db_path: string;
+}
+
+export interface VisionModelStatus {
+  id: string;
+  family_id: string;
+  family_name: string;
+  version_tag: string;
+  display_name: string;
+  hf_repo: string;
+  model_filename: string;
+  mmproj_filename: string;
+  size_mb: number;
+  min_vram_mb: number;
+  min_ram_mb: number;
+  quality_score: number;
+  quality_tier: string;
+  speed_tier: string;
+  quality_notes: string;
+  description: string;
+  installed: boolean;
+  compatible: boolean;
+  compatibility_reason: string;
+  curated_for_hardware: boolean;
+  recommended: boolean;
+  best_quality_for_hardware: boolean;
+  model_path?: string;
+  mmproj_path?: string;
+  actual_size_bytes?: number;
+}
+
+export interface ClipsConfig {
+  gemini_configured: boolean;
+  gemini_key_preview?: string | null;
+  default_provider: "gemini" | "local_free" | string;
+  gemini_scan_model: string;
+  gemini_director_model: string;
+  local_vision_model: string;
+}
+
+export interface SmartClipSegment {
+  start_sec: number;
+  end_sec: number;
+  role: string;
+}
+
+export interface ClipNarrativeArc {
+  beginning: string;
+  middle: string;
+  end: string;
+}
+
+export interface ClipScores {
+  match_description: number;
+  visual_interest: number;
+  narrative_coherence: number;
+  hook_strength: number;
+}
+
+export interface SmartClipPlan {
+  id: string;
+  title: string;
+  hook_first_5s: string;
+  visual_evidence: string;
+  why_interesting: string;
+  narrative_arc: ClipNarrativeArc;
+  segments: SmartClipSegment[];
+  total_duration_sec: number;
+  scores: ClipScores;
+  rendered_media_id?: string | null;
+}
+
+export interface SmartClipRun {
+  id: string;
+  media_id: string;
+  media_title: string;
+  provider: string;
+  model_id: string;
+  description: string;
+  max_duration_sec: number;
+  clips: SmartClipPlan[];
+  created_at: string;
 }

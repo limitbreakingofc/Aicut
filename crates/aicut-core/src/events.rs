@@ -6,7 +6,7 @@ use std::sync::RwLock;
 use tokio::sync::broadcast;
 
 use crate::jobs::JobRecord;
-use crate::media::{MediaAsset, TranscriptRecord};
+use crate::media::{MediaAsset, SmartClipRun, TranscriptRecord};
 use crate::tools::ToolStatus;
 use crate::ui_state::UiState;
 
@@ -55,6 +55,8 @@ pub enum AicutEvent {
     MediaDeleted { id: String },
     TranscriptCreated(TranscriptRecord),
     TranscriptDeleted { id: String },
+    SmartClipRunCreated(SmartClipRun),
+    SmartClipRunDeleted { id: String },
     UiStateChanged(UiState),
     UiNotification {
         level: NotificationLevel,

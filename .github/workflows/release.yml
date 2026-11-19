@@ -81,13 +81,13 @@ jobs:
           body: |
             ## Aicut ${{ steps.tag.outputs.name }} — Estúdio Modular AI-First para Windows 11
 
-            ### Novidades da v0.3.0
-            - **Detecção Exata da Versão do CUDA (`13.x` / `12.x` / `11.x`)**: o Aicut agora lê diretamente a versão do CUDA suportada pelo seu driver NVIDIA (via `nvidia-smi`) e seleciona dinamicamente a **maior build CUDA compatível** de ferramentas como `whisper.cpp` (sem versão travada no código).
-            - **Curadoria Inteligente de Modelos por GPU & Hardware**:
-              - Na aba **Transcrever IA**, o Aicut mostra por padrão **apenas os melhores modelos compatíveis com a VRAM da sua GPU e RAM do seu PC** (com opção de ver todos os modelos).
-              - **Seletor de Versões/Precisão por Família (`FP16`, `Q8_0`, `Q5_0`)**: alterne facilmente entre as versões de cada família (`Whisper Large v3 Turbo`, `Whisper Large v3`, `Large v2`) com **descrição clara de qual entrega a maior qualidade final** (`10/10`, `9.8/10`, `9.7/10`), VRAM exigida e velocidade.
-              - **Troca rápida do modelo ativo** (salvo automaticamente) + **Desinstalação Completa** removendo arquivos `.bin`/`.part` do disco e mostrando exatamente quantos MB/GB foram liberados.
-            - **Inclui todas as melhorias da v0.2.0**: `yt-dlp` corrigido (`--no-simulate --print-to-file` + `--impersonate`), 13 formatos de legenda e timeline (`SRT`, `VTT`, `ASS Karaokê`, `FCPXML DaVinci/CapCut`, `Premiere XML`, `EDL`, `OTIO`, `CSV`, `JSON`) salvos direto na **Biblioteca**, e controle completo por qualquer chat de IA via **MCP / OpenAPI 3.1 / CLI**.
+            ### Novidades da v0.4.0 — Cortes Shorts IA (Visual + Narrativa até 3 min)
+            - **Novo Módulo `Cortes Shorts IA` (`smart-clips`)**: assiste vídeos e lives usando **IA visual multimodal**, segue sua descrição editorial e encontra cortes coerentes com **Início (gancho 5s) → Meio → Fim** de até **3 minutos (180s)**, com snap cirúrgico em fronteiras de palavras.
+            - **Motor Dual-Engine (Nuvem + 100% Local Grátis)**:
+              - **Gemini API (`gemini-2.5-flash` + `gemini-2.5-pro`)**: visão + áudio nativos em janelas de 25 min com 3 min de sobreposição (0 MB de download local).
+              - **Local Free (`llama.cpp` + `Qwen2.5-VL` 7B/3B GGUF)**: o Aicut detecta automaticamente sua GPU/VRAM/CUDA, instala a melhor build do **`llama-server`** (CUDA + `cudart` / Vulkan / Metal / CPU) pelo próprio app e recomenda a melhor quantização compatível com sua placa.
+            - **Renderização Shorts 9:16 (`1080x1920`) Acelerada por Hardware (`NVENC` / `AMF` / `QSV`)**: layouts *Tela Inteira + Blur*, *Foco Central*, *Split Gameplay + Webcam* e *Original 16:9*, com opção de queimar legendas Karaokê sincronizadas e salvar direto na Biblioteca.
+            - **Inclui todas as melhorias das versões anteriores (`v0.3.0` / `v0.2.0`)**: detecção exata de CUDA, curadoria de modelos Whisper por GPU, 13 formatos de legenda/timeline e controle completo via MCP / OpenAPI / CLI.
 
             ### Como instalar / atualizar no Windows 11
             1. Baixe e execute **`Aicut_*_x64-setup.exe`** (recomendado) ou **`.msi`** nos assets abaixo.
