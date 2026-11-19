@@ -1,0 +1,25 @@
+[package]
+name = "aicut-desktop"
+version = "0.1.0"
+description = "Aicut — Modular AI-First Media Studio for Windows 11"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "aicut_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+aicut-core = { path = "../../../crates/aicut-core" }
+aicut-runtime = { path = "../../../crates/aicut-runtime" }
+aicut-server = { path = "../../../crates/aicut-server" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tokio = { version = "1.43", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

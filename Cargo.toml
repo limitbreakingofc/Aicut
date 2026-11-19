@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aicut-core",
+    "crates/modules/media-ingest",
+    "crates/aicut-runtime",
+    "crates/aicut-mcp",
+    "crates/aicut-server",
+    "crates/aicut-cli",
+]
+exclude = [
+    "apps/desktop/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+aicut-core = { path = "crates/aicut-core" }
+aicut-module-media-ingest = { path = "crates/modules/media-ingest" }
+aicut-runtime = { path = "crates/aicut-runtime" }
+aicut-mcp = { path = "crates/aicut-mcp" }
+aicut-server = { path = "crates/aicut-server" }
+
+async-trait = "0.1"
+axum = { version = "0.8", features = ["ws", "macros"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+dirs = "6.0"
+flate2 = "1.1"
+futures-util = "0.3"
+http-body-util = "0.1"
+mime_guess = "2.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+schemars = { version = "0.8", features = ["chrono", "uuid1"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+sysinfo = "0.33"
+tar = "0.4"
+tempfile = "3.15"
+thiserror = "2.0"
+tokio = { version = "1.43", features = ["full"] }
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["io"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.12", features = ["v4", "serde"] }
+walkdir = "2.5"
+which = "7.0"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }

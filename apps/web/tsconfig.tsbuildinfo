@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/main.tsx","./src/lib/client.ts","./src/lib/format.ts","./src/lib/types.ts","./src/modules/core/AiConnectView.tsx","./src/modules/core/JobsView.tsx","./src/modules/core/ModulesView.tsx","./src/modules/core/SettingsView.tsx","./src/modules/media-ingest/IngestView.tsx","./src/modules/media-ingest/LibraryView.tsx"],"version":"5.9.3"}

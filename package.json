@@ -1,0 +1,16 @@
+{
+  "name": "aicut-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev:web": "pnpm --filter @aicut/web dev",
+    "build:web": "pnpm --filter @aicut/web build",
+    "typecheck:web": "pnpm --filter @aicut/web typecheck",
+    "tauri:dev": "pnpm --filter @aicut/desktop tauri dev",
+    "tauri:build": "pnpm --filter @aicut/desktop tauri build"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  }
+}

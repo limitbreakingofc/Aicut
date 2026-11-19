@@ -1,0 +1,20 @@
+[package]
+name = "aicut-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "aicut"
+path = "src/main.rs"
+
+[dependencies]
+aicut-core.workspace = true
+aicut-mcp.workspace = true
+aicut-runtime.workspace = true
+aicut-server.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

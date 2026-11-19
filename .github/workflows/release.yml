@@ -1,0 +1,101 @@
+name: Release Windows 11 Build
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: false
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build & Publish Windows 11 Installers
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Run Rust Tests
+        run: cargo test --workspace
+
+      - name: Install Frontend Dependencies & Build Web UI
+        run: |
+          pnpm install
+          pnpm typecheck:web
+          pnpm build:web
+
+      - name: Build Aicut CLI & MCP Binary (Windows x64)
+        run: |
+          cargo build --release -p aicut-cli
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          Copy-Item target\release\aicut.exe release-assets\aicut-cli-windows-x86_64.exe
+
+      - name: Build Aicut Desktop App (Tauri v2 NSIS + MSI)
+        run: pnpm tauri:build
+
+      - name: Collect Windows 11 Installer Assets
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path "apps/desktop/src-tauri/target/release/bundle" -Recurse -Include *.exe,*.msi | ForEach-Object {
+            Copy-Item $_.FullName -Destination "release-assets/$($_.Name)"
+          }
+          Get-ChildItem release-assets
+
+      - name: Determine Release Tag
+        id: tag
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            echo "name=$env:GITHUB_REF_NAME" >> $env:GITHUB_OUTPUT
+          } else {
+            echo "name=${{ inputs.tag || 'v0.1.0' }}" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: "Aicut ${{ steps.tag.outputs.name }} (Windows 11)"
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          body: |
+            ## Aicut ${{ steps.tag.outputs.name }} — Estúdio Modular AI-First para Windows 11
+
+            ### O que há nesta versão
+            - **Core 100% em Rust + Interface Desktop Windows 11 (Tauri v2 + React/TypeScript)** fluida e modular.
+            - **Aba 1 — Baixar & Importar**:
+              - Download completo via **yt-dlp** com todas as opções configuráveis visualmente (Vídeo+Áudio, **Só Vídeo**, **Só Áudio**, resolução/qualidade, seletor exato de stream via Probe, codec, container, legendas manuais/automáticas/embutidas, recorte de trecho, capítulos, playlist, cookies do navegador, SponsorBlock, fragmentos concorrentes, limite de velocidade, proxy e presets salváveis).
+              - Importação de vídeos e áudios locais do PC (Drag & Drop, seletor de arquivos/pastas nativo do Windows 11, modo **Referência** instantâneo ou **Cópia**).
+            - **Aba 2 — Biblioteca**: reúne todos os arquivos baixados pelo `yt-dlp` e vídeos/áudios importados, com player integrado (vídeo e áudio), metadados técnicos (`ffprobe`), busca, filtros e edição de tags/notas.
+            - **Configurações — Hardware & Ferramentas**: detecção automática do hardware do PC (CPU, arquitetura, RAM, GPU NVIDIA/AMD/Intel) e instalador/atualizador extensível de `yt-dlp`, `FFmpeg` e futuras ferramentas dos módulos.
+            - **Qualquer Chat de IA conectado com paridade humana**:
+              - **MCP nativo**: `http://127.0.0.1:43210/mcp` (Streamable HTTP), `/mcp/sse` e `aicut mcp` (stdio).
+              - **OpenAPI 3.1 / REST**: `http://127.0.0.1:43210/openapi.json` (ChatGPT Actions, Open WebUI, n8n, LangChain).
+              - **CLI JSON**: `aicut-cli-windows-x86_64.exe` (`run`, `actions`, `modules`, `mcp`, `serve`, `doctor`).
+
+            ### Como instalar no Windows 11
+            1. Baixe o instalador **`Aicut_*_x64-setup.exe`** (recomendado) ou **`.msi`** nos assets abaixo.
+            2. Execute o instalador e abra o **Aicut**.
+            3. Vá em **Configurações → Ferramentas** e clique em **Instalar / Atualizar Tudo** para o Aicut detectar seu hardware e instalar automaticamente as melhores versões do `yt-dlp` e `FFmpeg`.
+          files: |
+            release-assets/*
