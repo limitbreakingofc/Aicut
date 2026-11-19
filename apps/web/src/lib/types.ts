@@ -92,14 +92,25 @@ export interface TranscriptRecord {
 
 export interface WhisperModelStatus {
   id: string;
+  family_id: string;
+  family_name: string;
+  version_tag: string;
   display_name: string;
   filename: string;
   size_mb: number;
+  min_vram_mb: number;
+  min_ram_mb: number;
+  quality_score: number;
   quality_tier: string;
   speed_tier: string;
+  quality_notes: string;
   description: string;
   installed: boolean;
+  compatible: boolean;
+  compatibility_reason: string;
+  curated_for_hardware: boolean;
   recommended: boolean;
+  best_quality_for_hardware: boolean;
   file_path?: string;
   actual_size_bytes?: number;
 }

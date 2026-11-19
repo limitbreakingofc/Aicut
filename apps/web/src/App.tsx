@@ -323,7 +323,7 @@ export function App() {
           <span className="brand-mark">A</span>
           <span>Aicut</span>
           <span style={{ color: "var(--text-muted)", fontWeight: 400, fontSize: 12 }}>
-            v0.2.0 · Modular AI Studio
+            v0.3.0 · Modular AI Studio
           </span>
         </div>
 
@@ -432,6 +432,7 @@ export function App() {
               media={media}
               tools={tools}
               jobs={jobs}
+              hardware={hardware}
               preselectedMediaId={transcribeTargetId}
               onNavigate={navigate}
               onNotify={pushToast}

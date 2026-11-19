@@ -14,22 +14,22 @@ use std::sync::Arc;
 
 use crate::engine::{start_transcription, TranscribeRequest, TranscribeResponse};
 use crate::exporters::{export_and_save_to_library, ExportFormat, ExportFormatInfo};
-use crate::models::{delete_model, download_model, list_models, WhisperModelStatus};
+use crate::models::{
+    delete_model, download_model, list_models, recommended_model_id, ModelUninstallResult,
+    WhisperModelStatus,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ModelsListOutput {
     pub models: Vec<WhisperModelStatus>,
+    pub recommended_model_id: String,
+    pub total_installed_bytes: u64,
+    pub installed_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ModelIdInput {
     pub model_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ModelDeleteOutput {
-    pub model_id: String,
-    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -88,12 +88,13 @@ impl AicutModule for TranscribeModule {
             id: "transcribe".to_string(),
             name: "Transcrição Local com IA (Whisper)".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            description: "Transcreve vídeos e áudios 100% offline com whisper.cpp + Whisper Large v3 Turbo e exporta qualquer formato de legenda ou timeline (SRT, VTT, ASS, FCPXML, Premiere XML, EDL, OTIO, CSV, JSON) direto para a Biblioteca.".to_string(),
+            description: "Transcreve vídeos e áudios 100% offline com whisper.cpp + Whisper Large v3 / Turbo selecionando modelos compatíveis com sua GPU e exporta 13 formatos de legenda ou timeline direto para a Biblioteca.".to_string(),
             category: "ai".to_string(),
             core: false,
             capabilities: vec![
                 "local-speech-to-text".into(),
                 "whisper-cpp".into(),
+                "gpu-model-curation".into(),
                 "word-timestamps".into(),
                 "subtitle-export".into(),
                 "timeline-export".into(),
@@ -105,7 +106,7 @@ impl AicutModule for TranscribeModule {
         vec![ToolDefinition {
             id: "whisper".to_string(),
             display_name: "whisper.cpp (IA Local)".to_string(),
-            description: "Motor nativo de transcrição offline (CUDA NVIDIA / OpenBLAS / ARM64) para rodar Whisper Large v3 Turbo e gerar legendas e timelines.".to_string(),
+            description: "Motor nativo de transcrição offline (CUDA NVIDIA / OpenBLAS / ARM64) para rodar Whisper Large v3 / Turbo e gerar legendas e timelines.".to_string(),
             owner_module: "transcribe".to_string(),
             category: "ai".to_string(),
             binary_name: "whisper-cli".to_string(),
@@ -119,7 +120,7 @@ impl AicutModule for TranscribeModule {
         let has_model = list_models(kernel).iter().any(|m| m.installed);
         match (has_whisper, has_model) {
             (true, true) => ModuleHealth::healthy("whisper.cpp e modelo prontos"),
-            (true, false) => ModuleHealth::degraded("whisper.cpp pronto — baixe um modelo na aba Transcrever IA"),
+            (true, false) => ModuleHealth::degraded("whisper.cpp pronto — baixe um modelo compatível na aba Transcrever IA"),
             (false, _) => ModuleHealth::degraded("whisper.cpp não instalado — instale em Configurações > Ferramentas"),
         }
     }
@@ -129,23 +130,40 @@ impl AicutModule for TranscribeModule {
             Arc::new(TypedAction::<EmptyInput, ModelsListOutput, _>::new(
                 "transcribe.models_list",
                 "transcribe",
-                "Listar Modelos Whisper",
-                "List available local Whisper GGML models (e.g. large-v3-turbo-q5_0, large-v3-turbo, small, medium, large-v3), installed status, and hardware recommendation.",
+                "Listar Modelos Whisper (Compatíveis com GPU)",
+                "List Whisper GGML model families & precision versions (FP16, Q8_0, Q5_0) evaluated against the user's GPU VRAM, CUDA version, and system RAM, including quality scores, compatibility reasons, and disk usage.",
                 ActionAnnotations { read_only: true, idempotent: true, ..Default::default() },
                 |ctx, _| {
                     Box::pin(async move {
                         let models = list_models(&ctx.kernel);
-                        let installed = models.iter().filter(|m| m.installed).count();
-                        let summary = format!("{installed}/{} Whisper model(s) installed", models.len());
-                        Ok((ModelsListOutput { models }, summary, vec![]))
+                        let installed_count = models.iter().filter(|m| m.installed).count();
+                        let total_installed_bytes: u64 = models
+                            .iter()
+                            .filter_map(|m| m.actual_size_bytes)
+                            .sum();
+                        let rec_id = recommended_model_id(&ctx.kernel.hardware).to_string();
+                        let summary = format!(
+                            "{installed_count}/{} model(s) installed (recommended: {rec_id})",
+                            models.len()
+                        );
+                        Ok((
+                            ModelsListOutput {
+                                models,
+                                recommended_model_id: rec_id,
+                                total_installed_bytes,
+                                installed_count,
+                            },
+                            summary,
+                            vec![],
+                        ))
                     })
                 },
             )),
             Arc::new(TypedAction::<ModelIdInput, WhisperModelStatus, _>::new(
                 "transcribe.model_download",
                 "transcribe",
-                "Baixar Modelo Whisper",
-                "Download a Whisper GGML model (recommended: 'large-v3-turbo-q5_0' or 'large-v3-turbo') locally for offline transcription.",
+                "Baixar Versão de Modelo Whisper",
+                "Download a specific Whisper GGML model version (e.g. 'large-v3-turbo', 'large-v3-turbo-q8_0', 'large-v3-turbo-q5_0', 'large-v3') locally for offline transcription.",
                 ActionAnnotations { long_running: true, ..Default::default() },
                 |ctx, input| {
                     Box::pin(async move {
@@ -155,17 +173,22 @@ impl AicutModule for TranscribeModule {
                     })
                 },
             )),
-            Arc::new(TypedAction::<ModelIdInput, ModelDeleteOutput, _>::new(
+            Arc::new(TypedAction::<ModelIdInput, ModelUninstallResult, _>::new(
                 "transcribe.model_delete",
                 "transcribe",
-                "Remover Modelo Whisper",
-                "Delete a downloaded local Whisper model file to free disk space.",
+                "Desinstalar Modelo Whisper Completamente",
+                "Completely uninstall a downloaded local Whisper model version from disk (removing weights and partial files) and report freed disk space.",
                 ActionAnnotations { destructive: true, ..Default::default() },
                 |ctx, input| {
                     Box::pin(async move {
-                        let deleted = delete_model(&ctx.kernel, &input.model_id)?;
-                        let summary = format!("Deleted model '{}': {deleted}", input.model_id);
-                        Ok((ModelDeleteOutput { model_id: input.model_id, deleted }, summary, vec![]))
+                        let res = delete_model(&ctx.kernel, &input.model_id)?;
+                        let mb = res.freed_bytes as f64 / (1024.0 * 1024.0);
+                        let summary = if res.deleted {
+                            format!("Completely uninstalled '{}' ({mb:.1} MB freed)", res.model_id)
+                        } else {
+                            format!("Model '{}' was not installed on disk", res.model_id)
+                        };
+                        Ok((res, summary, vec![]))
                     })
                 },
             )),

@@ -81,19 +81,17 @@ jobs:
           body: |
             ## Aicut ${{ steps.tag.outputs.name }} — Estúdio Modular AI-First para Windows 11
 
-            ### Novidades desta versão
-            - **Correção Crítica do `yt-dlp`**: corrigido o bug onde `--print` ativava `--simulate`/`--quiet` sem iniciar o download. Agora usa `--no-simulate --progress --print-to-file` com UTF-8 nativo, drenagem completa de logs/erros, `CREATE_NO_WINDOW` no Windows 11 e opção `--impersonate` (Chrome/Edge/Firefox) para sites protegidos como Kick.
-            - **Nova Aba 3 — Transcrever com IA Local (`whisper.cpp` + `Whisper Large v3 Turbo`)**:
-              - Detecção automática de hardware no menu **Configurações → Ferramentas** baixando a melhor build do `whisper.cpp` (NVIDIA CUDA 12, OpenBLAS/AVX2 ou ARM64) e modelos GGML (`large-v3-turbo-q5_0`, `large-v3-turbo`, `small`, `medium`, `large-v3`).
-              - **Exportador Universal (13 formatos)** salvando automaticamente na **Biblioteca**:
-                - **Legendas**: `SRT`, `WebVTT`, `ASS Estilizada`, `ASS Karaokê (palavra a palavra)`, `LRC`
-                - **Timelines de Editores**: `FCPXML 1.10` (DaVinci Resolve / CapCut / Final Cut), `Premiere Pro XML`, `EDL CMX 3600`, `OpenTimelineIO (.otio)`, `Marcadores CSV`
-                - **Transcrições**: `TXT Limpo`, `TXT com Timecodes`, `JSON Palavra-a-Palavra (para IAs)`
-            - **Biblioteca Expandida**: agora exibe vídeos, só vídeo, áudios, legendas, timelines e transcrições com preview integrado, cópia em 1 clique e botão direto para transcrever.
-            - **Qualquer Chat de IA conectado com paridade humana**: MCP (`http://127.0.0.1:43210/mcp` + `aicut mcp`), OpenAPI 3.1 (`/openapi.json`) e CLI JSON (`aicut-cli-windows-x86_64.exe`).
+            ### Novidades da v0.3.0
+            - **Detecção Exata da Versão do CUDA (`13.x` / `12.x` / `11.x`)**: o Aicut agora lê diretamente a versão do CUDA suportada pelo seu driver NVIDIA (via `nvidia-smi`) e seleciona dinamicamente a **maior build CUDA compatível** de ferramentas como `whisper.cpp` (sem versão travada no código).
+            - **Curadoria Inteligente de Modelos por GPU & Hardware**:
+              - Na aba **Transcrever IA**, o Aicut mostra por padrão **apenas os melhores modelos compatíveis com a VRAM da sua GPU e RAM do seu PC** (com opção de ver todos os modelos).
+              - **Seletor de Versões/Precisão por Família (`FP16`, `Q8_0`, `Q5_0`)**: alterne facilmente entre as versões de cada família (`Whisper Large v3 Turbo`, `Whisper Large v3`, `Large v2`) com **descrição clara de qual entrega a maior qualidade final** (`10/10`, `9.8/10`, `9.7/10`), VRAM exigida e velocidade.
+              - **Troca rápida do modelo ativo** (salvo automaticamente) + **Desinstalação Completa** removendo arquivos `.bin`/`.part` do disco e mostrando exatamente quantos MB/GB foram liberados.
+            - **Inclui todas as melhorias da v0.2.0**: `yt-dlp` corrigido (`--no-simulate --print-to-file` + `--impersonate`), 13 formatos de legenda e timeline (`SRT`, `VTT`, `ASS Karaokê`, `FCPXML DaVinci/CapCut`, `Premiere XML`, `EDL`, `OTIO`, `CSV`, `JSON`) salvos direto na **Biblioteca**, e controle completo por qualquer chat de IA via **MCP / OpenAPI 3.1 / CLI**.
 
             ### Como instalar / atualizar no Windows 11
             1. Baixe e execute **`Aicut_*_x64-setup.exe`** (recomendado) ou **`.msi`** nos assets abaixo.
-            2. Abra o **Aicut**, vá em **Configurações → Ferramentas** e clique em **Instalar / Atualizar Tudo** para instalar/atualizar `yt-dlp`, `FFmpeg` e `whisper.cpp` na melhor versão para seu hardware.
+            2. Em **Configurações → Ferramentas**, clique em **Instalar / Atualizar Tudo** para garantir `yt-dlp`, `FFmpeg` e `whisper.cpp` na melhor build para seu hardware/CUDA.
+            3. Na aba **Transcrever IA**, escolha a versão ideal do melhor modelo compatível com sua GPU e comece a gerar legendas e timelines!
           files: |
             release-assets/*

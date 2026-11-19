@@ -1,13 +1,16 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   AlertTriangle,
   ArrowRight,
+  Award,
   Check,
   CheckCircle2,
+  Cpu,
   Download,
   FileCode2,
   FileText,
   Film,
+  HardDrive,
   Loader2,
   Mic,
   Play,
@@ -16,9 +19,10 @@ import {
   Trash2,
 } from "lucide-react";
 import { AicutActionError, runAction } from "../../lib/client";
-import { formatDuration, formatRelativeDate } from "../../lib/format";
+import { formatBytes, formatDuration, formatRelativeDate } from "../../lib/format";
 import type {
   ExportFormatInfo,
+  HardwareProfile,
   JobRecord,
   MediaAsset,
   RouteId,
@@ -31,6 +35,7 @@ interface TranscribeViewProps {
   media: MediaAsset[];
   tools: ToolStatus[];
   jobs: JobRecord[];
+  hardware: HardwareProfile | null;
   preselectedMediaId?: string | null;
   onNavigate: (route: RouteId) => void;
   onNotify: (level: "info" | "success" | "warning" | "error", title: string, message: string) => void;
@@ -53,6 +58,7 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
   media,
   tools,
   jobs,
+  hardware,
   preselectedMediaId,
   onNavigate,
   onNotify,
@@ -67,11 +73,21 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
     preselectedMediaId ?? playableMedia[0]?.id ?? "",
   );
   const [models, setModels] = useState<WhisperModelStatus[]>([]);
+  const [totalInstalledBytes, setTotalInstalledBytes] = useState<number>(0);
+  const [showAllModels, setShowAllModels] = useState(false);
+
+  // Per-family active version tab (e.g. family "large-v3-turbo" -> "large-v3-turbo-q8_0")
+  const [familySelection, setFamilySelection] = useState<Record<string, string>>({});
+
+  // Globally active model version used for transcription
+  const [selectedModel, setSelectedModel] = useState<string>(() => {
+    return localStorage.getItem("aicut_whisper_model") ?? "";
+  });
+
   const [formats, setFormats] = useState<ExportFormatInfo[]>([]);
   const [transcripts, setTranscripts] = useState<TranscriptRecord[]>([]);
   const [activeTranscriptId, setActiveTranscriptId] = useState<string | null>(null);
 
-  const [selectedModel, setSelectedModel] = useState<string>("large-v3-turbo-q5_0");
   const [language, setLanguage] = useState<string>("auto");
   const [translateToEnglish, setTranslateToEnglish] = useState(false);
   const [wordTimestamps, setWordTimestamps] = useState(true);
@@ -80,6 +96,7 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
   const [selectedFormats, setSelectedFormats] = useState<string[]>(["srt", "fcpxml", "json"]);
 
   const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
+  const [uninstallingModel, setUninstallingModel] = useState<string | null>(null);
   const [installingEngine, setInstallingEngine] = useState(false);
   const [starting, setStarting] = useState(false);
   const [exportingFmt, setExportingFmt] = useState<string | null>(null);
@@ -96,25 +113,65 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
     }
   }, [preselectedMediaId, playableMedia.length]);
 
+  const chooseActiveModel = (modelId: string) => {
+    setSelectedModel(modelId);
+    localStorage.setItem("aicut_whisper_model", modelId);
+    void runAction("system.set_setting", {
+      key: "default_whisper_model",
+      value: modelId,
+    }).catch(() => {});
+  };
+
   const loadAll = async () => {
     try {
       const [mRes, fRes, tRes] = await Promise.all([
-        runAction<{ models: WhisperModelStatus[] }>("transcribe.models_list"),
+        runAction<{
+          models: WhisperModelStatus[];
+          recommended_model_id: string;
+          total_installed_bytes: number;
+        }>("transcribe.models_list"),
         runAction<{ formats: ExportFormatInfo[] }>("transcribe.formats_list"),
         runAction<{ transcripts: TranscriptRecord[] }>("transcribe.list"),
       ]);
       const mList = mRes.data.models ?? [];
       setModels(mList);
+      setTotalInstalledBytes(mRes.data.total_installed_bytes ?? 0);
       setFormats(fRes.data.formats ?? []);
       const tList = tRes.data.transcripts ?? [];
       setTranscripts(tList);
       if (tList.length > 0 && !activeTranscriptId) {
         setActiveTranscriptId(tList[0].id);
       }
-      const installedDefault = mList.find((m) => m.installed) ?? mList.find((m) => m.recommended);
-      if (installedDefault) {
-        setSelectedModel((curr) => curr || installedDefault.id);
-      }
+
+      // Initialize per-family default version (prefer installed -> recommended -> highest quality compatible)
+      setFamilySelection((prev) => {
+        const next = { ...prev };
+        const byFamily = new Map<string, WhisperModelStatus[]>();
+        for (const m of mList) {
+          const arr = byFamily.get(m.family_id) ?? [];
+          arr.push(m);
+          byFamily.set(m.family_id, arr);
+        }
+        for (const [famId, items] of byFamily.entries()) {
+          if (!next[famId] || !items.some((x) => x.id === next[famId])) {
+            const pick =
+              items.find((x) => x.installed) ??
+              items.find((x) => x.recommended) ??
+              items.find((x) => x.compatible) ??
+              items[0];
+            if (pick) next[famId] = pick.id;
+          }
+        }
+        return next;
+      });
+
+      // Ensure active model points to a valid installed or recommended model
+      setSelectedModel((curr) => {
+        if (curr && mList.some((m) => m.id === curr && m.installed)) return curr;
+        const firstInstalled = mList.find((m) => m.installed);
+        if (firstInstalled) return firstInstalled.id;
+        return mRes.data.recommended_model_id || mList[0]?.id || "large-v3-turbo-q5_0";
+      });
     } catch {
       // ignore if offline
     }
@@ -124,7 +181,6 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
     void loadAll();
   }, []);
 
-  // Reload transcripts automatically whenever a transcription job completes
   const activeTranscribeJobs = jobs.filter(
     (j) =>
       (j.kind === "transcribe.run" || j.kind === "transcribe.model_download") &&
@@ -141,6 +197,51 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
     }
   }, [completedTranscribeCount]);
 
+  // Group visible models by family (default: ONLY curated hardware-compatible best models + any already installed!)
+  const visibleFamilies = useMemo(() => {
+    const visible = showAllModels
+      ? models
+      : models.filter((m) => m.curated_for_hardware || m.installed);
+
+    const groups: Array<{
+      familyId: string;
+      familyName: string;
+      versions: WhisperModelStatus[];
+      maxQuality: number;
+      hasRecommended: boolean;
+      hasBestQuality: boolean;
+    }> = [];
+
+    const map = new Map<string, WhisperModelStatus[]>();
+    for (const m of visible) {
+      const list = map.get(m.family_id) ?? [];
+      list.push(m);
+      map.set(m.family_id, list);
+    }
+
+    for (const [familyId, versions] of map.entries()) {
+      versions.sort((a, b) => b.quality_score - a.quality_score);
+      groups.push({
+        familyId,
+        familyName: versions[0].family_name,
+        versions,
+        maxQuality: Math.max(...versions.map((v) => v.quality_score)),
+        hasRecommended: versions.some((v) => v.recommended),
+        hasBestQuality: versions.some((v) => v.best_quality_for_hardware),
+      });
+    }
+
+    // Put recommended / highest quality families first
+    groups.sort((a, b) => {
+      if (a.hasRecommended !== b.hasRecommended) return a.hasRecommended ? -1 : 1;
+      return b.maxQuality - a.maxQuality;
+    });
+
+    return groups;
+  }, [models, showAllModels]);
+
+  const installedModels = useMemo(() => models.filter((m) => m.installed), [models]);
+
   async function handleInstallWhisperEngine() {
     setInstallingEngine(true);
     try {
@@ -154,13 +255,13 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
     }
   }
 
-  async function handleDownloadModel(modelId: string, name: string) {
-    setDownloadingModel(modelId);
+  async function handleDownloadModel(model: WhisperModelStatus) {
+    setDownloadingModel(model.id);
     try {
-      await runAction("transcribe.model_download", { model_id: modelId });
+      await runAction("transcribe.model_download", { model_id: model.id });
       await loadAll();
-      setSelectedModel(modelId);
-      onNotify("success", "Modelo baixado!", `${name} pronto para uso 100% offline.`);
+      chooseActiveModel(model.id);
+      onNotify("success", "Modelo instalado!", `${model.display_name} pronto e selecionado como ativo.`);
     } catch (e) {
       onNotify("error", "Erro ao baixar modelo", (e as Error).message);
     } finally {
@@ -168,13 +269,24 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
     }
   }
 
-  async function handleDeleteModel(modelId: string) {
+  async function handleUninstallModel(model: WhisperModelStatus) {
+    setUninstallingModel(model.id);
     try {
-      await runAction("transcribe.model_delete", { model_id: modelId });
+      const res = await runAction<{
+        model_id: string;
+        deleted: boolean;
+        freed_bytes: number;
+      }>("transcribe.model_delete", { model_id: model.id });
       await loadAll();
-      onNotify("info", "Modelo removido", `Modelo ${modelId} apagado do disco.`);
+      onNotify(
+        "success",
+        "Modelo desinstalado completamente",
+        `${model.display_name} removido do disco (${formatBytes(res.data.freed_bytes)} liberados).`,
+      );
     } catch (e) {
-      onNotify("error", "Erro ao remover modelo", (e as Error).message);
+      onNotify("error", "Erro ao desinstalar modelo", (e as Error).message);
+    } finally {
+      setUninstallingModel(null);
     }
   }
 
@@ -206,11 +318,13 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
       onNotify(
         "success",
         "Transcrição iniciada",
-        `Job ${res.data.job_id.slice(0, 8)} rodando localmente — os formatos selecionados irão para a Biblioteca.`,
+        `Job ${res.data.job_id.slice(0, 8)} usando ${chosenModelObj?.display_name ?? selectedModel}.`,
       );
     } catch (e) {
       const msg =
-        e instanceof AicutActionError && e.detail.hint ? `${e.message} — ${e.detail.hint}` : (e as Error).message;
+        e instanceof AicutActionError && e.detail.hint
+          ? `${e.message} — ${e.detail.hint}`
+          : (e as Error).message;
       onNotify("error", "Não foi possível iniciar transcrição", msg);
     } finally {
       setStarting(false);
@@ -251,13 +365,19 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
   const timelineFormats = formats.filter((f) => f.category === "timeline");
   const transcriptFormats = formats.filter((f) => f.category === "transcript");
 
+  const gpuSummary = hardware
+    ? hardware.gpus.length > 0
+      ? `${hardware.gpus[0].name}${hardware.gpus[0].vram_mb ? ` (${(hardware.gpus[0].vram_mb / 1024).toFixed(1)} GB VRAM)` : ""}${hardware.cuda_version ? ` · CUDA ${hardware.cuda_version}` : ""}`
+      : `CPU ${hardware.cpu_brand} (${(hardware.total_memory_mb / 1024).toFixed(1)} GB RAM)`
+    : "Detectando hardware...";
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
       <div className="page-header">
         <div>
           <h1 className="page-title">Transcrever com IA Local (Whisper)</h1>
           <p className="page-subtitle">
-            Transcreva qualquer vídeo ou áudio 100% offline com whisper.cpp + Whisper Large v3 Turbo e salve qualquer formato de legenda ou timeline direto na Biblioteca.
+            Modelos filtrados automaticamente para sua GPU e hardware — troque versões/precisões comparando a qualidade final e desinstale modelos completamente quando quiser.
           </p>
         </div>
         <button type="button" className="btn" onClick={() => onNavigate("library")}>
@@ -285,7 +405,7 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
               <strong style={{ fontSize: 13.5 }}>Motor de IA Local pendente</strong>
               <div style={{ fontSize: 12.5, color: "var(--text-secondary)" }}>
                 {!whisperTool?.installed
-                  ? `whisper.cpp ainda não instalado. Build recomendada para seu PC: ${whisperTool?.recommended_build ?? "auto"}.`
+                  ? `whisper.cpp não instalado. Build ideal detectada: ${whisperTool?.recommended_build ?? "auto"}.`
                   : "FFmpeg necessário para extrair o áudio do vídeo."}
               </div>
             </div>
@@ -309,16 +429,268 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
         </div>
       )}
 
-      {/* Transcription Form */}
+      {/* ================================================================ */}
+      {/* GPU-CURATED MODEL & VERSION MANAGER                              */}
+      {/* ================================================================ */}
+      <div className="panel" style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+        <div
+          style={{
+            display: "flex",
+            flexWrap: "wrap",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 10,
+          }}
+        >
+          <div>
+            <h2 className="panel-title">
+              <Cpu size={16} color="var(--accent)" /> Modelos Compatíveis com seu Hardware
+            </h2>
+            <div style={{ fontSize: 12.5, color: "var(--text-secondary)", marginTop: 3 }}>
+              {gpuSummary}
+            </div>
+          </div>
+
+          <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
+            <span className="pill">
+              <HardDrive size={11} /> Instalados: {installedModels.length} ({formatBytes(totalInstalledBytes)})
+            </span>
+            <label className="check-row" style={{ fontSize: 12.5 }}>
+              <input
+                type="checkbox"
+                checked={showAllModels}
+                onChange={(e) => setShowAllModels(e.target.checked)}
+              />
+              Mostrar todos (incl. incompatíveis)
+            </label>
+          </div>
+        </div>
+
+        {/* Active installed models quick-switcher strip */}
+        {installedModels.length > 0 && (
+          <div
+            style={{
+              display: "flex",
+              flexWrap: "wrap",
+              alignItems: "center",
+              gap: 8,
+              padding: "10px 12px",
+              borderRadius: "var(--radius-md)",
+              background: "var(--bg-elevated)",
+              border: "1px solid var(--border-subtle)",
+            }}
+          >
+            <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text-secondary)" }}>
+              Modelo ativo para transcrever:
+            </span>
+            {installedModels.map((m) => (
+              <button
+                key={m.id}
+                type="button"
+                className={`btn btn-sm ${selectedModel === m.id ? "btn-primary" : ""}`}
+                onClick={() => chooseActiveModel(m.id)}
+              >
+                {selectedModel === m.id && <Check size={12} />}
+                {m.display_name}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Family Cards with Interactive Version Switcher + Final Quality Comparison */}
+        <div className="grid-2">
+          {visibleFamilies.map((fam) => {
+            const viewedId = familySelection[fam.familyId] ?? fam.versions[0]?.id;
+            const current =
+              fam.versions.find((v) => v.id === viewedId) ?? fam.versions[0];
+            if (!current) return null;
+
+            const isActiveForUse = selectedModel === current.id && current.installed;
+            const isDownloading = downloadingModel === current.id;
+            const isUninstalling = uninstallingModel === current.id;
+
+            return (
+              <div
+                key={fam.familyId}
+                style={{
+                  padding: 15,
+                  borderRadius: "var(--radius-md)",
+                  background: isActiveForUse ? "var(--accent-soft)" : "var(--bg-elevated)",
+                  border: `1px solid ${isActiveForUse ? "var(--accent-border)" : "var(--border-subtle)"}`,
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 11,
+                }}
+              >
+                {/* Family Header */}
+                <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8 }}>
+                  <div>
+                    <strong style={{ fontSize: 14.5 }}>{fam.familyName}</strong>
+                    <div style={{ fontSize: 12, color: "var(--text-secondary)", marginTop: 2 }}>
+                      {current.description}
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+                    {current.best_quality_for_hardware && (
+                      <span className="pill success">
+                        <Award size={11} /> Maior Qualidade Final
+                      </span>
+                    )}
+                    {current.recommended && (
+                      <span className="pill accent">Recomendado p/ sua GPU</span>
+                    )}
+                  </div>
+                </div>
+
+                {/* Version / Quantization Switcher Pills */}
+                <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                  <span style={{ fontSize: 11.5, color: "var(--text-muted)", fontWeight: 600 }}>
+                    Versão / Precisão ({fam.versions.length} disponível(is)):
+                  </span>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                    {fam.versions.map((ver) => {
+                      const activeTab = ver.id === current.id;
+                      return (
+                        <button
+                          key={ver.id}
+                          type="button"
+                          className={`btn btn-sm ${activeTab ? "btn-primary" : ""}`}
+                          style={{ fontSize: 12 }}
+                          onClick={() => {
+                            setFamilySelection((prev) => ({
+                              ...prev,
+                              [fam.familyId]: ver.id,
+                            }));
+                            if (ver.installed) {
+                              chooseActiveModel(ver.id);
+                            }
+                          }}
+                        >
+                          {ver.installed && (
+                            <span
+                              style={{
+                                width: 6,
+                                height: 6,
+                                borderRadius: "50%",
+                                background: activeTab ? "var(--accent-fg)" : "var(--success)",
+                              }}
+                            />
+                          )}
+                          {ver.version_tag}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Explicit Quality & Hardware Comparison Details */}
+                <div
+                  style={{
+                    padding: "10px 12px",
+                    borderRadius: "var(--radius-sm)",
+                    background: "var(--bg-surface)",
+                    border: "1px solid var(--border-subtle)",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 6,
+                    fontSize: 12.5,
+                  }}
+                >
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                    <span className="pill accent">Qualidade: {current.quality_tier}</span>
+                    <span className="pill">{current.speed_tier}</span>
+                    <span className="pill">{current.size_mb} MB</span>
+                    <span className="pill">
+                      VRAM mín: {(current.min_vram_mb / 1024).toFixed(1)} GB
+                    </span>
+                  </div>
+                  <div style={{ color: "var(--text-primary)", lineHeight: 1.45 }}>
+                    <strong>Qualidade final:</strong> {current.quality_notes}
+                  </div>
+                  <div
+                    style={{
+                      fontSize: 12,
+                      color: current.compatible ? "var(--success)" : "var(--danger)",
+                    }}
+                  >
+                    {current.compatibility_reason}
+                  </div>
+                </div>
+
+                {/* Actions: Download / Select Active / Complete Uninstall */}
+                <div
+                  style={{
+                    display: "flex",
+                    flexWrap: "wrap",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: 8,
+                    marginTop: "auto",
+                    paddingTop: 4,
+                  }}
+                >
+                  {current.installed ? (
+                    <>
+                      <button
+                        type="button"
+                        className={`btn btn-sm ${isActiveForUse ? "btn-primary" : ""}`}
+                        onClick={() => chooseActiveModel(current.id)}
+                      >
+                        {isActiveForUse ? (
+                          <>
+                            <CheckCircle2 size={13} /> Em uso para transcrever
+                          </>
+                        ) : (
+                          <>Usar esta Versão</>
+                        )}
+                      </button>
+
+                      <button
+                        type="button"
+                        className="btn btn-danger btn-sm"
+                        disabled={isUninstalling}
+                        onClick={() => handleUninstallModel(current)}
+                      >
+                        {isUninstalling ? <Loader2 size={13} /> : <Trash2 size={13} />}
+                        Desinstalar Completamente
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <span style={{ fontSize: 12, color: "var(--text-muted)" }}>
+                        Não instalado no disco
+                      </span>
+                      <button
+                        type="button"
+                        className="btn btn-primary btn-sm"
+                        disabled={isDownloading}
+                        onClick={() => handleDownloadModel(current)}
+                      >
+                        {isDownloading ? <Loader2 size={13} /> : <Download size={13} />}
+                        Baixar {current.version_tag.split(" ")[0]} ({current.size_mb} MB)
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* ================================================================ */}
+      {/* TRANSCRIPTION EXECUTION FORM                                     */}
+      {/* ================================================================ */}
       <form onSubmit={handleStartTranscription} style={{ display: "flex", flexDirection: "column", gap: 16 }}>
         <div className="panel" style={{ display: "flex", flexDirection: "column", gap: 16 }}>
           <div className="panel-header" style={{ marginBottom: 0 }}>
             <h2 className="panel-title">
-              <Mic size={16} color="var(--accent)" /> Nova Transcrição Local
+              <Mic size={16} color="var(--accent)" /> Transcrever Vídeo / Áudio da Biblioteca
             </h2>
-            {whisperTool?.installed && (
-              <span className="pill success">
-                <CheckCircle2 size={11} /> {whisperTool.recommended_build}
+            {chosenModelObj && (
+              <span className={`pill ${chosenModelObj.installed ? "success" : "warning"}`}>
+                {chosenModelObj.installed ? <CheckCircle2 size={11} /> : <AlertTriangle size={11} />}
+                {chosenModelObj.display_name}
               </span>
             )}
           </div>
@@ -359,75 +731,6 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
                   </option>
                 ))}
               </select>
-            </div>
-          </div>
-
-          {/* Model Selector Grid */}
-          <div className="field">
-            <label>Modelo Local Whisper (escolha e baixe com 1 clique)</label>
-            <div className="grid-3">
-              {models.map((m) => {
-                const isSelected = selectedModel === m.id;
-                const isBusy = downloadingModel === m.id;
-                return (
-                  <div
-                    key={m.id}
-                    onClick={() => setSelectedModel(m.id)}
-                    style={{
-                      padding: 12,
-                      borderRadius: "var(--radius-md)",
-                      background: isSelected ? "var(--accent-soft)" : "var(--bg-elevated)",
-                      border: `1px solid ${isSelected ? "var(--accent-border)" : "var(--border-subtle)"}`,
-                      cursor: "pointer",
-                      display: "flex",
-                      flexDirection: "column",
-                      gap: 6,
-                    }}
-                  >
-                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6 }}>
-                      <strong style={{ fontSize: 13 }}>{m.display_name}</strong>
-                      {m.recommended && <span className="pill accent">Recomendado</span>}
-                    </div>
-                    <div style={{ fontSize: 11.5, color: "var(--text-secondary)" }}>{m.description}</div>
-                    <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginTop: "auto", paddingTop: 4 }}>
-                      <span className="pill">{m.size_mb} MB</span>
-                      <span className="pill">{m.speed_tier}</span>
-                      {m.installed ? (
-                        <span className="pill success">
-                          <Check size={10} /> Instalado
-                        </span>
-                      ) : (
-                        <button
-                          type="button"
-                          className="btn btn-primary btn-sm"
-                          style={{ marginLeft: "auto", padding: "3px 9px", fontSize: 11.5 }}
-                          disabled={isBusy}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            void handleDownloadModel(m.id, m.display_name);
-                          }}
-                        >
-                          {isBusy ? <Loader2 size={12} /> : <Download size={12} />} Baixar
-                        </button>
-                      )}
-                      {m.installed && (
-                        <button
-                          type="button"
-                          className="btn btn-ghost btn-sm"
-                          style={{ marginLeft: "auto", padding: "2px 6px" }}
-                          title="Remover modelo do disco"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            void handleDeleteModel(m.id);
-                          }}
-                        >
-                          <Trash2 size={12} />
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
             </div>
           </div>
 
@@ -543,8 +846,8 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
           >
             <div style={{ fontSize: 12.5, color: "var(--text-secondary)" }}>
               {chosenModelObj && !chosenModelObj.installed
-                ? `Clique em "Baixar" no cartão do modelo ${chosenModelObj.display_name} antes de transcrever.`
-                : `${selectedFormats.length} formato(s) serão salvos na Biblioteca vinculados ao vídeo.`}
+                ? `Baixe uma versão de modelo compatível acima antes de iniciar.`
+                : `${selectedFormats.length} formato(s) serão salvos automaticamente na Biblioteca.`}
             </div>
             <button
               type="submit"
@@ -553,7 +856,7 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
                 starting ||
                 !selectedMediaId ||
                 !whisperTool?.installed ||
-                (chosenModelObj ? !chosenModelObj.installed : false)
+                !chosenModelObj?.installed
               }
             >
               {starting ? <Loader2 size={15} /> : <Sparkles size={15} />}
@@ -606,7 +909,6 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
           </div>
         ) : (
           <div style={{ display: "grid", gridTemplateColumns: "280px 1fr", gap: 16 }}>
-            {/* Left list of transcripts */}
             <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 420, overflowY: "auto" }}>
               {transcripts.map((t) => (
                 <div
@@ -649,7 +951,6 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
               ))}
             </div>
 
-            {/* Right: Instant Export Bar + Segments */}
             {activeTranscript && (
               <div style={{ display: "flex", flexDirection: "column", gap: 12, minWidth: 0 }}>
                 <div
@@ -663,7 +964,7 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
                   }}
                 >
                   <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text-secondary)" }}>
-                    Salvar outro formato de legenda ou timeline na Biblioteca (instantâneo, sem rodar a IA de novo):
+                    Salvar outro formato de legenda ou timeline na Biblioteca (instantâneo):
                   </div>
                   <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                     {formats.map((f) => {
