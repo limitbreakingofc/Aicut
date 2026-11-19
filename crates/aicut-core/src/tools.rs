@@ -11,6 +11,7 @@ use crate::error::{AicutError, AicutResult};
 use crate::events::{ActorKind, AicutEvent, EventBus};
 use crate::hardware::{AccelBackend, HardwareProfile};
 use crate::jobs::{JobManager, JobProgress};
+use crate::process::configure_tokio_command;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -19,9 +20,11 @@ pub enum ToolInstallStrategy {
     YtDlpOfficialRelease,
     /// Downloads the optimal FFmpeg/FFprobe build (including NVENC/AMF/QSV support on Windows x64).
     FfmpegHardwareBundle,
+    /// Downloads the official ggml-org/whisper.cpp release matching GPU/CPU hardware (CUDA 12 / Vulkan / OpenBLAS / ARM64 / Linux).
+    WhisperCppOfficialRelease,
     /// Companion binary provided alongside another managed tool (e.g. ffprobe inside ffmpeg bundle).
     CompanionOf(String),
-    /// Placeholder for future module-provided tools (Whisper, ONNX, etc.).
+    /// Placeholder for future module-provided tools.
     Custom { homepage: String },
 }
 
@@ -32,7 +35,7 @@ pub struct ToolDefinition {
     pub description: String,
     pub owner_module: String,
     pub category: String,
-    /// Base binary name without .exe suffix (e.g. "yt-dlp", "ffmpeg", "ffprobe").
+    /// Base binary name without .exe suffix (e.g. "yt-dlp", "ffmpeg", "ffprobe", "whisper-cli").
     pub binary_name: String,
     pub version_args: Vec<String>,
     pub strategy: ToolInstallStrategy,
@@ -69,8 +72,10 @@ pub struct ResolvedDownload {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveKind {
     SingleBinary,
-    Zip,
-    TarXzOrGz,
+    FfmpegZip,
+    FfmpegTarGz,
+    WhisperZip,
+    WhisperTarGz,
 }
 
 pub struct ToolManager {
@@ -91,7 +96,7 @@ impl ToolManager {
         jobs: Arc<JobManager>,
     ) -> Self {
         let http = reqwest::Client::builder()
-            .user_agent("Aicut/0.1.0 (+https://github.com/limitbreakingofc/Aicut)")
+            .user_agent("Aicut/0.2.0 (+https://github.com/limitbreakingofc/Aicut)")
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -110,6 +115,10 @@ impl ToolManager {
         &self.hardware
     }
 
+    pub fn http_client(&self) -> &reqwest::Client {
+        &self.http
+    }
+
     pub fn register_tool(&self, def: ToolDefinition) {
         if let Ok(mut guard) = self.definitions.write() {
             guard.insert(def.id.clone(), def);
@@ -126,12 +135,23 @@ impl ToolManager {
         items
     }
 
-    /// Resolves a binary path: checks Aicut's managed `bin_dir` first, then system PATH.
+    /// Resolves a binary path: checks Aicut's managed `bin_dir` (and `bin_dir/whisper`), then system PATH.
     pub fn resolve_binary(&self, binary_name: &str) -> Option<(PathBuf, bool)> {
         let managed_name = platform_binary_name(binary_name);
-        let managed_path = self.bin_dir.join(&managed_name);
-        if managed_path.is_file() {
-            return Some((managed_path, true));
+        let direct = self.bin_dir.join(&managed_name);
+        if direct.is_file() {
+            return Some((direct, true));
+        }
+        let in_whisper_dir = self.bin_dir.join("whisper").join(&managed_name);
+        if in_whisper_dir.is_file() {
+            return Some((in_whisper_dir, true));
+        }
+        // Fallback for older whisper.cpp builds where the executable was named `main`
+        if binary_name == "whisper-cli" {
+            let legacy = self.bin_dir.join("whisper").join(platform_binary_name("main"));
+            if legacy.is_file() {
+                return Some((legacy, true));
+            }
         }
         if let Ok(path) = which::which(binary_name) {
             return Some((path, false));
@@ -176,8 +196,7 @@ impl ToolManager {
                     format!("Selecionado automaticamente para plataforma {tag}."),
                 )
             }
-            ToolInstallStrategy::FfmpegHardwareBundle
-            | ToolInstallStrategy::CompanionOf(_) => {
+            ToolInstallStrategy::FfmpegHardwareBundle | ToolInstallStrategy::CompanionOf(_) => {
                 let build = match tag {
                     "win-x64" => "FFmpeg Win64 GPL (NVENC + AMF + QSV)",
                     "win-arm64" => "FFmpeg WinARM64 Native GPL",
@@ -195,15 +214,46 @@ impl ToolManager {
                     AccelBackend::QsvOpenvino => {
                         "GPU Intel detectada: build inclui suporte QuickSync (QSV) acelerado por hardware."
                     }
-                    AccelBackend::Metal => {
-                        "Apple Silicon detectado: suporte VideoToolbox nativo."
-                    }
+                    AccelBackend::Metal => "Apple Silicon detectado: suporte VideoToolbox nativo.",
                     AccelBackend::CpuOnly => {
                         "Modo CPU otimizado: build multithread para todos os núcleos lógicos."
                     }
                 };
                 (build.to_string(), hw_note.to_string())
             }
+            ToolInstallStrategy::WhisperCppOfficialRelease => match (tag, accel) {
+                ("win-x64", AccelBackend::CudaNvenc) => (
+                    "whisper.cpp Win64 CUDA 12 (GPU NVIDIA)".to_string(),
+                    "GPU NVIDIA detectada: seleciona build oficial CUDA 12 para transcrição ultrarrápida na GPU."
+                        .to_string(),
+                ),
+                ("win-x64", AccelBackend::AmfDirectml | AccelBackend::QsvOpenvino) => (
+                    "whisper.cpp Win64 Vulkan / OpenBLAS".to_string(),
+                    "GPU AMD/Intel detectada: prefere build Vulkan se disponível ou OpenBLAS SIMD otimizado."
+                        .to_string(),
+                ),
+                ("win-x64", _) => (
+                    "whisper.cpp Win64 OpenBLAS AVX2 (CPU)".to_string(),
+                    "Build oficial OpenBLAS otimizada para múltiplos núcleos de CPU no Windows 11."
+                        .to_string(),
+                ),
+                ("win-arm64", _) => (
+                    "whisper.cpp Win ARM64 Native".to_string(),
+                    "Build oficial nativa para Windows 11 ARM64.".to_string(),
+                ),
+                ("linux-x64", _) => (
+                    "whisper.cpp Linux x64 Official".to_string(),
+                    "Build oficial pré-compilada Linux x64.".to_string(),
+                ),
+                ("linux-arm64", _) => (
+                    "whisper.cpp Linux ARM64 Official".to_string(),
+                    "Build oficial pré-compilada Linux ARM64.".to_string(),
+                ),
+                _ => (
+                    format!("whisper.cpp ({tag})"),
+                    "Build oficial ggml-org/whisper.cpp.".to_string(),
+                ),
+            },
             ToolInstallStrategy::Custom { homepage } => (
                 format!("Hardware-matched ({tag})"),
                 format!("Gerenciado pelo módulo proprietário ({homepage})."),
@@ -223,7 +273,19 @@ impl ToolManager {
         let resolved = self.resolve_binary(&def.binary_name);
         let (installed, binary_path, managed_by_aicut, installed_version) = match resolved {
             Some((path, managed)) => {
-                let ver = probe_binary_version(&path, &def.version_args).await;
+                // For managed whisper.cpp, read stored version marker if available
+                let marker_ver = if def.id == "whisper" && managed {
+                    std::fs::read_to_string(self.bin_dir.join("whisper").join(".version"))
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                } else {
+                    None
+                };
+                let ver = match marker_ver {
+                    Some(v) => Some(v),
+                    None => probe_binary_version(&path, &def.version_args).await,
+                };
                 (true, Some(path.to_string_lossy().to_string()), managed, ver)
             }
             None => (false, None, false, None),
@@ -289,6 +351,13 @@ impl ToolManager {
                         }
                     }
                 }
+                ToolInstallStrategy::WhisperCppOfficialRelease => {
+                    if let Ok(resolved) = self.resolve_whisper_release().await {
+                        if let Ok(mut cache) = self.latest_cache.write() {
+                            cache.insert(def.id.clone(), resolved.version);
+                        }
+                    }
+                }
                 ToolInstallStrategy::CompanionOf(_) | ToolInstallStrategy::Custom { .. } => {}
             }
         }
@@ -334,13 +403,19 @@ impl ToolManager {
             let resolved = match &target_def.strategy {
                 ToolInstallStrategy::YtDlpOfficialRelease => self.resolve_ytdlp_release().await?,
                 ToolInstallStrategy::FfmpegHardwareBundle => self.resolve_ffmpeg_release().await?,
+                ToolInstallStrategy::WhisperCppOfficialRelease => {
+                    self.resolve_whisper_release().await?
+                }
                 ToolInstallStrategy::CompanionOf(_) => {
                     return Err(AicutError::internal("Companion tool resolution loop"));
                 }
                 ToolInstallStrategy::Custom { homepage } => {
                     return Err(AicutError::new(
                         "UNSUPPORTED_AUTO_INSTALL",
-                        format!("Tool '{}' must be installed via its module ({homepage}).", target_def.id),
+                        format!(
+                            "Tool '{}' must be installed via its module ({homepage}).",
+                            target_def.id
+                        ),
                     ));
                 }
             };
@@ -378,12 +453,24 @@ impl ToolManager {
                     replace_file(&tmp_path, &final_path)?;
                     make_executable(&final_path)?;
                 }
-                ArchiveKind::Zip => {
+                ArchiveKind::FfmpegZip => {
                     extract_ffmpeg_from_zip(&tmp_path, &self.bin_dir)?;
                     let _ = std::fs::remove_file(&tmp_path);
                 }
-                ArchiveKind::TarXzOrGz => {
+                ArchiveKind::FfmpegTarGz => {
                     extract_ffmpeg_from_targz(&tmp_path, &self.bin_dir)?;
+                    let _ = std::fs::remove_file(&tmp_path);
+                }
+                ArchiveKind::WhisperZip => {
+                    let whisper_dir = self.bin_dir.join("whisper");
+                    extract_whisper_from_zip(&tmp_path, &whisper_dir)?;
+                    let _ = std::fs::write(whisper_dir.join(".version"), &resolved.version);
+                    let _ = std::fs::remove_file(&tmp_path);
+                }
+                ArchiveKind::WhisperTarGz => {
+                    let whisper_dir = self.bin_dir.join("whisper");
+                    extract_whisper_from_targz(&tmp_path, &whisper_dir)?;
+                    let _ = std::fs::write(whisper_dir.join(".version"), &resolved.version);
                     let _ = std::fs::remove_file(&tmp_path);
                 }
             }
@@ -488,13 +575,13 @@ impl ToolManager {
                 url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip".to_string(),
                 version: "latest-win64-gpl".to_string(),
                 build_label: "ffmpeg-master-latest-win64-gpl.zip (NVENC/AMF/QSV)".to_string(),
-                archive_kind: ArchiveKind::Zip,
+                archive_kind: ArchiveKind::FfmpegZip,
             }),
             "win-arm64" => Ok(ResolvedDownload {
                 url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-winarm64-gpl.zip".to_string(),
                 version: "latest-winarm64-gpl".to_string(),
                 build_label: "ffmpeg-master-latest-winarm64-gpl.zip".to_string(),
-                archive_kind: ArchiveKind::Zip,
+                archive_kind: ArchiveKind::FfmpegZip,
             }),
             "linux-x64" | "linux-arm64" => Err(AicutError::new(
                 "LINUX_FFMPEG_SYSTEM",
@@ -505,6 +592,55 @@ impl ToolManager {
                 format!("Automatic FFmpeg download is not configured for platform '{tag}'."),
             )),
         }
+    }
+
+    /// Queries the latest releases of `ggml-org/whisper.cpp` (skipping source-only tags)
+    /// and picks the optimal binary archive for the host OS/CPU/GPU profile.
+    async fn resolve_whisper_release(&self) -> AicutResult<ResolvedDownload> {
+        let resp = self
+            .http
+            .get("https://api.github.com/repos/ggml-org/whisper.cpp/releases?per_page=15")
+            .send()
+            .await
+            .map_err(|e| {
+                AicutError::internal(format!("Failed querying whisper.cpp releases: {e}"))
+            })?;
+
+        let releases: Vec<serde_json::Value> = resp
+            .json()
+            .await
+            .map_err(|e| AicutError::internal(format!("Invalid whisper.cpp releases JSON: {e}")))?;
+
+        let tag = self.hardware.platform_tag.as_str();
+        let accel = self.hardware.recommended_accel;
+
+        for rel in &releases {
+            let Some(assets) = rel.get("assets").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            if assets.is_empty() {
+                continue;
+            }
+            let version = rel
+                .get("tag_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("latest")
+                .to_string();
+
+            if let Some((name, url, kind)) = select_best_whisper_asset(assets, tag, accel) {
+                return Ok(ResolvedDownload {
+                    url,
+                    version,
+                    build_label: name,
+                    archive_kind: kind,
+                });
+            }
+        }
+
+        Err(AicutError::new(
+            "WHISPER_ASSET_NOT_FOUND",
+            format!("No prebuilt whisper.cpp binary found for platform '{tag}'."),
+        ))
     }
 
     async fn download_file(
@@ -574,6 +710,76 @@ impl ToolManager {
     }
 }
 
+/// Picks the optimal `whisper.cpp` binary asset from a GitHub release's asset list based on hardware.
+pub fn select_best_whisper_asset(
+    assets: &[serde_json::Value],
+    platform_tag: &str,
+    accel: AccelBackend,
+) -> Option<(String, String, ArchiveKind)> {
+    let entries: Vec<(String, String)> = assets
+        .iter()
+        .filter_map(|a| {
+            let name = a.get("name")?.as_str()?.to_string();
+            let url = a.get("browser_download_url")?.as_str()?.to_string();
+            Some((name, url))
+        })
+        .collect();
+
+    let find_matching = |pred: &dyn Fn(&str) -> bool, kind: ArchiveKind| {
+        entries
+            .iter()
+            .find(|(n, _)| pred(&n.to_lowercase()))
+            .map(|(n, u)| (n.clone(), u.clone(), kind))
+    };
+
+    match platform_tag {
+        "win-x64" => {
+            if accel == AccelBackend::CudaNvenc {
+                if let Some(m) = find_matching(
+                    &|n| n.ends_with(".zip") && n.contains("x64") && (n.contains("cuda-12") || n.contains("cublas-12")),
+                    ArchiveKind::WhisperZip,
+                ) {
+                    return Some(m);
+                }
+                if let Some(m) = find_matching(
+                    &|n| n.ends_with(".zip") && n.contains("x64") && (n.contains("cuda") || n.contains("cublas")),
+                    ArchiveKind::WhisperZip,
+                ) {
+                    return Some(m);
+                }
+            }
+            if matches!(accel, AccelBackend::AmfDirectml | AccelBackend::QsvOpenvino) {
+                if let Some(m) = find_matching(
+                    &|n| n.ends_with(".zip") && n.contains("x64") && n.contains("vulkan"),
+                    ArchiveKind::WhisperZip,
+                ) {
+                    return Some(m);
+                }
+            }
+            find_matching(
+                &|n| n == "whisper-blas-bin-x64.zip",
+                ArchiveKind::WhisperZip,
+            )
+            .or_else(|| {
+                find_matching(&|n| n == "whisper-bin-x64.zip", ArchiveKind::WhisperZip)
+            })
+        }
+        "win-arm64" => find_matching(
+            &|n| n.ends_with(".zip") && n.contains("win") && n.contains("arm64") && n.contains("cpu"),
+            ArchiveKind::WhisperZip,
+        ),
+        "linux-x64" => find_matching(
+            &|n| n.ends_with(".tar.gz") && n.contains("ubuntu") && n.contains("x64"),
+            ArchiveKind::WhisperTarGz,
+        ),
+        "linux-arm64" => find_matching(
+            &|n| n.ends_with(".tar.gz") && n.contains("ubuntu") && n.contains("arm64"),
+            ArchiveKind::WhisperTarGz,
+        ),
+        _ => None,
+    }
+}
+
 pub fn platform_binary_name(base: &str) -> String {
     if cfg!(windows) && !base.ends_with(".exe") {
         format!("{base}.exe")
@@ -588,13 +794,14 @@ async fn probe_binary_version(path: &Path, version_args: &[String]) -> Option<St
     } else {
         version_args.iter().map(|s| s.as_str()).collect()
     };
-    let output = Command::new(path).args(args).output().await.ok()?;
+    let mut cmd = Command::new(path);
+    configure_tokio_command(&mut cmd);
+    let output = cmd.args(args).output().await.ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let first_line = stdout.lines().next()?.trim();
     if first_line.is_empty() {
         return None;
     }
-    // Extract clean version token for ffmpeg ("ffmpeg version 6.1.1 ...") or yt-dlp ("2025.01.15")
     if let Some(rest) = first_line.strip_prefix("ffmpeg version ") {
         return rest.split_whitespace().next().map(|s| s.to_string());
     }
@@ -687,28 +894,97 @@ fn extract_ffmpeg_from_targz(archive_path: &Path, bin_dir: &Path) -> AicutResult
     Ok(())
 }
 
+/// Extracts whisper-cli and all companion DLLs/shared libraries into `whisper_dir`.
+fn extract_whisper_from_zip(zip_path: &Path, whisper_dir: &Path) -> AicutResult<()> {
+    std::fs::create_dir_all(whisper_dir)?;
+    let file = std::fs::File::open(zip_path)?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| AicutError::internal(format!("Failed reading whisper.cpp zip: {e}")))?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| AicutError::internal(format!("Zip entry error: {e}")))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry.name().replace('\\', "/");
+        let file_name = name.rsplit('/').next().unwrap_or("");
+        if file_name.is_empty() {
+            continue;
+        }
+        let lower = file_name.to_lowercase();
+        let keep = lower.ends_with(".exe")
+            || lower.ends_with(".dll")
+            || lower.ends_with(".so")
+            || lower.contains(".so.")
+            || file_name == "whisper-cli";
+        if keep {
+            let out_path = whisper_dir.join(file_name);
+            let tmp_out = whisper_dir.join(format!(".{file_name}.new"));
+            let mut out = std::fs::File::create(&tmp_out)?;
+            std::io::copy(&mut entry, &mut out)?;
+            out.flush()?;
+            replace_file(&tmp_out, &out_path)?;
+            make_executable(&out_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn extract_whisper_from_targz(archive_path: &Path, whisper_dir: &Path) -> AicutResult<()> {
+    std::fs::create_dir_all(whisper_dir)?;
+    let file = std::fs::File::open(archive_path)?;
+    let dec = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(dec);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let path = entry.path()?.into_owned();
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        if file_name.is_empty() {
+            continue;
+        }
+        let keep = file_name == "whisper-cli"
+            || file_name == "whisper-server"
+            || file_name.contains(".so");
+        if keep {
+            let out_path = whisper_dir.join(&file_name);
+            let tmp_out = whisper_dir.join(format!(".{file_name}.new"));
+            entry.unpack(&tmp_out)?;
+            replace_file(&tmp_out, &out_path)?;
+            make_executable(&out_path)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn selects_hardware_appropriate_build_labels() {
-        let hw = HardwareProfile::detect();
-        let events = Arc::new(EventBus::new(16));
-        let jobs = Arc::new(JobManager::new(events.clone()));
-        let tm = ToolManager::new(PathBuf::from("/tmp/aicut-test-bin"), hw, events, jobs);
-        let ytdlp_def = ToolDefinition {
-            id: "yt-dlp".into(),
-            display_name: "yt-dlp".into(),
-            description: "Video downloader".into(),
-            owner_module: "media-ingest".into(),
-            category: "media".into(),
-            binary_name: "yt-dlp".into(),
-            version_args: vec!["--version".into()],
-            strategy: ToolInstallStrategy::YtDlpOfficialRelease,
-        };
-        let (build, note) = tm.recommend_build_for(&ytdlp_def);
-        assert!(build.contains("yt-dlp"));
-        assert!(!note.is_empty());
+    fn selects_best_whisper_asset_by_hardware() {
+        let assets = vec![
+            serde_json::json!({"name": "whisper-bin-x64.zip", "browser_download_url": "https://x/cpu.zip"}),
+            serde_json::json!({"name": "whisper-blas-bin-x64.zip", "browser_download_url": "https://x/blas.zip"}),
+            serde_json::json!({"name": "whisper-bin-win-cuda-12.4.0-x64.zip", "browser_download_url": "https://x/cuda12.zip"}),
+            serde_json::json!({"name": "whisper-bin-ubuntu-x64.tar.gz", "browser_download_url": "https://x/ubuntu.tar.gz"}),
+        ];
+
+        let nv = select_best_whisper_asset(&assets, "win-x64", AccelBackend::CudaNvenc).unwrap();
+        assert_eq!(nv.0, "whisper-bin-win-cuda-12.4.0-x64.zip");
+
+        let cpu = select_best_whisper_asset(&assets, "win-x64", AccelBackend::CpuOnly).unwrap();
+        assert_eq!(cpu.0, "whisper-blas-bin-x64.zip");
+
+        let lin = select_best_whisper_asset(&assets, "linux-x64", AccelBackend::CpuOnly).unwrap();
+        assert_eq!(lin.0, "whisper-bin-ubuntu-x64.tar.gz");
     }
 }

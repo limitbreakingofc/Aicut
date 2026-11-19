@@ -6,6 +6,7 @@ import {
   Command,
   Download,
   Film,
+  Mic,
   Settings,
   X,
 } from "lucide-react";
@@ -30,6 +31,7 @@ import type {
 } from "./lib/types";
 import { IngestView } from "./modules/media-ingest/IngestView";
 import { LibraryView } from "./modules/media-ingest/LibraryView";
+import { TranscribeView } from "./modules/transcribe/TranscribeView";
 import { JobsView } from "./modules/core/JobsView";
 import { ModulesView } from "./modules/core/ModulesView";
 import { AiConnectView } from "./modules/core/AiConnectView";
@@ -52,6 +54,7 @@ export function App() {
 
   const [media, setMedia] = useState<MediaAsset[]>([]);
   const [selectedMediaId, setSelectedMediaId] = useState<string | null>(null);
+  const [transcribeTargetId, setTranscribeTargetId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [filterKind, setFilterKind] = useState<string | null>(null);
 
@@ -138,7 +141,6 @@ export function App() {
     await Promise.all([refreshMedia(), refreshJobs(), refreshTools(), refreshModulesAndActions()]);
   }, [refreshMedia, refreshJobs, refreshTools, refreshModulesAndActions]);
 
-  // Initial load & WebSocket live sync
   useEffect(() => {
     void bootstrapAll();
 
@@ -229,7 +231,6 @@ export function App() {
     return () => sock.close();
   }, [bootstrapAll, pushToast, refreshModulesAndActions]);
 
-  // Keep Rust UiStateStore synchronized with user's screen so AI always sees what the human sees
   const syncUi = useCallback(
     (next: Partial<UiState>) => {
       socketRef.current?.sendUiSync({
@@ -257,7 +258,6 @@ export function App() {
     [syncUi],
   );
 
-  // Global Ctrl+K Command Palette
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
@@ -284,6 +284,7 @@ export function App() {
   }> = [
     { id: "ingest", label: "Baixar & Importar", icon: <Download size={16} /> },
     { id: "library", label: "Biblioteca", icon: <Film size={16} />, badge: media.length },
+    { id: "transcribe", label: "Transcrever IA", icon: <Mic size={16} /> },
     {
       id: "jobs",
       label: "Fila de Tarefas",
@@ -298,9 +299,10 @@ export function App() {
   const paletteCommands: Array<{ label: string; hint: string; run: () => void }> = [
     { label: "Ir para Baixar & Importar (yt-dlp / PC)", hint: "Aba 1", run: () => navigate("ingest") },
     { label: "Ir para Biblioteca de Mídia", hint: "Aba 2", run: () => navigate("library") },
-    { label: "Ir para Fila de Tarefas", hint: "Aba 3", run: () => navigate("jobs") },
-    { label: "Ir para Módulos & Action Playground", hint: "Aba 4", run: () => navigate("modules") },
-    { label: "Ir para Conectar IA (MCP / OpenAPI / CLI)", hint: "Aba 5", run: () => navigate("ai-connect") },
+    { label: "Ir para Transcrever com IA Local (Whisper)", hint: "Aba 3", run: () => navigate("transcribe") },
+    { label: "Ir para Fila de Tarefas", hint: "Aba 4", run: () => navigate("jobs") },
+    { label: "Ir para Módulos & Action Playground", hint: "Aba 5", run: () => navigate("modules") },
+    { label: "Ir para Conectar IA (MCP / OpenAPI / CLI)", hint: "Aba 6", run: () => navigate("ai-connect") },
     { label: "Ir para Configurações (Hardware & Ferramentas)", hint: "Menu", run: () => navigate("settings") },
     {
       label: "Alternar Tema Escuro / Claro",
@@ -316,13 +318,12 @@ export function App() {
 
   return (
     <div className="app-shell">
-      {/* Slim Win11 Fluent Top Titlebar */}
       <header className="titlebar" data-tauri-drag-region>
         <div className="titlebar-brand">
           <span className="brand-mark">A</span>
           <span>Aicut</span>
           <span style={{ color: "var(--text-muted)", fontWeight: 400, fontSize: 12 }}>
-            v0.1.0 · Modular AI Studio
+            v0.2.0 · Modular AI Studio
           </span>
         </div>
 
@@ -349,7 +350,6 @@ export function App() {
       </header>
 
       <div className="app-body">
-        {/* Left Navigation Rail */}
         <aside className="sidebar">
           <nav className="nav-group" aria-label="Navegação Principal">
             <div className="nav-label">Estúdio</div>
@@ -371,7 +371,6 @@ export function App() {
             ))}
           </nav>
 
-          {/* Bottom Settings Menu (Windows 11 Fluent pattern) */}
           <div className="sidebar-footer">
             <button
               type="button"
@@ -389,7 +388,6 @@ export function App() {
           </div>
         </aside>
 
-        {/* Main Viewport */}
         <main className="main-viewport">
           {route === "ingest" && (
             <IngestView
@@ -421,7 +419,24 @@ export function App() {
               }}
               onRefresh={refreshMedia}
               onNavigate={navigate}
+              onTranscribeMedia={(mediaId) => {
+                setTranscribeTargetId(mediaId);
+                navigate("transcribe");
+              }}
               onNotify={pushToast}
+            />
+          )}
+
+          {route === "transcribe" && (
+            <TranscribeView
+              media={media}
+              tools={tools}
+              jobs={jobs}
+              preselectedMediaId={transcribeTargetId}
+              onNavigate={navigate}
+              onNotify={pushToast}
+              onRefreshTools={refreshTools}
+              onRefreshMedia={refreshMedia}
             />
           )}
 
@@ -460,7 +475,6 @@ export function App() {
         </main>
       </div>
 
-      {/* Command Palette (Ctrl+K) */}
       {paletteOpen && (
         <div className="modal-backdrop" onClick={() => setPaletteOpen(false)}>
           <div
@@ -495,7 +509,6 @@ export function App() {
         </div>
       )}
 
-      {/* Real-time Toast Notifications */}
       {toasts.length > 0 && (
         <div className="toast-stack" aria-live="polite">
           {toasts.map((t) => (

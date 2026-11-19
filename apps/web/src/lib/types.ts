@@ -1,8 +1,15 @@
 export type ActorKind = "human" | "ai" | "system";
-export type MediaKind = "video" | "video_only" | "audio";
-export type MediaSourceType = "download" | "local";
+export type MediaKind = "video" | "video_only" | "audio" | "subtitle" | "timeline" | "transcript";
+export type MediaSourceType = "download" | "local" | "generated";
 export type JobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
-export type RouteId = "ingest" | "library" | "jobs" | "modules" | "ai-connect" | "settings";
+export type RouteId =
+  | "ingest"
+  | "library"
+  | "transcribe"
+  | "jobs"
+  | "modules"
+  | "ai-connect"
+  | "settings";
 
 export interface AicutError {
   code: string;
@@ -31,6 +38,9 @@ export interface MediaMetadata {
   uploader?: string;
   extractor?: string;
   has_subtitles?: boolean;
+  language?: string;
+  model_id?: string;
+  transcript_id?: string;
 }
 
 export interface MediaAsset {
@@ -39,6 +49,7 @@ export interface MediaAsset {
   kind: MediaKind;
   source_type: MediaSourceType;
   source_url?: string;
+  parent_media_id?: string | null;
   file_path: string;
   file_name: string;
   extension: string;
@@ -50,6 +61,55 @@ export interface MediaAsset {
   notes: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface TranscriptWord {
+  start_ms: number;
+  end_ms: number;
+  text: string;
+  probability?: number;
+}
+
+export interface TranscriptSegment {
+  index: number;
+  start_ms: number;
+  end_ms: number;
+  text: string;
+  words?: TranscriptWord[];
+}
+
+export interface TranscriptRecord {
+  id: string;
+  media_id: string;
+  media_title: string;
+  model_id: string;
+  language: string;
+  duration_sec?: number;
+  full_text: string;
+  segments: TranscriptSegment[];
+  created_at: string;
+}
+
+export interface WhisperModelStatus {
+  id: string;
+  display_name: string;
+  filename: string;
+  size_mb: number;
+  quality_tier: string;
+  speed_tier: string;
+  description: string;
+  installed: boolean;
+  recommended: boolean;
+  file_path?: string;
+  actual_size_bytes?: number;
+}
+
+export interface ExportFormatInfo {
+  id: string;
+  name: string;
+  extension: string;
+  category: "subtitle" | "timeline" | "transcript";
+  description: string;
 }
 
 export interface ProbedFormat {
@@ -213,7 +273,9 @@ export interface WorkspaceConfig {
   workspace_dir: string;
   downloads_dir: string;
   imports_dir: string;
+  exports_dir: string;
   thumbnails_dir: string;
+  models_dir: string;
   bin_dir: string;
   db_path: string;
 }

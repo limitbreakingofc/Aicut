@@ -89,6 +89,7 @@ export const IngestView: React.FC<IngestViewProps> = ({
   const [concurrentFragments, setConcurrentFragments] = useState(4);
   const [rateLimit, setRateLimit] = useState("");
   const [proxy, setProxy] = useState("");
+  const [impersonate, setImpersonate] = useState("");
   const [cookiesBrowser, setCookiesBrowser] = useState("");
   const [cookiesFile, setCookiesFile] = useState("");
   const [sponsorblock, setSponsorblock] = useState<string[]>([]);
@@ -237,6 +238,7 @@ export const IngestView: React.FC<IngestViewProps> = ({
         cookies_from_browser: cookiesBrowser || null,
         cookies_file: cookiesFile.trim() || null,
         proxy: proxy.trim() || null,
+        impersonate: impersonate || null,
       });
       setProbe(res.data);
       onNotify("success", "URL analisada", `${res.data.title} (${res.data.formats.length} formatos)`);
@@ -286,6 +288,7 @@ export const IngestView: React.FC<IngestViewProps> = ({
         concurrent_fragments: concurrentFragments,
         rate_limit: rateLimit.trim() || null,
         proxy: proxy.trim() || null,
+        impersonate: impersonate || null,
         cookies_from_browser: cookiesBrowser || null,
         cookies_file: cookiesFile.trim() || null,
         sponsorblock_remove: sponsorblock,
@@ -967,7 +970,7 @@ export const IngestView: React.FC<IngestViewProps> = ({
                       </div>
                     </div>
 
-                    <div className="grid-2">
+                    <div className="grid-3">
                       <div className="field">
                         <label>Cookies do navegador (vídeos privados/membros)</label>
                         <select
@@ -982,6 +985,20 @@ export const IngestView: React.FC<IngestViewProps> = ({
                           <option value="brave">Brave</option>
                           <option value="opera">Opera</option>
                           <option value="vivaldi">Vivaldi</option>
+                        </select>
+                      </div>
+                      <div className="field">
+                        <label>Impersonate (--impersonate p/ Kick/Cloudflare)</label>
+                        <select
+                          className="select"
+                          value={impersonate}
+                          onChange={(e) => setImpersonate(e.target.value)}
+                        >
+                          <option value="">Automático</option>
+                          <option value="chrome">Chrome</option>
+                          <option value="edge">Edge</option>
+                          <option value="firefox">Firefox</option>
+                          <option value="safari">Safari</option>
                         </select>
                       </div>
                       <div className="field">

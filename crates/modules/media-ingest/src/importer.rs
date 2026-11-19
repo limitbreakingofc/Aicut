@@ -275,6 +275,7 @@ async fn import_single_file(
         kind: probe.kind,
         source_type: MediaSourceType::Local,
         source_url: None,
+        parent_media_id: None,
         file_path: stored_path.to_string_lossy().to_string(),
         file_name,
         extension: ext,

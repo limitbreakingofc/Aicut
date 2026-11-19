@@ -14,6 +14,9 @@ pub enum MediaKind {
     Video,
     VideoOnly,
     Audio,
+    Subtitle,
+    Timeline,
+    Transcript,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -21,6 +24,7 @@ pub enum MediaKind {
 pub enum MediaSourceType {
     Download,
     Local,
+    Generated,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -51,6 +55,12 @@ pub struct MediaMetadata {
     pub extractor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub has_subtitles: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -61,6 +71,9 @@ pub struct MediaAsset {
     pub source_type: MediaSourceType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_url: Option<String>,
+    /// Links generated subtitles, timelines, and transcripts back to their source video/audio asset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_media_id: Option<String>,
     pub file_path: String,
     pub file_name: String,
     pub extension: String,
@@ -85,6 +98,8 @@ pub struct MediaListFilter {
     #[serde(default)]
     pub source_type: Option<MediaSourceType>,
     #[serde(default)]
+    pub parent_media_id: Option<String>,
+    #[serde(default)]
     pub tag: Option<String>,
     #[serde(default)]
     pub sort_by: Option<String>,
@@ -100,6 +115,38 @@ pub struct DownloadPreset {
     pub name: String,
     pub description: String,
     pub config: Value,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TranscriptWord {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probability: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TranscriptSegment {
+    pub index: usize,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub words: Vec<TranscriptWord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TranscriptRecord {
+    pub id: String,
+    pub media_id: String,
+    pub media_title: String,
+    pub model_id: String,
+    pub language: String,
+    pub duration_sec: Option<f64>,
+    pub full_text: String,
+    pub segments: Vec<TranscriptSegment>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -121,6 +168,7 @@ impl MediaRepository {
                 kind TEXT NOT NULL,
                 source_type TEXT NOT NULL,
                 source_url TEXT,
+                parent_media_id TEXT,
                 file_path TEXT NOT NULL,
                 file_name TEXT NOT NULL,
                 extension TEXT NOT NULL,
@@ -136,6 +184,20 @@ impl MediaRepository {
 
             CREATE INDEX IF NOT EXISTS idx_media_created_at ON media_assets(created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_media_fingerprint ON media_assets(fingerprint);
+
+            CREATE TABLE IF NOT EXISTS transcripts (
+                id TEXT PRIMARY KEY,
+                media_id TEXT NOT NULL,
+                media_title TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                language TEXT NOT NULL,
+                duration_sec REAL,
+                full_text TEXT NOT NULL,
+                segments_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_transcripts_media_id ON transcripts(media_id);
 
             CREATE TABLE IF NOT EXISTS download_presets (
                 id TEXT PRIMARY KEY,
@@ -158,6 +220,12 @@ impl MediaRepository {
             );
             ",
         )?;
+
+        // Safe upgrade migration for v0.1.0 databases that lacked `parent_media_id`
+        let _ = conn.execute(
+            "ALTER TABLE media_assets ADD COLUMN parent_media_id TEXT",
+            [],
+        );
 
         let repo = Self {
             conn: Mutex::new(conn),
@@ -246,16 +314,17 @@ impl MediaRepository {
             .map_err(|_| AicutError::internal("DB lock poisoned"))?;
         conn.execute(
             "INSERT INTO media_assets (
-                id, title, kind, source_type, source_url, file_path, file_name, extension,
-                file_size_bytes, fingerprint, thumbnail_path, metadata_json, tags_json, notes,
-                created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                id, title, kind, source_type, source_url, parent_media_id, file_path, file_name,
+                extension, file_size_bytes, fingerprint, thumbnail_path, metadata_json, tags_json,
+                notes, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 asset.id,
                 asset.title,
                 serde_json::to_string(&asset.kind)?.trim_matches('"'),
                 serde_json::to_string(&asset.source_type)?.trim_matches('"'),
                 asset.source_url,
+                asset.parent_media_id,
                 asset.file_path,
                 asset.file_name,
                 asset.extension,
@@ -279,9 +348,9 @@ impl MediaRepository {
             .map_err(|_| AicutError::internal("DB lock poisoned"))?;
         let row = conn
             .query_row(
-                "SELECT id, title, kind, source_type, source_url, file_path, file_name, extension,
-                        file_size_bytes, fingerprint, thumbnail_path, metadata_json, tags_json,
-                        notes, created_at, updated_at
+                "SELECT id, title, kind, source_type, source_url, parent_media_id, file_path,
+                        file_name, extension, file_size_bytes, fingerprint, thumbnail_path,
+                        metadata_json, tags_json, notes, created_at, updated_at
                  FROM media_assets WHERE id = ?1",
                 params![id],
                 row_to_media,
@@ -297,9 +366,9 @@ impl MediaRepository {
             .map_err(|_| AicutError::internal("DB lock poisoned"))?;
         let row = conn
             .query_row(
-                "SELECT id, title, kind, source_type, source_url, file_path, file_name, extension,
-                        file_size_bytes, fingerprint, thumbnail_path, metadata_json, tags_json,
-                        notes, created_at, updated_at
+                "SELECT id, title, kind, source_type, source_url, parent_media_id, file_path,
+                        file_name, extension, file_size_bytes, fingerprint, thumbnail_path,
+                        metadata_json, tags_json, notes, created_at, updated_at
                  FROM media_assets WHERE fingerprint = ?1 LIMIT 1",
                 params![fingerprint],
                 row_to_media,
@@ -315,9 +384,9 @@ impl MediaRepository {
             .map_err(|_| AicutError::internal("DB lock poisoned"))?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, title, kind, source_type, source_url, file_path, file_name, extension,
-                    file_size_bytes, fingerprint, thumbnail_path, metadata_json, tags_json,
-                    notes, created_at, updated_at
+            "SELECT id, title, kind, source_type, source_url, parent_media_id, file_path,
+                    file_name, extension, file_size_bytes, fingerprint, thumbnail_path,
+                    metadata_json, tags_json, notes, created_at, updated_at
              FROM media_assets
              ORDER BY created_at DESC",
         )?;
@@ -339,6 +408,11 @@ impl MediaRepository {
                 }
                 if let Some(source) = filter.source_type {
                     if m.source_type != source {
+                        return false;
+                    }
+                }
+                if let Some(ref pid) = filter.parent_media_id {
+                    if m.parent_media_id.as_deref() != Some(pid.as_str()) {
                         return false;
                     }
                 }
@@ -448,6 +522,88 @@ impl MediaRepository {
             .map_err(|_| AicutError::internal("DB lock poisoned"))?;
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM media_assets", [], |r| r.get(0))?;
         Ok(count as usize)
+    }
+
+    // ---- Transcripts ----
+
+    pub fn insert_transcript(&self, rec: &TranscriptRecord) -> AicutResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AicutError::internal("DB lock poisoned"))?;
+        conn.execute(
+            "INSERT INTO transcripts (
+                id, media_id, media_title, model_id, language, duration_sec, full_text,
+                segments_json, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                rec.id,
+                rec.media_id,
+                rec.media_title,
+                rec.model_id,
+                rec.language,
+                rec.duration_sec,
+                rec.full_text,
+                serde_json::to_string(&rec.segments)?,
+                rec.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_transcript(&self, id: &str) -> AicutResult<Option<TranscriptRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AicutError::internal("DB lock poisoned"))?;
+        let row = conn
+            .query_row(
+                "SELECT id, media_id, media_title, model_id, language, duration_sec, full_text,
+                        segments_json, created_at
+                 FROM transcripts WHERE id = ?1",
+                params![id],
+                row_to_transcript,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn list_transcripts(&self, media_id: Option<&str>) -> AicutResult<Vec<TranscriptRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AicutError::internal("DB lock poisoned"))?;
+        let items = if let Some(mid) = media_id {
+            let mut stmt = conn.prepare(
+                "SELECT id, media_id, media_title, model_id, language, duration_sec, full_text,
+                        segments_json, created_at
+                 FROM transcripts WHERE media_id = ?1 ORDER BY created_at DESC",
+            )?;
+            let rows = stmt
+                .query_map(params![mid], row_to_transcript)?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, media_id, media_title, model_id, language, duration_sec, full_text,
+                        segments_json, created_at
+                 FROM transcripts ORDER BY created_at DESC",
+            )?;
+            let rows = stmt
+                .query_map([], row_to_transcript)?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        Ok(items)
+    }
+
+    pub fn delete_transcript(&self, id: &str) -> AicutResult<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AicutError::internal("DB lock poisoned"))?;
+        let changed = conn.execute("DELETE FROM transcripts WHERE id = ?1", params![id])?;
+        Ok(changed > 0)
     }
 
     // ---- Download Presets ----
@@ -598,18 +754,22 @@ impl MediaRepository {
 fn row_to_media(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaAsset> {
     let kind_str: String = row.get(2)?;
     let source_str: String = row.get(3)?;
-    let meta_str: String = row.get(11)?;
-    let tags_str: String = row.get(12)?;
-    let created_str: String = row.get(14)?;
-    let updated_str: String = row.get(15)?;
+    let meta_str: String = row.get(12)?;
+    let tags_str: String = row.get(13)?;
+    let created_str: String = row.get(15)?;
+    let updated_str: String = row.get(16)?;
 
     let kind = match kind_str.as_str() {
         "video_only" => MediaKind::VideoOnly,
         "audio" => MediaKind::Audio,
+        "subtitle" => MediaKind::Subtitle,
+        "timeline" => MediaKind::Timeline,
+        "transcript" => MediaKind::Transcript,
         _ => MediaKind::Video,
     };
     let source_type = match source_str.as_str() {
         "download" => MediaSourceType::Download,
+        "generated" => MediaSourceType::Generated,
         _ => MediaSourceType::Local,
     };
 
@@ -619,19 +779,38 @@ fn row_to_media(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaAsset> {
         kind,
         source_type,
         source_url: row.get(4)?,
-        file_path: row.get(5)?,
-        file_name: row.get(6)?,
-        extension: row.get(7)?,
-        file_size_bytes: row.get::<_, i64>(8)? as u64,
-        fingerprint: row.get(9)?,
-        thumbnail_path: row.get(10)?,
+        parent_media_id: row.get(5)?,
+        file_path: row.get(6)?,
+        file_name: row.get(7)?,
+        extension: row.get(8)?,
+        file_size_bytes: row.get::<_, i64>(9)? as u64,
+        fingerprint: row.get(10)?,
+        thumbnail_path: row.get(11)?,
         metadata: serde_json::from_str(&meta_str).unwrap_or_default(),
         tags: serde_json::from_str(&tags_str).unwrap_or_default(),
-        notes: row.get(13)?,
+        notes: row.get(14)?,
         created_at: DateTime::parse_from_rfc3339(&created_str)
             .map(|d| d.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now()),
         updated_at: DateTime::parse_from_rfc3339(&updated_str)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+    })
+}
+
+fn row_to_transcript(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranscriptRecord> {
+    let seg_str: String = row.get(7)?;
+    let created_str: String = row.get(8)?;
+    Ok(TranscriptRecord {
+        id: row.get(0)?,
+        media_id: row.get(1)?,
+        media_title: row.get(2)?,
+        model_id: row.get(3)?,
+        language: row.get(4)?,
+        duration_sec: row.get(5)?,
+        full_text: row.get(6)?,
+        segments: serde_json::from_str(&seg_str).unwrap_or_default(),
+        created_at: DateTime::parse_from_rfc3339(&created_str)
             .map(|d| d.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now()),
     })

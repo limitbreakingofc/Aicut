@@ -81,21 +81,19 @@ jobs:
           body: |
             ## Aicut ${{ steps.tag.outputs.name }} — Estúdio Modular AI-First para Windows 11
 
-            ### O que há nesta versão
-            - **Core 100% em Rust + Interface Desktop Windows 11 (Tauri v2 + React/TypeScript)** fluida e modular.
-            - **Aba 1 — Baixar & Importar**:
-              - Download completo via **yt-dlp** com todas as opções configuráveis visualmente (Vídeo+Áudio, **Só Vídeo**, **Só Áudio**, resolução/qualidade, seletor exato de stream via Probe, codec, container, legendas manuais/automáticas/embutidas, recorte de trecho, capítulos, playlist, cookies do navegador, SponsorBlock, fragmentos concorrentes, limite de velocidade, proxy e presets salváveis).
-              - Importação de vídeos e áudios locais do PC (Drag & Drop, seletor de arquivos/pastas nativo do Windows 11, modo **Referência** instantâneo ou **Cópia**).
-            - **Aba 2 — Biblioteca**: reúne todos os arquivos baixados pelo `yt-dlp` e vídeos/áudios importados, com player integrado (vídeo e áudio), metadados técnicos (`ffprobe`), busca, filtros e edição de tags/notas.
-            - **Configurações — Hardware & Ferramentas**: detecção automática do hardware do PC (CPU, arquitetura, RAM, GPU NVIDIA/AMD/Intel) e instalador/atualizador extensível de `yt-dlp`, `FFmpeg` e futuras ferramentas dos módulos.
-            - **Qualquer Chat de IA conectado com paridade humana**:
-              - **MCP nativo**: `http://127.0.0.1:43210/mcp` (Streamable HTTP), `/mcp/sse` e `aicut mcp` (stdio).
-              - **OpenAPI 3.1 / REST**: `http://127.0.0.1:43210/openapi.json` (ChatGPT Actions, Open WebUI, n8n, LangChain).
-              - **CLI JSON**: `aicut-cli-windows-x86_64.exe` (`run`, `actions`, `modules`, `mcp`, `serve`, `doctor`).
+            ### Novidades desta versão
+            - **Correção Crítica do `yt-dlp`**: corrigido o bug onde `--print` ativava `--simulate`/`--quiet` sem iniciar o download. Agora usa `--no-simulate --progress --print-to-file` com UTF-8 nativo, drenagem completa de logs/erros, `CREATE_NO_WINDOW` no Windows 11 e opção `--impersonate` (Chrome/Edge/Firefox) para sites protegidos como Kick.
+            - **Nova Aba 3 — Transcrever com IA Local (`whisper.cpp` + `Whisper Large v3 Turbo`)**:
+              - Detecção automática de hardware no menu **Configurações → Ferramentas** baixando a melhor build do `whisper.cpp` (NVIDIA CUDA 12, OpenBLAS/AVX2 ou ARM64) e modelos GGML (`large-v3-turbo-q5_0`, `large-v3-turbo`, `small`, `medium`, `large-v3`).
+              - **Exportador Universal (13 formatos)** salvando automaticamente na **Biblioteca**:
+                - **Legendas**: `SRT`, `WebVTT`, `ASS Estilizada`, `ASS Karaokê (palavra a palavra)`, `LRC`
+                - **Timelines de Editores**: `FCPXML 1.10` (DaVinci Resolve / CapCut / Final Cut), `Premiere Pro XML`, `EDL CMX 3600`, `OpenTimelineIO (.otio)`, `Marcadores CSV`
+                - **Transcrições**: `TXT Limpo`, `TXT com Timecodes`, `JSON Palavra-a-Palavra (para IAs)`
+            - **Biblioteca Expandida**: agora exibe vídeos, só vídeo, áudios, legendas, timelines e transcrições com preview integrado, cópia em 1 clique e botão direto para transcrever.
+            - **Qualquer Chat de IA conectado com paridade humana**: MCP (`http://127.0.0.1:43210/mcp` + `aicut mcp`), OpenAPI 3.1 (`/openapi.json`) e CLI JSON (`aicut-cli-windows-x86_64.exe`).
 
-            ### Como instalar no Windows 11
-            1. Baixe o instalador **`Aicut_*_x64-setup.exe`** (recomendado) ou **`.msi`** nos assets abaixo.
-            2. Execute o instalador e abra o **Aicut**.
-            3. Vá em **Configurações → Ferramentas** e clique em **Instalar / Atualizar Tudo** para o Aicut detectar seu hardware e instalar automaticamente as melhores versões do `yt-dlp` e `FFmpeg`.
+            ### Como instalar / atualizar no Windows 11
+            1. Baixe e execute **`Aicut_*_x64-setup.exe`** (recomendado) ou **`.msi`** nos assets abaixo.
+            2. Abra o **Aicut**, vá em **Configurações → Ferramentas** e clique em **Instalar / Atualizar Tudo** para instalar/atualizar `yt-dlp`, `FFmpeg` e `whisper.cpp` na melhor versão para seu hardware.
           files: |
             release-assets/*

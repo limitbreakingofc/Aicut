@@ -44,23 +44,27 @@ pub fn run() {
         )
         .try_init();
 
-    // Boot the embedded Aicut Rust kernel and local AI/Media server (127.0.0.1:43210)
-    tauri::async_runtime::spawn(async {
-        let ws = WorkspaceConfig::default_paths();
-        match aicut_runtime::bootstrap_kernel(ws).await {
-            Ok(kernel) => {
-                if let Err(e) = aicut_server::spawn_server(kernel, ServerConfig::default()).await {
-                    tracing::error!("Failed starting embedded Aicut server: {e}");
-                }
-            }
-            Err(e) => {
-                tracing::error!("Failed bootstrapping Aicut kernel: {e}");
-            }
-        }
-    });
-
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .setup(|_app| {
+            // Boot the embedded Aicut Rust kernel and local AI/Media server (127.0.0.1:43210)
+            tauri::async_runtime::spawn(async {
+                let ws = WorkspaceConfig::default_paths();
+                match aicut_runtime::bootstrap_kernel(ws).await {
+                    Ok(kernel) => {
+                        if let Err(e) =
+                            aicut_server::spawn_server(kernel, ServerConfig::default()).await
+                        {
+                            tracing::error!("Failed starting embedded Aicut server: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed bootstrapping Aicut kernel: {e}");
+                    }
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![pick_media_paths])
         .run(tauri::generate_context!())
         .expect("error while running Aicut desktop application");

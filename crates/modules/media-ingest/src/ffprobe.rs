@@ -25,7 +25,9 @@ pub async fn probe_file(
         };
     };
 
-    let output = match Command::new(ffprobe)
+    let mut cmd = Command::new(ffprobe);
+    aicut_core::configure_tokio_command(&mut cmd);
+    let output = match cmd
         .args([
             "-v",
             "quiet",
@@ -158,7 +160,9 @@ pub async fn generate_thumbnail(
         .map(|d| if d > 10.0 { d * 0.1 } else { (d * 0.5).max(0.0) })
         .unwrap_or(1.0);
 
-    let status = Command::new(ffmpeg)
+    let mut cmd = Command::new(ffmpeg);
+    aicut_core::configure_tokio_command(&mut cmd);
+    let status = cmd
         .args([
             "-y",
             "-ss",

@@ -1,20 +1,32 @@
 import React, { useEffect, useState } from "react";
 import {
+  Copy,
   Download,
   ExternalLink,
+  FileCode2,
+  FileText,
   Film,
   HardDrive,
+  Mic,
   Music,
   Play,
   RefreshCw,
   Save,
   Search,
+  Sparkles,
+  Subtitles,
   Trash2,
   Video,
   VideoOff,
   X,
 } from "lucide-react";
-import { mediaStreamUrl, mediaThumbnailUrl, runAction } from "../../lib/client";
+import {
+  fetchMediaText,
+  mediaStreamUrl,
+  mediaTextUrl,
+  mediaThumbnailUrl,
+  runAction,
+} from "../../lib/client";
 import { formatBytes, formatDuration, formatRelativeDate } from "../../lib/format";
 import type { MediaAsset, MediaKind, RouteId } from "../../lib/types";
 
@@ -28,8 +40,12 @@ interface LibraryViewProps {
   onFilterKindChange: (kind: string | null) => void;
   onRefresh: () => void;
   onNavigate: (route: RouteId) => void;
+  onTranscribeMedia: (mediaId: string) => void;
   onNotify: (level: "info" | "success" | "warning" | "error", title: string, message: string) => void;
 }
+
+const isTextKind = (kind: MediaKind) =>
+  kind === "subtitle" || kind === "timeline" || kind === "transcript";
 
 export const LibraryView: React.FC<LibraryViewProps> = ({
   media,
@@ -41,18 +57,20 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   onFilterKindChange,
   onRefresh,
   onNavigate,
+  onTranscribeMedia,
   onNotify,
 }) => {
-  const [sourceFilter, setSourceFilter] = useState<"all" | "download" | "local">("all");
+  const [sourceFilter, setSourceFilter] = useState<"all" | "download" | "local" | "generated">("all");
   const [sortBy, setSortBy] = useState("newest");
 
-  // Modal edit state
   const selectedAsset = media.find((m) => m.id === selectedMediaId) ?? null;
   const [editTitle, setEditTitle] = useState("");
   const [editTags, setEditTags] = useState("");
   const [editNotes, setEditNotes] = useState("");
   const [deleteFileOnDisk, setDeleteFileOnDisk] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [textPreview, setTextPreview] = useState<string | null>(null);
+  const [loadingText, setLoadingText] = useState(false);
 
   useEffect(() => {
     if (selectedAsset) {
@@ -60,6 +78,15 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
       setEditTags(selectedAsset.tags.join(", "));
       setEditNotes(selectedAsset.notes);
       setDeleteFileOnDisk(false);
+      setTextPreview(null);
+
+      if (isTextKind(selectedAsset.kind)) {
+        setLoadingText(true);
+        void fetchMediaText(selectedAsset.id)
+          .then((txt) => setTextPreview(txt))
+          .catch(() => setTextPreview("Não foi possível carregar o preview do arquivo."))
+          .finally(() => setLoadingText(false));
+      }
     }
   }, [selectedAsset?.id]);
 
@@ -136,26 +163,55 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     }
   }
 
+  async function handleCopyText() {
+    if (!textPreview) return;
+    try {
+      await navigator.clipboard.writeText(textPreview);
+      onNotify("success", "Copiado!", "Conteúdo copiado para a área de transferência.");
+    } catch {
+      onNotify("warning", "Selecione o texto manualmente", "Não foi possível acessar a área de transferência.");
+    }
+  }
+
   function kindBadge(kind: MediaKind) {
-    if (kind === "audio") {
-      return (
-        <span className="media-kind-badge">
-          <Music size={11} /> Áudio
-        </span>
-      );
+    switch (kind) {
+      case "audio":
+        return (
+          <span className="media-kind-badge">
+            <Music size={11} /> Áudio
+          </span>
+        );
+      case "video_only":
+        return (
+          <span className="media-kind-badge">
+            <VideoOff size={11} /> Só Vídeo
+          </span>
+        );
+      case "subtitle":
+        return (
+          <span className="media-kind-badge">
+            <Subtitles size={11} /> Legenda
+          </span>
+        );
+      case "timeline":
+        return (
+          <span className="media-kind-badge">
+            <FileCode2 size={11} /> Timeline
+          </span>
+        );
+      case "transcript":
+        return (
+          <span className="media-kind-badge">
+            <FileText size={11} /> Transcrição
+          </span>
+        );
+      default:
+        return (
+          <span className="media-kind-badge">
+            <Video size={11} /> Vídeo
+          </span>
+        );
     }
-    if (kind === "video_only") {
-      return (
-        <span className="media-kind-badge">
-          <VideoOff size={11} /> Só Vídeo
-        </span>
-      );
-    }
-    return (
-      <span className="media-kind-badge">
-        <Video size={11} /> Vídeo
-      </span>
-    );
   }
 
   return (
@@ -164,7 +220,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
         <div>
           <h1 className="page-title">Biblioteca</h1>
           <p className="page-subtitle">
-            Todos os vídeos e áudios baixados via yt-dlp ou importados do PC ({media.length} item(ns)).
+            Vídeos e áudios baixados via yt-dlp ou importados do PC + legendas, timelines e transcrições geradas pela IA local ({media.length} item(ns)).
           </p>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
@@ -189,7 +245,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
           padding: "12px 14px",
         }}
       >
-        <div style={{ position: "relative", flex: "1 1 240px", maxWidth: 360 }}>
+        <div style={{ position: "relative", flex: "1 1 220px", maxWidth: 340 }}>
           <input
             className="input"
             placeholder="Buscar por título, arquivo, tag ou URL..."
@@ -215,6 +271,9 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
             { id: "video", label: "Vídeo" },
             { id: "video_only", label: "Só Vídeo" },
             { id: "audio", label: "Áudio" },
+            { id: "subtitle", label: "Legendas" },
+            { id: "timeline", label: "Timelines" },
+            { id: "transcript", label: "Transcrições" },
           ].map((opt) => (
             <button
               key={String(opt.id)}
@@ -230,11 +289,14 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
             className="select"
             style={{ width: "auto" }}
             value={sourceFilter}
-            onChange={(e) => setSourceFilter(e.target.value as "all" | "download" | "local")}
+            onChange={(e) =>
+              setSourceFilter(e.target.value as "all" | "download" | "local" | "generated")
+            }
           >
             <option value="all">Todas as origens</option>
             <option value="download">Baixados (yt-dlp)</option>
             <option value="local">Importados (PC)</option>
+            <option value="generated">Gerados por IA</option>
           </select>
 
           <select
@@ -259,9 +321,9 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
           <div style={{ fontWeight: 600, fontSize: 16 }}>
             {media.length === 0 ? "Sua Biblioteca está vazia" : "Nenhum resultado para o filtro atual"}
           </div>
-          <p style={{ color: "var(--text-secondary)", margin: "6px auto 16px", maxWidth: 420 }}>
+          <p style={{ color: "var(--text-secondary)", margin: "6px auto 16px", maxWidth: 440 }}>
             {media.length === 0
-              ? "Baixe um vídeo com yt-dlp ou importe vídeos e áudios do seu PC na primeira aba — ou peça diretamente para seu chat de IA!"
+              ? "Baixe um vídeo com yt-dlp ou importe arquivos do PC na primeira aba — e transcreva na aba Transcrever IA para gerar legendas e timelines."
               : "Tente limpar a busca ou trocar os filtros de tipo e origem."}
           </p>
           {media.length === 0 && (
@@ -279,25 +341,34 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
               onClick={() => onSelectMedia(item.id)}
             >
               <div className="media-thumb">
-                {item.thumbnail_path ? (
-                  <img
-                    src={mediaThumbnailUrl(item.id)}
-                    alt={item.title}
-                    loading="lazy"
-                  />
+                {item.thumbnail_path && !isTextKind(item.kind) ? (
+                  <img src={mediaThumbnailUrl(item.id)} alt={item.title} loading="lazy" />
                 ) : item.kind === "audio" ? (
-                  <div
-                    style={{
-                      display: "flex",
-                      flexDirection: "column",
-                      alignItems: "center",
-                      gap: 6,
-                      color: "var(--accent)",
-                    }}
-                  >
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6, color: "var(--accent)" }}>
                     <Music size={34} />
                     <span style={{ fontSize: 11.5, fontFamily: "var(--font-mono)", color: "var(--text-secondary)" }}>
                       {item.extension.toUpperCase()}
+                    </span>
+                  </div>
+                ) : item.kind === "subtitle" ? (
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6, color: "var(--accent)" }}>
+                    <Subtitles size={34} />
+                    <span style={{ fontSize: 11.5, fontFamily: "var(--font-mono)", color: "var(--text-secondary)" }}>
+                      .{item.extension.toUpperCase()}
+                    </span>
+                  </div>
+                ) : item.kind === "timeline" ? (
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6, color: "var(--success)" }}>
+                    <FileCode2 size={34} />
+                    <span style={{ fontSize: 11.5, fontFamily: "var(--font-mono)", color: "var(--text-secondary)" }}>
+                      .{item.extension.toUpperCase()}
+                    </span>
+                  </div>
+                ) : item.kind === "transcript" ? (
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6, color: "var(--accent)" }}>
+                    <FileText size={34} />
+                    <span style={{ fontSize: 11.5, fontFamily: "var(--font-mono)", color: "var(--text-secondary)" }}>
+                      .{item.extension.toUpperCase()}
                     </span>
                   </div>
                 ) : (
@@ -314,13 +385,21 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                   {item.title}
                 </h3>
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
-                  <span className="pill">
-                    {item.source_type === "download" ? <Download size={10} /> : <HardDrive size={10} />}
-                    {item.source_type === "download" ? "yt-dlp" : "PC"}
+                  <span className={`pill ${item.source_type === "generated" ? "accent" : ""}`}>
+                    {item.source_type === "download" ? (
+                      <Download size={10} />
+                    ) : item.source_type === "generated" ? (
+                      <Sparkles size={10} />
+                    ) : (
+                      <HardDrive size={10} />
+                    )}
+                    {item.source_type === "download"
+                      ? "yt-dlp"
+                      : item.source_type === "generated"
+                        ? "IA Local"
+                        : "PC"}
                   </span>
-                  {item.metadata.height && (
-                    <span className="pill accent">{item.metadata.height}p</span>
-                  )}
+                  {item.metadata.height && <span className="pill accent">{item.metadata.height}p</span>}
                   <span className="pill">{item.extension.toUpperCase()}</span>
                   <span className="pill">{formatBytes(item.file_size_bytes)}</span>
                 </div>
@@ -339,7 +418,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
         </div>
       )}
 
-      {/* Media Inspector & Player Modal */}
+      {/* Media / Subtitle / Timeline Inspector Modal */}
       {selectedAsset && (
         <div className="modal-backdrop" onClick={() => onSelectMedia(null)}>
           <div className="modal-card" onClick={(e) => e.stopPropagation()}>
@@ -353,7 +432,11 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
               }}
             >
               <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
-                <Play size={16} color="var(--accent)" />
+                {isTextKind(selectedAsset.kind) ? (
+                  <FileCode2 size={16} color="var(--accent)" />
+                ) : (
+                  <Play size={16} color="var(--accent)" />
+                )}
                 <strong style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {selectedAsset.title}
                 </strong>
@@ -372,9 +455,33 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                 gap: 20,
               }}
             >
-              {/* Left: Player & Technical Specs */}
-              <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-                {selectedAsset.kind === "audio" ? (
+              {/* Left: Player OR Text/Timeline Code Preview */}
+              <div style={{ display: "flex", flexDirection: "column", gap: 14, minWidth: 0 }}>
+                {isTextKind(selectedAsset.kind) ? (
+                  <>
+                    <div style={{ display: "flex", gap: 8, justifyContent: "space-between", alignItems: "center" }}>
+                      <span className="pill accent">
+                        {selectedAsset.metadata.format_name ?? selectedAsset.extension.toUpperCase()}
+                      </span>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <button type="button" className="btn btn-sm" onClick={handleCopyText}>
+                          <Copy size={13} /> Copiar
+                        </button>
+                        <a
+                          href={mediaTextUrl(selectedAsset.id)}
+                          download={selectedAsset.file_name}
+                          className="btn btn-sm btn-primary"
+                          style={{ textDecoration: "none" }}
+                        >
+                          <Download size={13} /> Baixar Arquivo
+                        </a>
+                      </div>
+                    </div>
+                    <pre className="code-block" style={{ maxHeight: 340, minHeight: 220 }}>
+                      {loadingText ? "Carregando conteúdo..." : textPreview ?? ""}
+                    </pre>
+                  </>
+                ) : selectedAsset.kind === "audio" ? (
                   <div
                     style={{
                       padding: 28,
@@ -388,11 +495,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                     }}
                   >
                     <Music size={44} color="var(--accent)" />
-                    <audio
-                      controls
-                      src={mediaStreamUrl(selectedAsset.id)}
-                      style={{ width: "100%" }}
-                    />
+                    <audio controls src={mediaStreamUrl(selectedAsset.id)} style={{ width: "100%" }} />
                   </div>
                 ) : (
                   <video
@@ -401,11 +504,35 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                     poster={selectedAsset.thumbnail_path ? mediaThumbnailUrl(selectedAsset.id) : undefined}
                     style={{
                       width: "100%",
-                      maxHeight: 380,
+                      maxHeight: 360,
                       borderRadius: "var(--radius-md)",
                       background: "#000",
                     }}
                   />
+                )}
+
+                {!isTextKind(selectedAsset.kind) && (
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    onClick={() => {
+                      const id = selectedAsset.id;
+                      onSelectMedia(null);
+                      onTranscribeMedia(id);
+                    }}
+                  >
+                    <Mic size={15} /> Transcrever com IA Local (Gerar Legenda / Timeline)
+                  </button>
+                )}
+
+                {selectedAsset.parent_media_id && (
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    onClick={() => onSelectMedia(selectedAsset.parent_media_id ?? null)}
+                  >
+                    <Film size={14} /> Abrir vídeo/áudio de origem
+                  </button>
                 )}
 
                 <div
@@ -420,13 +547,15 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                   }}
                 >
                   <div>
-                    <span style={{ color: "var(--text-muted)" }}>Duração: </span>
-                    {formatDuration(selectedAsset.metadata.duration_sec)}
-                  </div>
-                  <div>
                     <span style={{ color: "var(--text-muted)" }}>Tamanho: </span>
                     {formatBytes(selectedAsset.file_size_bytes)}
                   </div>
+                  {selectedAsset.metadata.duration_sec !== undefined && (
+                    <div>
+                      <span style={{ color: "var(--text-muted)" }}>Duração: </span>
+                      {formatDuration(selectedAsset.metadata.duration_sec)}
+                    </div>
+                  )}
                   {selectedAsset.metadata.width && selectedAsset.metadata.height && (
                     <div>
                       <span style={{ color: "var(--text-muted)" }}>Resolução: </span>
@@ -434,21 +563,20 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                       {selectedAsset.metadata.fps ? ` @ ${selectedAsset.metadata.fps}fps` : ""}
                     </div>
                   )}
-                  {selectedAsset.metadata.video_codec && (
+                  {selectedAsset.metadata.model_id && (
                     <div>
-                      <span style={{ color: "var(--text-muted)" }}>Codec Vídeo: </span>
-                      {selectedAsset.metadata.video_codec}
+                      <span style={{ color: "var(--text-muted)" }}>Modelo IA: </span>
+                      {selectedAsset.metadata.model_id}
                     </div>
                   )}
-                  {selectedAsset.metadata.audio_codec && (
+                  {selectedAsset.metadata.language && (
                     <div>
-                      <span style={{ color: "var(--text-muted)" }}>Codec Áudio: </span>
-                      {selectedAsset.metadata.audio_codec}
-                      {selectedAsset.metadata.sample_rate ? ` (${selectedAsset.metadata.sample_rate} Hz)` : ""}
+                      <span style={{ color: "var(--text-muted)" }}>Idioma: </span>
+                      {selectedAsset.metadata.language.toUpperCase()}
                     </div>
                   )}
                   <div>
-                    <span style={{ color: "var(--text-muted)" }}>Adicionado: </span>
+                    <span style={{ color: "var(--text-muted)" }}>Criado: </span>
                     {formatRelativeDate(selectedAsset.created_at)}
                   </div>
                 </div>
@@ -486,7 +614,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                 )}
               </div>
 
-              {/* Right: Metadata Editor & Delete */}
+              {/* Right: Metadata Editor & Safe Delete */}
               <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
                 <div className="field">
                   <label>Título</label>

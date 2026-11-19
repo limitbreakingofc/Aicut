@@ -123,7 +123,9 @@ fn detect_gpus(os: &str) -> Vec<GpuInfo> {
     let mut gpus = Vec::new();
 
     // 1. Try nvidia-smi (cross-platform: Windows & Linux) for accurate NVIDIA VRAM & driver info.
-    if let Ok(output) = Command::new("nvidia-smi")
+    let mut nv_cmd = Command::new("nvidia-smi");
+    crate::process::configure_std_command(&mut nv_cmd);
+    if let Ok(output) = nv_cmd
         .args([
             "--query-gpu=name,memory.total,driver_version",
             "--format=csv,noheader,nounits",
@@ -150,7 +152,9 @@ fn detect_gpus(os: &str) -> Vec<GpuInfo> {
 
     // 2. Windows: query Win32_VideoController via PowerShell CIM (covers AMD, Intel, and NVIDIA fallback).
     if os == "windows" {
-        if let Ok(output) = Command::new("powershell")
+        let mut ps_cmd = Command::new("powershell");
+        crate::process::configure_std_command(&mut ps_cmd);
+        if let Ok(output) = ps_cmd
             .args([
                 "-NoProfile",
                 "-Command",

@@ -43,6 +43,16 @@ export function mediaThumbnailUrl(id: string): string {
   return `${getPublicServerUrl()}/api/v1/media/${encodeURIComponent(id)}/thumbnail`;
 }
 
+export function mediaTextUrl(id: string): string {
+  return `${getPublicServerUrl()}/api/v1/media/${encodeURIComponent(id)}/text`;
+}
+
+export async function fetchMediaText(id: string): Promise<string> {
+  const res = await fetch(mediaTextUrl(id));
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.text();
+}
+
 export class AicutActionError extends Error {
   public readonly detail: AicutError;
   constructor(detail: AicutError) {

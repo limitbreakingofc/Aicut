@@ -256,7 +256,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <code className="code-block" style={{ padding: "7px 10px" }}>{workspace.imports_dir}</code>
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-              <span style={{ color: "var(--text-muted)" }}>Binários Gerenciados (yt-dlp / FFmpeg)</span>
+              <span style={{ color: "var(--text-muted)" }}>Legendas & Timelines Geradas (Exports)</span>
+              <code className="code-block" style={{ padding: "7px 10px" }}>{workspace.exports_dir}</code>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              <span style={{ color: "var(--text-muted)" }}>Modelos de IA Local (Whisper GGML)</span>
+              <code className="code-block" style={{ padding: "7px 10px" }}>{workspace.models_dir}</code>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              <span style={{ color: "var(--text-muted)" }}>Binários Gerenciados (yt-dlp / FFmpeg / whisper.cpp)</span>
               <code className="code-block" style={{ padding: "7px 10px" }}>{workspace.bin_dir}</code>
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>

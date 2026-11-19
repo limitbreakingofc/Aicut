@@ -90,6 +90,7 @@ pub fn build_router(kernel: Arc<AicutKernel>, config: &ServerConfig) -> Router {
         .route("/api/v1/activity", get(activity_handler))
         .route("/api/v1/media/{id}/stream", get(stream_media_handler))
         .route("/api/v1/media/{id}/thumbnail", get(thumbnail_handler))
+        .route("/api/v1/media/{id}/text", get(media_text_handler))
         .route("/api/v1/events", get(ws_events_handler))
         .route("/mcp", post(mcp_http_handler).get(mcp_info_handler))
         .route("/mcp/sse", get(mcp_sse_handler))
@@ -434,6 +435,23 @@ async fn thumbnail_handler(
         Ok(bytes) => (
             [(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "public, max-age=3600")],
             bytes,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn media_text_handler(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+) -> Response {
+    let Ok(Some(asset)) = state.kernel.repo.get_media(&id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match tokio::fs::read_to_string(&asset.file_path).await {
+        Ok(text) => (
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            text,
         )
             .into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),

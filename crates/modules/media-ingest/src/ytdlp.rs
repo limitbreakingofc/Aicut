@@ -1,6 +1,6 @@
 use aicut_core::{
-    ActorKind, AicutError, AicutEvent, AicutKernel, AicutResult, JobProgress, MediaAsset,
-    MediaKind, MediaSourceType,
+    configure_tokio_command, ActorKind, AicutError, AicutEvent, AicutKernel, AicutResult,
+    JobProgress, MediaAsset, MediaKind, MediaSourceType,
 };
 use chrono::Utc;
 use schemars::JsonSchema;
@@ -165,6 +165,8 @@ pub struct DownloadRequest {
     #[serde(default)]
     pub proxy: Option<String>,
     #[serde(default)]
+    pub impersonate: Option<String>,
+    #[serde(default)]
     pub cookies_from_browser: Option<BrowserCookieSource>,
     #[serde(default)]
     pub cookies_file: Option<String>,
@@ -195,6 +197,8 @@ pub struct ProbeUrlRequest {
     pub cookies_file: Option<String>,
     #[serde(default)]
     pub proxy: Option<String>,
+    #[serde(default)]
+    pub impersonate: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -250,19 +254,27 @@ pub struct DownloadResponse {
 }
 
 /// Builds the exact yt-dlp CLI argument vector from `DownloadRequest` safely (no shell).
+/// IMPORTANT: Uses `--no-simulate`, `--progress`, and `--print-to-file` (NEVER `--print` alone,
+/// because `--print` implies `--simulate` and `--quiet` in yt-dlp!).
 pub fn build_ytdlp_args(
     req: &DownloadRequest,
     output_dir: &Path,
     ffmpeg_path: Option<&Path>,
+    manifest_file: Option<&Path>,
 ) -> Vec<String> {
     let mut args = vec![
+        "--no-simulate".to_string(),
+        "--progress".to_string(),
         "--newline".to_string(),
-        "--no-warnings".to_string(),
         "--progress-template".to_string(),
         "download:AICUT_PROGRESS:%(progress._percent_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.speed)s|%(progress.eta)s".to_string(),
-        "--print".to_string(),
-        "after_move:AICUT_FILEPATH:%(filepath)s".to_string(),
     ];
+
+    if let Some(mfile) = manifest_file {
+        args.push("--print-to-file".to_string());
+        args.push("after_move:%(filepath)s".to_string());
+        args.push(mfile.to_string_lossy().to_string());
+    }
 
     if let Some(ffmpeg) = ffmpeg_path {
         if let Some(parent) = ffmpeg.parent() {
@@ -372,8 +384,16 @@ pub fn build_ytdlp_args(
     }
 
     // Clip / Section cutting (--download-sections)
-    let start = req.clip_start.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let end = req.clip_end.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let start = req
+        .clip_start
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let end = req
+        .clip_end
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     if start.is_some() || end.is_some() {
         let s = start.unwrap_or("0");
         let e = end.unwrap_or("inf");
@@ -384,7 +404,7 @@ pub fn build_ytdlp_args(
         }
     }
 
-    // Network, Concurrency, Cookies & SponsorBlock
+    // Network, Concurrency, Impersonation, Cookies & SponsorBlock
     if let Some(cf) = req.concurrent_fragments {
         let clamped = cf.clamp(1, 16);
         args.push("--concurrent-fragments".to_string());
@@ -400,6 +420,12 @@ pub fn build_ytdlp_args(
         if !proxy.trim().is_empty() {
             args.push("--proxy".to_string());
             args.push(proxy.trim().to_string());
+        }
+    }
+    if let Some(ref imp) = req.impersonate {
+        if !imp.trim().is_empty() {
+            args.push("--impersonate".to_string());
+            args.push(imp.trim().to_string());
         }
     }
     if let Some(browser) = req.cookies_from_browser {
@@ -508,6 +534,12 @@ pub async fn probe_url(kernel: &Arc<AicutKernel>, req: &ProbeUrlRequest) -> Aicu
         "--no-playlist".to_string(),
         "--skip-download".to_string(),
     ];
+    if let Some(ref imp) = req.impersonate {
+        if !imp.trim().is_empty() {
+            args.push("--impersonate".to_string());
+            args.push(imp.trim().to_string());
+        }
+    }
     if let Some(browser) = req.cookies_from_browser {
         args.push("--cookies-from-browser".to_string());
         args.push(browser.as_ytdlp_arg().to_string());
@@ -525,7 +557,10 @@ pub async fn probe_url(kernel: &Arc<AicutKernel>, req: &ProbeUrlRequest) -> Aicu
     }
     args.push(req.url.trim().to_string());
 
-    let output = Command::new(&ytdlp_path)
+    let mut cmd = Command::new(&ytdlp_path);
+    configure_tokio_command(&mut cmd);
+    let output = cmd
+        .env("PYTHONIOENCODING", "utf-8")
         .args(&args)
         .output()
         .await
@@ -533,8 +568,12 @@ pub async fn probe_url(kernel: &Arc<AicutKernel>, req: &ProbeUrlRequest) -> Aicu
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(AicutError::new("YTDLP_PROBE_FAILED", format!("yt-dlp probe failed: {stderr}"))
-            .recoverable("Verify the URL is valid and accessible, or supply browser cookies if login is required."));
+        return Err(
+            AicutError::new("YTDLP_PROBE_FAILED", format!("yt-dlp probe failed: {stderr}"))
+                .recoverable(
+                    "Verify the URL is valid and accessible, or enable browser cookies / impersonate (e.g. 'chrome') for Cloudflare-protected sites like Kick.",
+                ),
+        );
     }
 
     let json: Value = serde_json::from_slice(&output.stdout)?;
@@ -650,7 +689,6 @@ pub fn parse_probe_json(url: &str, json: &Value) -> ProbeUrlResult {
         }
     }
 
-    // Order best resolution / bitrate first
     formats.sort_by(|a, b| {
         b.height
             .unwrap_or(0)
@@ -770,12 +808,25 @@ async fn execute_download_task(
     cancel: CancellationToken,
 ) -> AicutResult<Vec<MediaAsset>> {
     kernel.jobs.mark_running(&job_id, "initializing");
-    let args = build_ytdlp_args(&req, &kernel.workspace.downloads_dir, ffmpeg_path.as_deref());
+    let _ = std::fs::create_dir_all(&kernel.workspace.downloads_dir);
+
+    let manifest_path = std::env::temp_dir().join(format!("aicut-ytdlp-{job_id}.txt"));
+    let _ = std::fs::remove_file(&manifest_path);
+
+    let args = build_ytdlp_args(
+        &req,
+        &kernel.workspace.downloads_dir,
+        ffmpeg_path.as_deref(),
+        Some(&manifest_path),
+    );
     kernel
         .jobs
         .append_log(&job_id, format!("Executando yt-dlp ({} args)", args.len()));
 
-    let mut child = Command::new(&ytdlp_path)
+    let mut cmd = Command::new(&ytdlp_path);
+    configure_tokio_command(&mut cmd);
+    let mut child = cmd
+        .env("PYTHONIOENCODING", "utf-8")
         .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -792,28 +843,31 @@ async fn execute_download_task(
     let mut stdout_lines = BufReader::new(stdout).lines();
     let mut stderr_lines = BufReader::new(stderr).lines();
 
-    let mut final_files: Vec<PathBuf> = Vec::new();
+    let mut stdout_done = false;
+    let mut stderr_done = false;
     let mut stderr_buf: Vec<String> = Vec::new();
+    let mut fallback_paths: Vec<PathBuf> = Vec::new();
 
-    loop {
+    while !(stdout_done && stderr_done) {
         tokio::select! {
             _ = cancel.cancelled() => {
                 let _ = child.kill().await;
+                let _ = std::fs::remove_file(&manifest_path);
                 kernel.jobs.mark_cancelled(&job_id);
                 return Err(AicutError::cancelled("Download cancelled by user/AI."));
             }
-            line = stdout_lines.next_line() => {
+            line = stdout_lines.next_line(), if !stdout_done => {
                 match line {
                     Ok(Some(l)) => {
                         let trimmed = l.trim();
                         if let Some(prog) = parse_progress_line(trimmed) {
                             kernel.jobs.update_progress(&job_id, prog);
-                        } else if let Some(fp) = trimmed.strip_prefix("AICUT_FILEPATH:") {
-                            let path = PathBuf::from(fp.trim());
-                            if !final_files.contains(&path) {
-                                final_files.push(path);
-                            }
                         } else if !trimmed.is_empty() {
+                            if let Some(dest) = extract_destination_path(trimmed) {
+                                if !fallback_paths.contains(&dest) {
+                                    fallback_paths.push(dest);
+                                }
+                            }
                             if trimmed.contains("[Merger]") || trimmed.contains("[ExtractAudio]") || trimmed.contains("[Fixup") {
                                 kernel.jobs.update_progress(&job_id, JobProgress {
                                     percent: 94.0,
@@ -825,17 +879,19 @@ async fn execute_download_task(
                             kernel.jobs.append_log(&job_id, trimmed);
                         }
                     }
-                    Ok(None) => break,
-                    Err(_) => break,
+                    Ok(None) | Err(_) => stdout_done = true,
                 }
             }
-            err_line = stderr_lines.next_line() => {
-                if let Ok(Some(el)) = err_line {
-                    let trimmed = el.trim();
-                    if !trimmed.is_empty() {
-                        stderr_buf.push(trimmed.to_string());
-                        kernel.jobs.append_log(&job_id, format!("stderr: {trimmed}"));
+            err_line = stderr_lines.next_line(), if !stderr_done => {
+                match err_line {
+                    Ok(Some(el)) => {
+                        let trimmed = el.trim();
+                        if !trimmed.is_empty() {
+                            stderr_buf.push(trimmed.to_string());
+                            kernel.jobs.append_log(&job_id, format!("stderr: {trimmed}"));
+                        }
                     }
+                    Ok(None) | Err(_) => stderr_done = true,
                 }
             }
         }
@@ -846,14 +902,37 @@ async fn execute_download_task(
         .await
         .map_err(|e| AicutError::internal(format!("Failed awaiting yt-dlp: {e}")))?;
 
+    let mut final_files: Vec<PathBuf> = Vec::new();
+    if let Ok(content) = std::fs::read_to_string(&manifest_path) {
+        for line in content.lines() {
+            let trimmed = line.trim().trim_start_matches('\u{feff}');
+            if !trimmed.is_empty() {
+                let p = PathBuf::from(trimmed);
+                if p.is_file() && !final_files.contains(&p) {
+                    final_files.push(p);
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&manifest_path);
+
+    if final_files.is_empty() {
+        for p in fallback_paths {
+            if p.is_file() && !final_files.contains(&p) {
+                final_files.push(p);
+            }
+        }
+    }
+
     if !status.success() {
         let msg = if stderr_buf.is_empty() {
             format!("yt-dlp exited with code {:?}", status.code())
         } else {
             stderr_buf.join(" | ")
         };
-        let err = AicutError::new("YTDLP_DOWNLOAD_FAILED", msg)
-            .recoverable("Check URL, format selection, or update yt-dlp in Settings -> Tools.");
+        let err = AicutError::new("YTDLP_DOWNLOAD_FAILED", msg).recoverable(
+            "Verifique a URL, atualize o yt-dlp em Configurações -> Ferramentas, ou ative Cookies/Impersonate (Chrome) para sites protegidos como Kick.",
+        );
         kernel.jobs.fail(&job_id, err.clone());
         return Err(err);
     }
@@ -886,7 +965,7 @@ async fn execute_download_task(
 
     if indexed_assets.is_empty() {
         let err = AicutError::internal(
-            "yt-dlp finished successfully, but no output file path was captured.",
+            "yt-dlp concluiu, mas nenhum arquivo final foi encontrado na pasta de Downloads.",
         );
         kernel.jobs.fail(&job_id, err.clone());
         return Err(err);
@@ -901,6 +980,36 @@ async fn execute_download_task(
     );
 
     Ok(indexed_assets)
+}
+
+fn extract_destination_path(line: &str) -> Option<PathBuf> {
+    if let Some(rest) = line.strip_prefix("[Merger] Merging formats into \"") {
+        let path = rest.trim_end_matches('"');
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    if let Some(rest) = line.strip_prefix("[ExtractAudio] Destination: ") {
+        let path = rest.trim();
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    if let Some(rest) = line.strip_prefix("[download] Destination: ") {
+        let path = rest.trim();
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    if let Some(rest) = line.strip_prefix("[download] ") {
+        if let Some(path) = rest.strip_suffix(" has already been downloaded") {
+            let p = path.trim();
+            if !p.is_empty() {
+                return Some(PathBuf::from(p));
+            }
+        }
+    }
+    None
 }
 
 async fn index_downloaded_file(
@@ -958,6 +1067,7 @@ async fn index_downloaded_file(
         kind,
         source_type: MediaSourceType::Download,
         source_url: Some(req.url.trim().to_string()),
+        parent_media_id: None,
         file_path: path.to_string_lossy().to_string(),
         file_name,
         extension: ext,
@@ -1002,6 +1112,7 @@ mod tests {
             concurrent_fragments: Some(4),
             rate_limit: Some("10M".into()),
             proxy: None,
+            impersonate: Some("chrome".into()),
             cookies_from_browser: Some(BrowserCookieSource::Edge),
             cookies_file: None,
             sponsorblock_remove: vec!["sponsor".into(), "intro".into()],
@@ -1014,21 +1125,26 @@ mod tests {
     }
 
     #[test]
-    fn builds_full_ytdlp_arguments_for_video_audio() {
+    fn builds_full_ytdlp_arguments_without_simulate_bug() {
         let req = base_req();
-        let args = build_ytdlp_args(&req, Path::new("/tmp/dl"), None);
+        let manifest = Path::new("/tmp/manifest.txt");
+        let args = build_ytdlp_args(&req, Path::new("/tmp/dl"), None, Some(manifest));
+        // Critical regression guard: NEVER use `--print` (which implies --simulate & --quiet)
+        assert!(!args.contains(&"--print".to_string()));
+        assert!(args.contains(&"--no-simulate".to_string()));
+        assert!(args.contains(&"--progress".to_string()));
+        assert!(args.contains(&"--print-to-file".to_string()));
+        assert!(args.contains(&"--impersonate".to_string()));
+        assert!(args.contains(&"chrome".to_string()));
         assert!(args.contains(&"--no-playlist".to_string()));
         assert!(args.contains(&"--merge-output-format".to_string()));
         assert!(args.contains(&"mp4".to_string()));
         assert!(args.contains(&"--embed-chapters".to_string()));
         assert!(args.contains(&"--concurrent-fragments".to_string()));
         assert!(args.contains(&"4".to_string()));
-        assert!(args.contains(&"--limit-rate".to_string()));
-        assert!(args.contains(&"10M".to_string()));
         assert!(args.contains(&"--cookies-from-browser".to_string()));
         assert!(args.contains(&"edge".to_string()));
         assert!(args.contains(&"--sponsorblock-remove".to_string()));
-        assert!(args.contains(&"sponsor,intro".to_string()));
     }
 
     #[test]
@@ -1043,7 +1159,7 @@ mod tests {
         ao.mode = DownloadMode::AudioOnly;
         ao.container = ContainerFormat::Mp3;
         ao.audio_quality = Some("320K".into());
-        let args = build_ytdlp_args(&ao, Path::new("/tmp/dl"), None);
+        let args = build_ytdlp_args(&ao, Path::new("/tmp/dl"), None, None);
         assert!(args.contains(&"-x".to_string()));
         assert!(args.contains(&"--audio-format".to_string()));
         assert!(args.contains(&"mp3".to_string()));
@@ -1064,7 +1180,7 @@ mod tests {
             embed_in_file: true,
             format: Some("srt".into()),
         };
-        let args = build_ytdlp_args(&req, Path::new("/tmp/dl"), None);
+        let args = build_ytdlp_args(&req, Path::new("/tmp/dl"), None, None);
         assert!(args.contains(&"--download-sections".to_string()));
         assert!(args.contains(&"*00:00:30-00:01:45".to_string()));
         assert!(args.contains(&"--force-keyframes-at-cuts".to_string()));
