@@ -10,22 +10,26 @@ use std::path::Path;
 use tokio::process::Command;
 use uuid::Uuid;
 
+use crate::template::{detect_template_geometry_from_path, resolve_template_png, TemplateGeometry};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ShortsLayout {
+    /// 9:16 vertical (1080x1920): custom/built-in branded PNG template with camera on TOP and content on BOTTOM.
+    TemplateSplit,
+    /// 9:16 vertical (1080x1920): borderless split with webcam on TOP and gameplay/content on BOTTOM.
+    GamingSplit,
     /// 9:16 vertical (1080x1920): keeps full 16:9 frame sharp in center over blurred background.
     FitBlur,
     /// 9:16 vertical (1080x1920): full-bleed center crop ideal for vlogs, talks, and facecams.
     CenterCrop,
-    /// 9:16 vertical (1080x1920): gameplay/screen on top + zoomed webcam corner on bottom.
-    GamingSplit,
     /// Keeps original source aspect ratio (e.g. 16:9 horizontal clip).
     Original,
 }
 
 impl Default for ShortsLayout {
     fn default() -> Self {
-        Self::FitBlur
+        Self::TemplateSplit
     }
 }
 
@@ -36,11 +40,27 @@ pub enum WebcamCorner {
     BottomLeft,
     TopRight,
     TopLeft,
+    Center,
 }
 
 impl Default for WebcamCorner {
     fn default() -> Self {
         Self::BottomRight
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentFit {
+    /// Fills the entire bottom content box cleanly (mild center crop, no black bars).
+    Fill,
+    /// Keeps 100% of the 16:9 screen visible inside the bottom content box over a soft blurred fill.
+    FitBlur,
+}
+
+impl Default for ContentFit {
+    fn default() -> Self {
+        Self::Fill
     }
 }
 
@@ -53,6 +73,8 @@ pub async fn render_clip_to_library(
     transcript: Option<&TranscriptRecord>,
     layout: ShortsLayout,
     webcam_corner: WebcamCorner,
+    content_fit: ContentFit,
+    template_path: Option<&str>,
     burn_subtitles: bool,
 ) -> AicutResult<MediaAsset> {
     if clip.segments.is_empty() {
@@ -85,6 +107,14 @@ pub async fn render_clip_to_library(
         None
     };
 
+    let resolved_template = if layout == ShortsLayout::TemplateSplit {
+        let tpl_path = resolve_template_png(kernel, template_path)?;
+        let geom = detect_template_geometry_from_path(&tpl_path);
+        Some((tpl_path, geom))
+    } else {
+        None
+    };
+
     let hw_encoder = select_hw_h264_encoder(kernel.hardware.recommended_accel);
     let first_attempt = run_ffmpeg_render(
         ffmpeg_bin,
@@ -92,6 +122,10 @@ pub async fn render_clip_to_library(
         &clip.segments,
         layout,
         webcam_corner,
+        content_fit,
+        resolved_template
+            .as_ref()
+            .map(|(p, g)| (p.as_path(), *g)),
         tmp_ass.as_deref(),
         hw_encoder,
         &out_path,
@@ -106,6 +140,10 @@ pub async fn render_clip_to_library(
             &clip.segments,
             layout,
             webcam_corner,
+            content_fit,
+            resolved_template
+                .as_ref()
+                .map(|(p, g)| (p.as_path(), *g)),
             tmp_ass.as_deref(),
             "libx264",
             &out_path,
@@ -192,6 +230,16 @@ pub fn select_hw_h264_encoder(accel: AccelBackend) -> &'static str {
     }
 }
 
+fn webcam_crop_expr(corner: WebcamCorner) -> &'static str {
+    match corner {
+        WebcamCorner::BottomRight => "crop=iw*0.34:ih*0.38:iw*0.66:ih*0.62",
+        WebcamCorner::BottomLeft => "crop=iw*0.34:ih*0.38:0:ih*0.62",
+        WebcamCorner::TopRight => "crop=iw*0.34:ih*0.38:iw*0.66:0",
+        WebcamCorner::TopLeft => "crop=iw*0.34:ih*0.38:0:0",
+        WebcamCorner::Center => "crop=iw*0.60:ih*0.75:iw*0.20:ih*0.08",
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_ffmpeg_render(
     ffmpeg_bin: &Path,
@@ -199,6 +247,8 @@ async fn run_ffmpeg_render(
     segments: &[SmartClipSegment],
     layout: ShortsLayout,
     webcam_corner: WebcamCorner,
+    content_fit: ContentFit,
+    template: Option<(&Path, TemplateGeometry)>,
     ass_path: Option<&Path>,
     encoder: &str,
     out_path: &Path,
@@ -211,9 +261,15 @@ async fn run_ffmpeg_render(
     if segments.len() == 1 {
         let seg = &segments[0];
         let dur = (seg.end_sec - seg.start_sec).max(0.5);
-        cmd.args(["-y", "-ss", &format!("{:.3}", seg.start_sec), "-i"])
-            .arg(input_path)
-            .args(["-t", &format!("{dur:.3}")]);
+        cmd.args([
+            "-y",
+            "-ss",
+            &format!("{:.3}", seg.start_sec),
+            "-t",
+            &format!("{dur:.3}"),
+            "-i",
+        ])
+        .arg(input_path);
         filter_parts.push("[0:v]setpts=PTS-STARTPTS[vbase]".to_string());
         filter_parts.push("[0:a]asetpts=PTS-STARTPTS[abase]".to_string());
     } else {
@@ -238,8 +294,58 @@ async fn run_ffmpeg_render(
         ));
     }
 
+    // Add PNG template as input 1 when using TemplateSplit
+    if let Some((tpl_path, _)) = template {
+        cmd.arg("-i").arg(tpl_path);
+    }
+
     // Apply layout transform onto [vbase] -> [vlayout]
     match layout {
+        ShortsLayout::TemplateSplit => {
+            let geom = template.map(|(_, g)| g).unwrap_or_default();
+            let tc = geom.top_camera;
+            let bc = geom.bottom_content;
+            let cam_crop = webcam_crop_expr(webcam_corner);
+
+            filter_parts.push("[vbase]split=3[canvas_src][cam_src][content_src]".to_string());
+            // Derive canvas from video stream so FPS & EOF always match source cleanly
+            filter_parts.push(
+                "[canvas_src]scale=1080:1920,drawbox=t=fill:c=black,setsar=1[canvas]".to_string(),
+            );
+            // Top box: CAMERA
+            filter_parts.push(format!(
+                "[cam_src]{cam_crop},scale={}:{}:force_original_aspect_ratio=increase,crop={}:{},setsar=1[cam_box]",
+                tc.w, tc.h, tc.w, tc.h
+            ));
+            // Bottom box: CONTENT
+            match content_fit {
+                ContentFit::Fill => {
+                    filter_parts.push(format!(
+                        "[content_src]scale={}:{}:force_original_aspect_ratio=increase,crop={}:{},setsar=1[content_box]",
+                        bc.w, bc.h, bc.w, bc.h
+                    ));
+                }
+                ContentFit::FitBlur => {
+                    filter_parts.push("[content_src]split=2[cb_bg_in][cb_fg_in]".to_string());
+                    filter_parts.push(format!(
+                        "[cb_bg_in]scale={}:{}:force_original_aspect_ratio=increase,crop={}:{},boxblur=18:4[cb_bg]",
+                        bc.w, bc.h, bc.w, bc.h
+                    ));
+                    filter_parts.push(format!(
+                        "[cb_fg_in]scale={}:{}:force_original_aspect_ratio=decrease[cb_fg]",
+                        bc.w, bc.h
+                    ));
+                    filter_parts.push(
+                        "[cb_bg][cb_fg]overlay=(W-w)/2:(H-h)/2,setsar=1[content_box]".to_string(),
+                    );
+                }
+            }
+            // Stack camera on top slot, content on bottom slot, and PNG template overlay on top
+            filter_parts.push(format!("[canvas][cam_box]overlay={}:{}[tmp1]", tc.x, tc.y));
+            filter_parts.push(format!("[tmp1][content_box]overlay={}:{}[tmp2]", bc.x, bc.y));
+            filter_parts.push("[1:v]scale=1080:1920,format=rgba[tpl]".to_string());
+            filter_parts.push("[tmp2][tpl]overlay=0:0:format=auto,setsar=1[vlayout]".to_string());
+        }
         ShortsLayout::Original => {
             filter_parts.push("[vbase]scale=trunc(iw/2)*2:trunc(ih/2)*2[vlayout]".to_string());
         }
@@ -261,21 +367,33 @@ async fn run_ffmpeg_render(
             filter_parts.push("[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[vlayout]".to_string());
         }
         ShortsLayout::GamingSplit => {
-            let (wx, wy) = match webcam_corner {
-                WebcamCorner::BottomRight => ("iw*0.66", "ih*0.64"),
-                WebcamCorner::BottomLeft => ("0", "ih*0.64"),
-                WebcamCorner::TopRight => ("iw*0.66", "0"),
-                WebcamCorner::TopLeft => ("0", "0"),
-            };
-            filter_parts.push("[vbase]split=2[top_in][cam_in]".to_string());
-            filter_parts.push(
-                "[top_in]scale=1080:1190:force_original_aspect_ratio=increase,crop=1080:1190[top]"
-                    .to_string(),
-            );
+            // Camera on TOP (1080x730) + Content/Gameplay on BOTTOM (1080x1190)
+            let cam_crop = webcam_crop_expr(webcam_corner);
+            filter_parts.push("[vbase]split=2[cam_in][bot_in]".to_string());
             filter_parts.push(format!(
-                "[cam_in]crop=iw*0.34:ih*0.36:{wx}:{wy},scale=1080:730:force_original_aspect_ratio=increase,crop=1080:730[cam]"
+                "[cam_in]{cam_crop},scale=1080:730:force_original_aspect_ratio=increase,crop=1080:730[cam]"
             ));
-            filter_parts.push("[top][cam]vstack=inputs=2,setsar=1[vlayout]".to_string());
+            match content_fit {
+                ContentFit::Fill => {
+                    filter_parts.push(
+                        "[bot_in]scale=1080:1190:force_original_aspect_ratio=increase,crop=1080:1190[bot]"
+                            .to_string(),
+                    );
+                }
+                ContentFit::FitBlur => {
+                    filter_parts.push("[bot_in]split=2[gb_bg_in][gb_fg_in]".to_string());
+                    filter_parts.push(
+                        "[gb_bg_in]scale=1080:1190:force_original_aspect_ratio=increase,crop=1080:1190,boxblur=20:5[gb_bg]"
+                            .to_string(),
+                    );
+                    filter_parts.push(
+                        "[gb_fg_in]scale=1080:1190:force_original_aspect_ratio=decrease[gb_fg]"
+                            .to_string(),
+                    );
+                    filter_parts.push("[gb_bg][gb_fg]overlay=(W-w)/2:(H-h)/2[bot]".to_string());
+                }
+            }
+            filter_parts.push("[cam][bot]vstack=inputs=2,setsar=1[vlayout]".to_string());
         }
     }
 

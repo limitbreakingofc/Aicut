@@ -81,8 +81,11 @@ jobs:
           body: |
             ## Aicut ${{ steps.tag.outputs.name }} — Estúdio Modular AI-First para Windows 11
 
-            ### Correções da v0.4.1
-            - **Compatibilidade com FFmpeg 8 (`N-129xxx`):** substituída a flag removida `-vsync vfr` por `-fps_mode vfr` na extração de storyboards visuais do modo Local Free, além de `-frames:v 1` nas miniaturas e ajuste seguro de escala no layout `FitBlur`.
+            ### Novidades da v0.4.2 — Moldura Shorts Padrão (Câmera em Cima + Conteúdo em Baixo)
+            - **Moldura PNG 9:16 Integrada (`SMOKING33`) como Layout Padrão (`template_split`)**: embutida direto no Aicut com recorte transparente automático de alta precisão — **Câmera na janela superior** (`1020×582`) e **Conteúdo/Gameplay na janela inferior** (`1020×889`), com bordas arredondadas e douradas perfeitas por cima do vídeo!
+            - **Suporte a qualquer Moldura PNG Personalizada**: o detector de canal alpha lê automaticamente as duas janelas transparentes de qualquer PNG 9:16 que você escolher.
+            - **Split Sem Moldura (`gaming_split`) atualizado**: agora também segue o padrão **Câmera em Cima + Conteúdo em Baixo**, com seletor de origem da webcam (4 cantos ou centro) e modo de ajuste do conteúdo (*Preencher* ou *Tela 16:9 inteira + Blur*).
+            - **Inclui a correção da v0.4.1** de compatibilidade com FFmpeg 8 (`-fps_mode vfr`).
 
             ### Novidades da v0.4.0 — Cortes Shorts IA (Visual + Narrativa até 3 min)
             - **Novo Módulo `Cortes Shorts IA` (`smart-clips`)**: assiste vídeos e lives usando **IA visual multimodal**, segue sua descrição editorial e encontra cortes coerentes com **Início (gancho 5s) → Meio → Fim** de até **3 minutos (180s)**, com snap cirúrgico em fronteiras de palavras.

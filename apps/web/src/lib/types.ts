@@ -328,6 +328,7 @@ export interface ClipsConfig {
   gemini_scan_model: string;
   gemini_director_model: string;
   local_vision_model: string;
+  template_path?: string | null;
 }
 
 export interface SmartClipSegment {

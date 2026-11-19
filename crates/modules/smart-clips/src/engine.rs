@@ -15,13 +15,14 @@ use crate::gemini::{analyze_with_gemini, GeminiConfig};
 use crate::local_vlm::analyze_with_local_vlm;
 use crate::models::{recommended_vision_model_id, resolve_installed_vision_model};
 use crate::postprocess::validate_and_finalize_clips;
-use crate::renderer::{render_clip_to_library, ShortsLayout, WebcamCorner};
+use crate::renderer::{render_clip_to_library, ContentFit, ShortsLayout, WebcamCorner};
 
 pub const SETTING_GEMINI_API_KEY: &str = "smart_clips_gemini_api_key";
 pub const SETTING_DEFAULT_PROVIDER: &str = "smart_clips_default_provider";
 pub const SETTING_GEMINI_SCAN_MODEL: &str = "smart_clips_gemini_scan_model";
 pub const SETTING_GEMINI_DIRECTOR_MODEL: &str = "smart_clips_gemini_director_model";
 pub const SETTING_LOCAL_VISION_MODEL: &str = "smart_clips_local_vision_model";
+pub const SETTING_TEMPLATE_PATH: &str = "smart_clips_template_path";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -103,6 +104,11 @@ pub struct RenderClipRequest {
     pub layout: ShortsLayout,
     #[serde(default)]
     pub webcam_corner: WebcamCorner,
+    #[serde(default)]
+    pub content_fit: ContentFit,
+    /// Optional custom 9:16 PNG template path (uses built-in SMOKING33 template if omitted).
+    #[serde(default)]
+    pub template_path: Option<String>,
     #[serde(default = "default_true")]
     pub burn_subtitles: bool,
     #[serde(default)]
@@ -486,6 +492,20 @@ pub async fn start_clip_render(
     );
     let job_id = job.id.clone();
 
+    let effective_template_path = req
+        .template_path
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            kernel
+                .repo
+                .get_setting(SETTING_TEMPLATE_PATH)
+                .ok()
+                .flatten()
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .filter(|s| !s.trim().is_empty())
+        });
+
     let wait = req.wait;
     let task_kernel = kernel.clone();
     let task_job_id = job_id.clone();
@@ -525,6 +545,8 @@ pub async fn start_clip_render(
                     transcript.as_ref(),
                     req.layout,
                     req.webcam_corner,
+                    req.content_fit,
+                    effective_template_path.as_deref(),
                     req.burn_subtitles,
                 )
                 .await?;

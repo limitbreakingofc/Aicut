@@ -6,6 +6,7 @@ pub mod models;
 pub mod postprocess;
 pub mod prompts;
 pub mod renderer;
+pub mod template;
 
 use aicut_core::{
     ActionAnnotations, ActionHandler, AicutError, AicutEvent, AicutKernel, AicutModule, EmptyInput,
@@ -20,7 +21,7 @@ use crate::engine::{
     resolve_gemini_api_key, start_clip_analysis, start_clip_render, AnalyzeClipsRequest,
     AnalyzeClipsResponse, RenderClipRequest, RenderClipResponse, SETTING_DEFAULT_PROVIDER,
     SETTING_GEMINI_API_KEY, SETTING_GEMINI_DIRECTOR_MODEL, SETTING_GEMINI_SCAN_MODEL,
-    SETTING_LOCAL_VISION_MODEL,
+    SETTING_LOCAL_VISION_MODEL, SETTING_TEMPLATE_PATH,
 };
 use crate::models::{
     delete_vision_model, download_vision_model, list_vision_models, recommended_vision_model_id,
@@ -48,6 +49,7 @@ pub struct ClipsConfigOutput {
     pub gemini_scan_model: String,
     pub gemini_director_model: String,
     pub local_vision_model: String,
+    pub template_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -62,6 +64,8 @@ pub struct ClipsConfigUpdateInput {
     pub gemini_director_model: Option<String>,
     #[serde(default)]
     pub local_vision_model: Option<String>,
+    #[serde(default)]
+    pub template_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -106,6 +110,14 @@ fn read_clips_config(kernel: &AicutKernel) -> ClipsConfigOutput {
             .unwrap_or_else(|| default.to_string())
     };
 
+    let template_path = kernel
+        .repo
+        .get_setting(SETTING_TEMPLATE_PATH)
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .filter(|s| !s.trim().is_empty());
+
     ClipsConfigOutput {
         gemini_configured: key.is_some(),
         gemini_key_preview: preview,
@@ -116,6 +128,7 @@ fn read_clips_config(kernel: &AicutKernel) -> ClipsConfigOutput {
             SETTING_LOCAL_VISION_MODEL,
             recommended_vision_model_id(&kernel.hardware),
         ),
+        template_path,
     }
 }
 
@@ -296,6 +309,12 @@ impl AicutModule for SmartClipsModule {
                             ctx.kernel.repo.set_setting(
                                 SETTING_LOCAL_VISION_MODEL,
                                 &serde_json::json!(m.trim()),
+                            )?;
+                        }
+                        if let Some(ref t) = input.template_path {
+                            ctx.kernel.repo.set_setting(
+                                SETTING_TEMPLATE_PATH,
+                                &serde_json::json!(t.trim()),
                             )?;
                         }
                         let cfg = read_clips_config(&ctx.kernel);

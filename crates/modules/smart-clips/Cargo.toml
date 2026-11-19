@@ -10,6 +10,7 @@ async-trait.workspace = true
 base64.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
+png.workspace = true
 reqwest.workspace = true
 schemars.workspace = true
 serde.workspace = true

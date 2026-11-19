@@ -66,19 +66,24 @@ const DESCRIPTION_PRESETS = [
 
 const SHORTS_LAYOUTS = [
   {
+    id: "template_split",
+    label: "Moldura Shorts (SMOKING33) · Câmera em Cima + Conteúdo em Baixo",
+    desc: "Aplica sua moldura 9:16 com borda dourada: webcam na janela superior e conteúdo/gameplay na janela inferior.",
+  },
+  {
+    id: "gaming_split",
+    label: "Split 9:16 Sem Moldura · Câmera em Cima + Conteúdo em Baixo",
+    desc: "Webcam cheia na parte superior e gameplay/conteúdo na parte inferior, sem moldura.",
+  },
+  {
     id: "fit_blur",
     label: "Shorts 9:16 · Tela Inteira + Blur",
-    desc: "Mantém o vídeo 16:9 sem cortar bordas sobre fundo desfocado (ideal para lives, tutoriais e gameplay).",
+    desc: "Mantém o vídeo 16:9 sem cortar bordas sobre fundo desfocado (ideal para tutoriais e tela única).",
   },
   {
     id: "center_crop",
     label: "Shorts 9:16 · Foco Central",
     desc: "Enquadramento vertical cheio focado no centro (ideal para vlogs, podcasts e câmera principal).",
-  },
-  {
-    id: "gaming_split",
-    label: "Shorts 9:16 · Split Gameplay + Webcam",
-    desc: "Jogo/tela na metade superior e zoom na webcam na parte inferior.",
   },
   {
     id: "original",
@@ -133,12 +138,14 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
   const [transcripts, setTranscripts] = useState<TranscriptRecord[]>([]);
 
   // Shorts rendering options
-  const [layout, setLayout] = useState<"fit_blur" | "center_crop" | "gaming_split" | "original">(
-    "fit_blur",
-  );
+  const [layout, setLayout] = useState<
+    "template_split" | "gaming_split" | "fit_blur" | "center_crop" | "original"
+  >("template_split");
   const [webcamCorner, setWebcamCorner] = useState<
-    "bottom_right" | "bottom_left" | "top_right" | "top_left"
+    "bottom_right" | "bottom_left" | "top_right" | "top_left" | "center"
   >("bottom_right");
+  const [contentFit, setContentFit] = useState<"fill" | "fit_blur">("fill");
+  const [customTemplatePath, setCustomTemplatePath] = useState<string>("");
   const [burnSubtitles, setBurnSubtitles] = useState<boolean>(true);
   const [analyzing, setAnalyzing] = useState<boolean>(false);
   const [renderingKey, setRenderingKey] = useState<string | null>(null);
@@ -168,6 +175,7 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
       ]);
 
       setConfig(cfgRes.data);
+      setCustomTemplatePath(cfgRes.data.template_path ?? "");
       if (cfgRes.data.default_provider === "local_free") {
         setProvider("local_free");
       } else {
@@ -378,6 +386,8 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
         clip_id: clipId,
         layout,
         webcam_corner: webcamCorner,
+        content_fit: contentFit,
+        template_path: customTemplatePath.trim() ? customTemplatePath.trim() : undefined,
         burn_subtitles: burnSubtitles,
         wait: false,
       });
@@ -885,76 +895,158 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
         {/* Shorts render controls */}
         <div
           style={{
-            display: "grid",
-            gridTemplateColumns: layout === "gaming_split" ? "1.3fr 1fr auto auto" : "1.6fr auto auto",
+            display: "flex",
+            flexDirection: "column",
             gap: 10,
-            alignItems: "end",
             padding: 12,
             borderRadius: "var(--radius-md)",
             background: "var(--bg-elevated)",
           }}
         >
-          <div className="field" style={{ margin: 0 }}>
-            <label>Enquadramento Shorts</label>
-            <select
-              className="select"
-              value={layout}
-              onChange={(e) =>
-                setLayout(e.target.value as "fit_blur" | "center_crop" | "gaming_split" | "original")
-              }
-            >
-              {SHORTS_LAYOUTS.map((l) => (
-                <option key={l.id} value={l.id}>
-                  {l.label}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          {layout === "gaming_split" && (
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns:
+                layout === "template_split" || layout === "gaming_split"
+                  ? "1.4fr 1fr 1fr auto"
+                  : "1.6fr auto auto",
+              gap: 10,
+              alignItems: "end",
+            }}
+          >
             <div className="field" style={{ margin: 0 }}>
-              <label>Posição da Webcam</label>
+              <label>Enquadramento Shorts</label>
               <select
                 className="select"
-                value={webcamCorner}
+                value={layout}
                 onChange={(e) =>
-                  setWebcamCorner(
-                    e.target.value as "bottom_right" | "bottom_left" | "top_right" | "top_left",
+                  setLayout(
+                    e.target.value as
+                      | "template_split"
+                      | "gaming_split"
+                      | "fit_blur"
+                      | "center_crop"
+                      | "original",
                   )
                 }
               >
-                <option value="bottom_right">Canto inferior direito</option>
-                <option value="bottom_left">Canto inferior esquerdo</option>
-                <option value="top_right">Canto superior direito</option>
-                <option value="top_left">Canto superior esquerdo</option>
+                {SHORTS_LAYOUTS.map((l) => (
+                  <option key={l.id} value={l.id}>
+                    {l.label}
+                  </option>
+                ))}
               </select>
             </div>
-          )}
 
-          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, paddingBottom: 8, cursor: "pointer" }}>
-            <input
-              type="checkbox"
-              checked={burnSubtitles}
-              onChange={(e) => setBurnSubtitles(e.target.checked)}
-            />
-            Queimar legendas Karaokê (se transcrito)
-          </label>
+            {(layout === "template_split" || layout === "gaming_split") && (
+              <>
+                <div className="field" style={{ margin: 0 }}>
+                  <label>Origem da Câmera (Janela de Cima)</label>
+                  <select
+                    className="select"
+                    value={webcamCorner}
+                    onChange={(e) =>
+                      setWebcamCorner(
+                        e.target.value as
+                          | "bottom_right"
+                          | "bottom_left"
+                          | "top_right"
+                          | "top_left"
+                          | "center",
+                      )
+                    }
+                  >
+                    <option value="bottom_right">Canto inferior direito</option>
+                    <option value="bottom_left">Canto inferior esquerdo</option>
+                    <option value="top_right">Canto superior direito</option>
+                    <option value="top_left">Canto superior esquerdo</option>
+                    <option value="center">Centro (vídeo sem webcam no canto)</option>
+                  </select>
+                </div>
 
-          {activeRun && activeRun.clips.length > 0 && (
-            <button
-              type="button"
-              className="btn btn-primary"
-              disabled={renderingKey !== null}
-              onClick={() => handleRender(activeRun.id)}
-            >
-              {renderingKey === `all:${activeRun.id}` ? (
-                <Loader2 size={14} className="spin" />
-              ) : (
-                <Scissors size={14} />
-              )}
-              Renderizar Todos ({activeRun.clips.length})
-            </button>
-          )}
+                <div className="field" style={{ margin: 0 }}>
+                  <label>Conteúdo (Janela de Baixo)</label>
+                  <select
+                    className="select"
+                    value={contentFit}
+                    onChange={(e) => setContentFit(e.target.value as "fill" | "fit_blur")}
+                  >
+                    <option value="fill">Preencher janela (sem bordas)</option>
+                    <option value="fit_blur">Tela 16:9 inteira + Blur</option>
+                  </select>
+                </div>
+              </>
+            )}
+
+            {activeRun && activeRun.clips.length > 0 && (
+              <button
+                type="button"
+                className="btn btn-primary"
+                disabled={renderingKey !== null}
+                onClick={() => handleRender(activeRun.id)}
+              >
+                {renderingKey === `all:${activeRun.id}` ? (
+                  <Loader2 size={14} className="spin" />
+                ) : (
+                  <Scissors size={14} />
+                )}
+                Renderizar Todos ({activeRun.clips.length})
+              </button>
+            )}
+          </div>
+
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              flexWrap: "wrap",
+              gap: 10,
+            }}
+          >
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={burnSubtitles}
+                onChange={(e) => setBurnSubtitles(e.target.checked)}
+              />
+              Queimar legendas Karaokê sincronizadas (se transcrito)
+            </label>
+
+            {layout === "template_split" && (
+              <div style={{ display: "flex", alignItems: "center", gap: 6, flex: 1, minWidth: 280, maxWidth: 520 }}>
+                <input
+                  type="text"
+                  className="input"
+                  style={{ fontSize: 12, padding: "5px 8px" }}
+                  value={customTemplatePath}
+                  onChange={(e) => setCustomTemplatePath(e.target.value)}
+                  placeholder="Moldura padrão SMOKING33 ativa (ou cole caminho de outro PNG 9:16 transparente)"
+                />
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={() => {
+                    void runAction("clips.config_set", {
+                      template_path: customTemplatePath.trim(),
+                    })
+                      .then(() =>
+                        onNotify(
+                          "success",
+                          "Moldura salva",
+                          customTemplatePath.trim()
+                            ? "Moldura PNG personalizada salva como padrão."
+                            : "Moldura padrão SMOKING33 restaurada.",
+                        ),
+                      )
+                      .catch(() => {});
+                  }}
+                >
+                  Salvar PNG
+                </button>
+              </div>
+            )}
+          </div>
         </div>
 
         {/* Clip Cards */}
