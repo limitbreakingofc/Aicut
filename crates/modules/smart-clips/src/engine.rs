@@ -14,7 +14,7 @@ use crate::framing::{resolve_effective_framing, ContentRegionMode, NormalizedRec
 use crate::frames::probe_duration_sec;
 use crate::gemini::{analyze_with_gemini, GeminiConfig};
 use crate::local_vlm::analyze_with_local_vlm;
-use crate::models::{recommended_vision_model_id, resolve_installed_vision_model};
+use crate::models::resolve_any_installed_vision_model;
 use crate::postprocess::validate_and_finalize_clips;
 use crate::renderer::{render_clip_to_library, ContentFit, ShortsLayout, WebcamCorner};
 
@@ -227,7 +227,7 @@ pub async fn start_clip_analysis(
         }
         ClipProvider::LocalFree => {
             let llama_bin = kernel.tools.resolve_tool("llama-server")?;
-            let model_id = req
+            let preferred_id = req
                 .model_id
                 .clone()
                 .filter(|s| !s.trim().is_empty())
@@ -239,9 +239,9 @@ pub async fn start_clip_analysis(
                         .flatten()
                         .and_then(|v| v.as_str().map(|s| s.to_string()))
                         .filter(|s| !s.trim().is_empty())
-                })
-                .unwrap_or_else(|| recommended_vision_model_id(&kernel.hardware).to_string());
-            let (model_path, mmproj_path) = resolve_installed_vision_model(&kernel, &model_id)?;
+                });
+            let (model_id, model_path, mmproj_path) =
+                resolve_any_installed_vision_model(&kernel, preferred_id.as_deref())?;
             ResolvedProvider::Local {
                 llama_bin,
                 model_id,

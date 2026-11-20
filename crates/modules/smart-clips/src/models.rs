@@ -181,9 +181,36 @@ pub fn resolve_installed_vision_model(
     Err(AicutError::dependency_missing(
         &format!("vision_model:{model_id}"),
         format!(
-            "Modelo visual '{}' ainda não foi baixado. Baixe-o na aba Cortes IA (modo Local Free).",
+            "Modelo visual '{}' ainda não foi baixado. Baixe-o em Configurações → IA & Chaves (modo Local grátis).",
             spec.display_name
         ),
+    ))
+}
+
+/// Resolves the preferred local vision model if installed, otherwise automatically falls back
+/// to ANY installed Qwen2.5-VL model on disk so users never hit a false "not installed" error
+/// when they downloaded a different quantization/size than the default recommendation.
+pub fn resolve_any_installed_vision_model(
+    kernel: &AicutKernel,
+    preferred_model_id: Option<&str>,
+) -> AicutResult<(String, PathBuf, PathBuf)> {
+    if let Some(pref) = preferred_model_id.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Ok((mp, proj)) = resolve_installed_vision_model(kernel, pref) {
+            return Ok((pref.to_string(), mp, proj));
+        }
+    }
+    let rec = recommended_vision_model_id(&kernel.hardware);
+    if let Ok((mp, proj)) = resolve_installed_vision_model(kernel, rec) {
+        return Ok((rec.to_string(), mp, proj));
+    }
+    for spec in catalog() {
+        if let Ok((mp, proj)) = resolve_installed_vision_model(kernel, &spec.id) {
+            return Ok((spec.id, mp, proj));
+        }
+    }
+    Err(AicutError::dependency_missing(
+        "vision_model",
+        "Nenhum modelo visual local (Qwen2.5-VL) está baixado. Baixe um modelo em Configurações → IA & Chaves (modo Local grátis).",
     ))
 }
 

@@ -83,6 +83,16 @@ jobs:
           body: |
             ## Aicut ${{ steps.tag.outputs.name }} — Estúdio Modular AI-First para Windows 11
 
+            ### Novidades & Correções da v0.9.2 — Gemini Anti-503 + IA Local GPU no Motion Studio + Ilustrações Animadas Sob Medida (Zero Padronização)
+            - **Fim das falhas por HTTP 503 (`high demand`) no Gemini:** agora o motor Gemini faz **retentativas automáticas com backoff** e **failover completo entre até 6 modelos ativos** na sua chave (ex.: `gemini-3.8-pro` → `gemini-3.8-flash` → `gemini-2.5-pro` → `gemini-2.5-flash` → `gemini-2.5-flash-lite`) em Motion Studio, Cortes Shorts e Revisão de Enquadramento!
+            - **IA Local Grátis (`llama-server` + `Qwen2.5-VL` na GPU) agora funciona no Motion Studio + Failover Cruzado Automático:**
+              - O Motion Studio respeita o motor escolhido em **Configurações → IA & Chaves** (`Gemini API` ou `Local grátis GPU`).
+              - Se o Gemini ficar indisponível/503 e você tiver a IA Local instalada, o Aicut alterna automaticamente para a sua GPU local (e vice-versa!).
+              - Novo resolvedor `resolve_any_installed_vision_model` encontra automaticamente qualquer `Qwen2.5-VL` já baixado (3B/7B), captura o log real de erro do `llama-server` e faz fallback seguro de VRAM (`-ngl 99` → `-ngl 24` → CPU) caso outro programa esteja usando VRAM.
+            - **Edição & Ilustrações Animadas 100% Sob Medida (Zero Padronização):**
+              - Removida qualquer fórmula/template fixo no Motion Studio: a IA cria paleta, ritmo e **ilustrações vetoriais SVG, gráficos animados, contadores, diagramas e tipografia cinética** preenchendo automaticamente a área de conteúdo (`.hf-content-stage`) sempre que nada relevante estiver acontecendo na tela de baixo (mantendo a webcam limpa em cima)!
+              - Runtime determinístico turbinado com `window.__aicut.interpolate(...)`, `window.__aicut.spring(...)` (estilo Remotion), barras animadas (`data-bar-to`) e animações `float`/`spin`/`draw`.
+
             ### Novidades da v0.9.1 — Interface Reorganizada em Abas Sem Redundância + Motion Studio Integrado ao Plano de Cortes
             - **Motion Studio conectado diretamente ao Plano de Cortes:** agora o Motion Studio seleciona diretamente um corte gerado nos seus Planos de Corte (agrupados por plano, com timecode exato automático e zero campos manuais de segundos), herda automaticamente o gancho/evidência visual/arco narrativo do corte para a IA editora e carrega a composição/conversa exata de cada corte separadamente.
             - **Menu Lateral Limpo (5 abas do Estúdio + Configurações fixa embaixo):** eliminados os 4 itens duplicados do menu lateral (`Enquadramento`, `Fila de Tarefas`, `Módulos`, `Conectar IA`). Agora são apenas **Importar (`Alt+1`)**, **Biblioteca (`Alt+2`)**, **Transcrever (`Alt+3`)**, **Cortes Shorts (`Alt+4`)**, **Motion Studio (`Alt+5`)** e **Configurações (`Alt+6`)** isolada no rodapé.

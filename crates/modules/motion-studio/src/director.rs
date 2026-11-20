@@ -1,13 +1,14 @@
 use aicut_core::{configure_tokio_command, AicutError, AicutKernel, AicutResult, TranscriptRecord};
 use aicut_module_smart_clips::engine::{
-    resolve_gemini_api_key, SETTING_GEMINI_DIRECTOR_MODEL, SETTING_GEMINI_SCAN_MODEL,
+    resolve_gemini_api_key, SETTING_DEFAULT_PROVIDER, SETTING_GEMINI_DIRECTOR_MODEL,
     SETTING_TEMPLATE_PATH,
 };
 use aicut_module_smart_clips::framing::{resolve_effective_framing, NormalizedRect};
 use aicut_module_smart_clips::frames::probe_duration_sec;
 use aicut_module_smart_clips::gemini::{
-    generate_json_text, generate_with_inline_image, resolve_active_gemini_models,
+    generate_json_text, generate_with_inline_image, list_ranked_gemini_models,
 };
+use aicut_module_smart_clips::local_vlm::generate_with_local_vlm_once;
 use aicut_module_smart_clips::prompts::extract_json_object;
 use base64::Engine as _;
 use chrono::Utc;
@@ -175,67 +176,49 @@ pub async fn plan_composition_with_ai(
     let goal_str = user_goal
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or("Assista ao vídeo e aplique automaticamente técnicas de edição profissionais + motion graphics HyperFrames sob medida para o contexto exato deste vídeo.");
+        .unwrap_or("Assista ao corte sem padronização fixa: crie uma edição única para este vídeo, com ilustrações e animações visuais sob medida sempre que nada relevante estiver acontecendo na área de conteúdo.");
+
+    let prompt = build_context_aware_plan_prompt(
+        &comp.title,
+        duration_sec,
+        goal_str,
+        &transcript_excerpt,
+        storyboard_b64.is_some(),
+    );
 
     let mut reply = String::new();
     let mut used_ai = false;
     let mut ai_error_note: Option<String> = None;
 
-    if let Some(api_key) = resolve_gemini_api_key(kernel, None) {
-        let http = kernel.tools.http_client();
-        let (scan_m, dir_m) = resolve_active_gemini_models(
-            http,
-            &api_key,
-            &read_setting_str(kernel, SETTING_GEMINI_SCAN_MODEL, "auto"),
-            &read_setting_str(kernel, SETTING_GEMINI_DIRECTOR_MODEL, "auto"),
-        )
-        .await;
-        let prompt = build_context_aware_plan_prompt(
-            &comp.title,
-            duration_sec,
-            goal_str,
-            &transcript_excerpt,
-            storyboard_b64.is_some(),
-        );
-        match call_gemini_director(
-            http,
-            &api_key,
-            &dir_m,
-            &scan_m,
-            storyboard_b64.as_deref(),
-            &prompt,
-        )
-        .await
-        {
-            Ok((parsed, model_used)) if !parsed.scenes.is_empty() => {
-                if let Some(t) = parsed.title.filter(|s| !s.trim().is_empty()) {
-                    if title_override.is_none() {
-                        comp.title = t;
-                    }
+    match call_director_ai(kernel, storyboard_b64.as_deref(), &prompt).await {
+        Ok((parsed, engine_used)) if !parsed.scenes.is_empty() => {
+            if let Some(t) = parsed.title.filter(|s| !s.trim().is_empty()) {
+                if title_override.is_none() {
+                    comp.title = t;
                 }
-                comp.scenes = parsed.scenes;
-                if let Some(html) = parsed.motion_html.filter(|s| !s.trim().is_empty()) {
-                    comp.motion_html = Some(html);
-                }
-                if let Some(cd) = parsed.creative_direction.filter(|s| !s.trim().is_empty()) {
-                    comp.creative_direction = cd;
-                } else {
-                    comp.creative_direction = format!("Edição IA ({model_used}) · HyperFrames");
-                }
-                reply = parsed.assistant_reply.unwrap_or_else(|| {
-                    format!(
-                        "Assisti ao vídeo ({model_used}) e montei uma edição personalizada com {} momentos + motion graphics HyperFrames sob medida! Dá play ao lado e me diz no chat o que você quer ajustar ou planejar.",
-                        comp.scenes.len()
-                    )
-                });
-                used_ai = true;
             }
-            Ok(_) => {
-                ai_error_note = Some("A IA respondeu sem cenas válidas para o clipe.".to_string());
+            comp.scenes = parsed.scenes;
+            if let Some(html) = parsed.motion_html.filter(|s| !s.trim().is_empty()) {
+                comp.motion_html = Some(html);
             }
-            Err(err) => {
-                ai_error_note = Some(err);
+            if let Some(cd) = parsed.creative_direction.filter(|s| !s.trim().is_empty()) {
+                comp.creative_direction = format!("{cd} · {engine_used}");
+            } else {
+                comp.creative_direction = format!("Edição IA ({engine_used}) · Motion sob medida");
             }
+            reply = parsed.assistant_reply.unwrap_or_else(|| {
+                format!(
+                    "Assisti ao corte ({engine_used}) e criei uma edição sob medida com {} momentos + ilustrações e animações próprias para este vídeo! Dá play ao lado e me diz no chat o que você quer evoluir.",
+                    comp.scenes.len()
+                )
+            });
+            used_ai = true;
+        }
+        Ok(_) => {
+            ai_error_note = Some("A IA respondeu sem cenas válidas para o corte.".to_string());
+        }
+        Err(err) => {
+            ai_error_note = Some(err);
         }
     }
 
@@ -245,10 +228,10 @@ pub async fn plan_composition_with_ai(
         comp.creative_direction = "Edição base local (fallback)".to_string();
         reply = if let Some(err) = ai_error_note {
             format!(
-                "Não consegui concluir a análise com o Gemini agora ({err}). Apliquei uma edição base dinâmica para você já testar o preview — tente novamente no chat ou verifique sua chave/cota do Gemini em Configurações."
+                "Não consegui usar a IA agora ({err}). Apliquei uma base inicial para o preview — configure o Gemini ou baixe um modelo local (Qwen2.5-VL + llama-server) em Configurações → IA & Chaves e tente novamente!"
             )
         } else {
-            "Montei uma primeira edição dinâmica com abertura chamativa, SMOKING33 e destaque em tela cheia! Conecte sua Gemini API Key em Cortes IA / Configurações para eu assistir visualmente aos frames e criar animações HyperFrames 100% sob medida.".to_string()
+            "Configure sua Gemini API Key ou ative a IA Local Grátis (Qwen2.5-VL) em Configurações → IA & Chaves para eu assistir aos frames e criar edições e ilustrações animadas 100% sob medida para este corte.".to_string()
         };
     }
 
@@ -310,63 +293,45 @@ pub async fn edit_composition_via_chat(
     let mut assistant_reply: Option<String> = None;
     let mut ai_err_note: Option<String> = None;
 
-    if let Some(api_key) = resolve_gemini_api_key(kernel, None) {
-        let http = kernel.tools.http_client();
-        let (scan_m, dir_m) = resolve_active_gemini_models(
-            http,
-            &api_key,
-            &read_setting_str(kernel, SETTING_GEMINI_SCAN_MODEL, "auto"),
-            &read_setting_str(kernel, SETTING_GEMINI_DIRECTOR_MODEL, "auto"),
-        )
-        .await;
-        let prompt = build_conversational_editor_prompt(
-            &comp,
-            &transcript_excerpt,
-            trimmed,
-            storyboard_b64.is_some(),
-        );
-        match call_gemini_director(
-            http,
-            &api_key,
-            &dir_m,
-            &scan_m,
-            storyboard_b64.as_deref(),
-            &prompt,
-        )
-        .await
-        {
-            Ok((parsed, _model_used)) => {
-                let is_discuss = parsed.mode.eq_ignore_ascii_case("discuss");
-                if !is_discuss {
-                    if !parsed.scenes.is_empty() {
-                        comp.scenes = parsed.scenes;
-                    }
-                    if let Some(html) = parsed.motion_html {
-                        let cleaned = html.trim().to_string();
-                        comp.motion_html = if cleaned.is_empty() {
-                            None
-                        } else {
-                            Some(cleaned)
-                        };
-                    }
-                    if let Some(cd) = parsed.creative_direction.filter(|s| !s.trim().is_empty()) {
-                        comp.creative_direction = cd;
-                    }
-                    if let Some(b) = parsed.burn_subtitles {
-                        comp.burn_subtitles = b;
-                    }
+    let prompt = build_conversational_editor_prompt(
+        &comp,
+        &transcript_excerpt,
+        trimmed,
+        storyboard_b64.is_some(),
+    );
+
+    match call_director_ai(kernel, storyboard_b64.as_deref(), &prompt).await {
+        Ok((parsed, engine_used)) => {
+            let is_discuss = parsed.mode.eq_ignore_ascii_case("discuss");
+            if !is_discuss {
+                if !parsed.scenes.is_empty() {
+                    comp.scenes = parsed.scenes;
                 }
-                assistant_reply = Some(parsed.assistant_reply.unwrap_or_else(|| {
-                    if is_discuss {
-                        "Essas são minhas sugestões para este vídeo — me diga qual você gostou mais que eu já aplico na hora!".to_string()
+                if let Some(html) = parsed.motion_html {
+                    let cleaned = html.trim().to_string();
+                    comp.motion_html = if cleaned.is_empty() {
+                        None
                     } else {
-                        "Edição atualizada! Dá play no preview ao lado para ver as novas animações e cortes em tempo real.".to_string()
-                    }
-                }));
+                        Some(cleaned)
+                    };
+                }
+                if let Some(cd) = parsed.creative_direction.filter(|s| !s.trim().is_empty()) {
+                    comp.creative_direction = format!("{cd} · {engine_used}");
+                }
+                if let Some(b) = parsed.burn_subtitles {
+                    comp.burn_subtitles = b;
+                }
             }
-            Err(err) => {
-                ai_err_note = Some(err);
-            }
+            assistant_reply = Some(parsed.assistant_reply.unwrap_or_else(|| {
+                if is_discuss {
+                    format!("({engine_used}) Essas são minhas ideias para este corte — me diga qual você curtiu que eu já aplico!")
+                } else {
+                    format!("Edição atualizada via {engine_used}! Dá play no preview ao lado para ver as novas ilustrações, animações e cortes.")
+                }
+            }));
+        }
+        Err(err) => {
+            ai_err_note = Some(err);
         }
     }
 
@@ -375,7 +340,7 @@ pub async fn edit_composition_via_chat(
         None => {
             let local_reply = apply_local_ptbr_chat_edit(&mut comp, trimmed);
             if let Some(err) = ai_err_note {
-                format!("(Aviso: Gemini indisponível agora — {err})\n\n{local_reply}")
+                format!("(Aviso: IA indisponível agora — {err})\n\n{local_reply}")
             } else {
                 local_reply
             }
@@ -488,7 +453,7 @@ pub fn apply_local_ptbr_chat_edit(comp: &mut AicutComposition, msg: &str) -> Str
         return "Legendas karaokê ativadas.".to_string();
     }
 
-    "Para eu assistir visualmente ao vídeo e criar animações HyperFrames sob medida pelo chat, salve sua Gemini API Key na aba Cortes IA. No modo offline você pode pedir por tempo exato (ex.: 'entre 0:08 e 0:16 tela cheia com título \"OLHA ISSO\"').".to_string()
+    "Para eu assistir visualmente ao corte e criar ilustrações e animações sob medida pelo chat, configure sua Gemini API Key ou baixe um modelo da IA Local Grátis (Qwen2.5-VL + llama-server) em Configurações → IA & Chaves. No modo offline você ainda pode pedir cortes por tempo (ex.: 'entre 0:08 e 0:16 tela cheia com título \"OLHA ISSO\"').".to_string()
 }
 
 fn insert_scene_into_timeline(scenes: &mut Vec<MotionScene>, inserted: MotionScene, total_dur: f64) {
@@ -634,45 +599,116 @@ fn build_smart_default_scenes(dur: f64) -> Vec<MotionScene> {
     ]
 }
 
-async fn call_gemini_director(
-    http: &reqwest::Client,
-    api_key: &str,
-    director_model: &str,
-    scan_model: &str,
+/// Unified dual-engine AI dispatcher for Motion Studio:
+/// - Respects the user's chosen engine in `Configurações → IA & Chaves` (`gemini` or `local_free`).
+/// - Gemini path: automatic 503/429 retry + full ranked multi-model failover across active Gemini models.
+/// - Local path: `llama-server` + installed `Qwen2.5-VL` on GPU (with automatic VRAM offload fallback).
+/// - Cross-provider failover: if the primary engine is down/overloaded, automatically tries the other engine if configured!
+async fn call_director_ai(
+    kernel: &AicutKernel,
     storyboard_b64: Option<&str>,
     prompt: &str,
 ) -> Result<(AiDirectorResponse, String), String> {
-    let mut candidates: Vec<&str> = Vec::new();
-    if !director_model.trim().is_empty() {
-        candidates.push(director_model.trim());
-    }
-    if !scan_model.trim().is_empty() && !candidates.contains(&scan_model.trim()) {
-        candidates.push(scan_model.trim());
-    }
-    if candidates.is_empty() {
-        candidates.push("gemini-3.8-flash");
+    let default_provider = read_setting_str(kernel, SETTING_DEFAULT_PROVIDER, "gemini");
+    let prefer_local = default_provider.eq_ignore_ascii_case("local_free");
+    let gemini_key = resolve_gemini_api_key(kernel, None);
+    let mut errors: Vec<String> = Vec::new();
+
+    if prefer_local {
+        match call_local_vlm_director(kernel, storyboard_b64, prompt).await {
+            Ok(ok) => return Ok(ok),
+            Err(e) => errors.push(format!("IA Local: {e}")),
+        }
+        if let Some(ref api_key) = gemini_key {
+            match call_gemini_models_chain(kernel, api_key, storyboard_b64, prompt).await {
+                Ok(ok) => return Ok(ok),
+                Err(e) => errors.push(format!("Gemini (fallback): {e}")),
+            }
+        }
+    } else {
+        if let Some(ref api_key) = gemini_key {
+            match call_gemini_models_chain(kernel, api_key, storyboard_b64, prompt).await {
+                Ok(ok) => return Ok(ok),
+                Err(e) => errors.push(format!("Gemini: {e}")),
+            }
+        }
+        // Automatic fallback to Local GPU AI whenever Gemini is unavailable / 503 / no key
+        if kernel.tools.resolve_tool("llama-server").is_ok() {
+            match call_local_vlm_director(kernel, storyboard_b64, prompt).await {
+                Ok(ok) => return Ok(ok),
+                Err(e) => errors.push(format!("IA Local: {e}")),
+            }
+        } else if gemini_key.is_none() {
+            return Err(
+                "nenhuma IA configurada — salve sua Gemini API Key ou instale a IA Local (llama-server + Qwen2.5-VL) em Configurações → IA & Chaves".to_string(),
+            );
+        }
     }
 
-    let mut last_err = String::from("nenhum modelo Gemini respondeu");
+    Err(errors.join(" | "))
+}
+
+async fn call_gemini_models_chain(
+    kernel: &AicutKernel,
+    api_key: &str,
+    storyboard_b64: Option<&str>,
+    prompt: &str,
+) -> Result<(AiDirectorResponse, String), String> {
+    let http = kernel.tools.http_client();
+    let requested_dir = read_setting_str(kernel, SETTING_GEMINI_DIRECTOR_MODEL, "auto");
+    let candidates = list_ranked_gemini_models(http, api_key, &requested_dir).await;
+
+    let mut last_err = String::from("nenhum modelo Gemini disponível respondeu");
     for model in candidates {
         let raw_res = if let Some(b64) = storyboard_b64 {
-            generate_with_inline_image(http, api_key, model, b64, prompt).await
+            generate_with_inline_image(http, api_key, &model, b64, prompt).await
         } else {
-            generate_json_text(http, api_key, model, prompt).await
+            generate_json_text(http, api_key, &model, prompt).await
         };
         match raw_res {
             Ok(raw) => {
                 if let Some(parsed) = parse_ai_director_response(&raw) {
-                    return Ok((parsed, model.to_string()));
+                    return Ok((parsed, model));
                 }
                 last_err = format!("resposta JSON inválida do modelo {model}");
             }
             Err(e) => {
-                last_err = format!("{model}: {}", e.message);
+                let lower = e.message.to_lowercase();
+                last_err = format!("{model}: {}", compact_api_err(&e.message));
+                if lower.contains("api_key_invalid")
+                    || lower.contains("http 401")
+                    || lower.contains("http 403")
+                {
+                    break;
+                }
             }
         }
     }
     Err(last_err)
+}
+
+async fn call_local_vlm_director(
+    kernel: &AicutKernel,
+    storyboard_b64: Option<&str>,
+    prompt: &str,
+) -> Result<(AiDirectorResponse, String), String> {
+    let sys = "Você é um Editor de Vídeo e Diretor de Motion Graphics criativo (sem padronização fixa). Assista aos frames, crie ilustrações e animações SVG/HTML sob medida quando a área de conteúdo estiver parada e responda SEMPRE com um único objeto JSON válido.";
+    let (raw, model_id) =
+        generate_with_local_vlm_once(kernel, storyboard_b64, sys, prompt, 3600)
+            .await
+            .map_err(|e| e.message)?;
+    parse_ai_director_response(&raw)
+        .map(|parsed| (parsed, format!("Local · {model_id}")))
+        .ok_or_else(|| format!("modelo local {model_id} retornou JSON incompleto ou inválido"))
+}
+
+fn compact_api_err(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.chars().count() <= 220 {
+        return trimmed.to_string();
+    }
+    let head: String = trimmed.chars().take(210).collect();
+    format!("{head}…")
 }
 
 /// Resilient parser for Gemini JSON outputs: tolerates explicit `null` nested objects,
@@ -900,40 +936,47 @@ fn build_context_aware_plan_prompt(
     has_storyboard: bool,
 ) -> String {
     let vis_note = if has_storyboard {
-        "VOCÊ ESTÁ VENDO O STORYBOARD VISUAL REAL (grade 4x2 de frames do vídeo anexada)! Observe exatamente o tema, ambiente, cores, expressões e o que aparece na tela."
+        "VOCÊ ESTÁ VENDO O STORYBOARD VISUAL REAL (grade 4x2 de frames do corte anexada)! Analise frame a frame: em quais momentos há ação visual real na tela de conteúdo e em quais momentos a área de conteúdo está parada/vazia/monótona enquanto a pessoa fala."
     } else {
-        "Baseie-se profundamente na transcrição e no tema do vídeo."
+        "Baseie-se profundamente na transcrição e no assunto exato deste corte."
     };
     format!(
-        r##"Você é um Editor de Vídeo & Diretor de Motion Graphics Sênior (estilo edição profissional de YouTube Shorts / Reels + HyperFrames HTML/CSS/SVG).
+        r##"Você é um Editor de Vídeo & Diretor Criativo de Motion Graphics / Ilustrações Animadas (estilo Remotion + HyperFrames HTML/CSS/SVG/JS).
 {vis_note}
 
-Sua missão: criar uma edição ÚNICA, feita SOB MEDIDA para o contexto exato deste vídeo de {dur:.1}s ("{title}") — NÃO genérica!
-Pedido do criador: {goal}
+PRINCÍPIO CENTRAL — ZERO PADRONIZAÇÃO:
+- NUNCA use uma fórmula fixa, template repetitivo ou apenas uma barrinha genérica de título!
+- Cada vídeo merece uma identidade visual, paleta de cores, tipografia, ritmo de cortes e animações **100% criados do zero para o assunto exato deste corte** de {dur:.1}s ("{title}").
+- **REGRA DE OURO PARA A ÁREA DE CONTEÚDO PARADA:** Sempre que você perceber (pelos frames ou pela fala) que **não há nada visualmente relevante acontecendo na área de conteúdo embaixo** (ex.: tela parada, lobby, menu, chat estático, pessoa apenas contando história, explicando um conceito, citando valores ou comparando ideias), **CRIE ILUSTRAÇÕES E ANIMAÇÕES VETORIAIS COMPLETAS NO `motion_html`** cobrindo a área de conteúdo (`class="hf-content-stage"` — `left:30px; top:765px; width:1020px; height:889px;` ou estilo próprio) enquanto a webcam continua 100% limpa e visível em cima!
+  * Exemplos de ilustrações/animações criativas na área de conteúdo quando estiver ociosa:
+    - Falou de números/dinheiro/crescimento → desenhe um **gráfico SVG animado / barras crescendo (`data-bar-to="82"`) / contador (`data-count-from`/`data-count-to`)** com cores do tema!
+    - Explicou uma história, processo ou ideia → desenhe uma **cena vetorial SVG ilustrativa, diagrama animado, linha do tempo com `data-anim="draw"`, ícones/personagens/objetos geométricos com movimento (`float`, `pop`, `slide-up`) e tipografia cinética** representando visualmente o que está sendo dito!
+    - Comparou duas coisas (A vs B) → anime um **duelo visual / cards lado a lado com spring physics**!
+  * E quando **HOUVER ação visual importante na tela** (jogada, vídeo reagido, detalhe visual), **NÃO tampe a ação**: destaque a tela real (`content_hero_pip`, `callout_zoom`, `split_clean` ou `split_branded`) usando apenas anotações leves (setas/círculos `data-anim="draw"` ou badges sutis)!
 
-Você controla DUAS camadas em total harmonia:
-1. **Coreografia de Câmera & Ritmo (`scenes[]`, cobrindo 0.0 até {dur:.1}s sem lacunas):**
-   - `layout`: "split_branded" (moldura SMOKING33), "content_hero_pip" (tela cheia + webcam PiP quando algo importante acontece na tela!), "content_fullscreen" (100% conteúdo), "camera_focus" (foco na webcam para gancho/reação), "camera_hero_pip" (webcam grande 68%), "callout_zoom" (zoom focal em `focus_x, focus_y, zoom`).
-   - `effects`: `camera_zoom_end` (1.0=parado, 1.06..1.16=aproximação suave dramática), `impact_shake` (0.0..0.8=tremor breve de impacto/susto/jogada), `vignette` (true para suspense/ênfase), `color_mood` ("natural"|"vibrant"|"dramatic"|"cyber").
+Contexto do corte & pedido do criador:
+{goal}
 
-2. **Camada HyperFrames de Motion Graphics Personalizados (`motion_html` — HTML + CSS + SVG + JS sobre canvas transparente 1080x1920!):**
-   - Crie elementos visuais **específicos para o assunto deste vídeo** (ex.: se falar de dinheiro/número → contador animado `data-count-from`/`data-count-to`; se citar 3 pontos → cards glassmorphism surgindo no tempo exato da fala; se apontar algo na tela → seta/círculo SVG animado com `data-anim="draw"`; flash suave `data-anim="flash"` em viradas; título de gancho cinematográfico com a paleta de cor do vídeo!).
-   - REGRAS DO RUNTIME HYPERFRAMES (100% offline, determinístico):
-     * NÃO use URLs externas, NÃO use `<img>` externos, NÃO use CSS `@keyframes` dependente do relógio.
-     * TODO elemento animado DEVE ter `data-start="SEG"` e `data-end="SEG"` e `data-anim="pop|slide-up|slide-down|slide-left|slide-right|fade|scale|pulse|draw|flash"`.
-     * Contadores animados usam `data-count-from="0" data-count-to="600" data-prefix="R$ " data-suffix=""`.
-     * Para animações customizadas avançadas, opcionalmente defina `<script>window.__aicutCustomSeek = function(t) {{ ... }};</script>`.
-     * Deixe a zona inferior (y > 1480px) livre para legendas karaokê e a área da webcam limpa (não cubra o rosto!).
+Você controla DUAS camadas sincronizadas:
+1. **Câmera & Ritmo (`scenes[]`, 0.0 até {dur:.1}s sem lacunas):**
+   - `layout`: escolha livremente conforme cada segundo do vídeo: "split_branded", "split_clean", "content_hero_pip", "content_fullscreen", "camera_focus", "camera_hero_pip", "callout_zoom".
+   - `effects`: `camera_zoom_end` (1.0..1.20), `impact_shake` (0.0..0.8), `vignette` (bool), `color_mood` ("natural"|"vibrant"|"dramatic"|"cyber").
+
+2. **Ilustrações & Motion Graphics Customizados (`motion_html` — canvas transparente 1080x1920, 100% offline e determinístico):**
+   - Você tem liberdade total para escrever `<style>`, HTML rico, `<svg viewBox="...">` com ilustrações detalhadas e `<script>window.__aicutCustomSeek = function(t) {{ ... }};</script>` usando os utilitários embutidos estilo Remotion: `window.__aicut.interpolate(t, inS, inE, outS, outE, 'out'|'back'|'inout')` e `window.__aicut.spring(t, start, stiffness, damping)`.
+   - Todo elemento animado por atributo usa `data-start="SEG"`, `data-end="SEG"` e `data-anim="pop|slide-up|slide-down|slide-left|slide-right|fade|scale|pulse|float|spin|draw|flash"` (opcional `data-count-from`/`data-count-to`/`data-prefix`/`data-suffix` ou `data-bar-to="80"`).
+   - NÃO use URLs externas nem `<img>` externos nem CSS `@keyframes` solto (tudo deve ser guiado pelo tempo `t`!).
+   - Preserve o rosto na webcam (topo) limpo e deixe a faixa inferior das legendas (`y > 1660px`) legível.
 
 Responda APENAS JSON válido:
 {{
   "mode": "apply",
-  "title": "Título curto impactante",
-  "creative_direction": "Resumo em 1 frase da linguagem visual escolhida para este vídeo.",
-  "assistant_reply": "Explicação natural em PT-BR contando o que você viu/ouviu no vídeo e quais técnicas de edição + motions você aplicou sob medida.",
+  "title": "Título curto do corte",
+  "creative_direction": "Resumo em 1 frase da direção visual e ilustrações criadas para este vídeo.",
+  "assistant_reply": "Explicação natural em PT-BR contando o que você viu no vídeo, onde criou ilustrações/animações na área de conteúdo e quais técnicas aplicou.",
   "burn_subtitles": true,
   "scenes": [ ... ],
-  "motion_html": "<div ...>...</div>"
+  "motion_html": "<style>...</style><div ...>...</div>"
 }}
 
 Transcrição com tempos relativos (0.0s .. {dur:.1}s):
@@ -959,23 +1002,23 @@ fn build_conversational_editor_prompt(
         .collect::<Vec<_>>()
         .join("\n");
     let vis_note = if has_storyboard {
-        "O storyboard visual (4x2 frames reais do vídeo) está anexado — use o que você VÊ na imagem."
+        "O storyboard visual (4x2 frames reais do corte) está anexado — observe o que acontece na tela e onde a área de conteúdo está parada para criar ilustrações animadas."
     } else {
         ""
     };
 
     format!(
-        r##"Você é o Editor de Vídeo & Diretor de Motion Graphics pessoal do criador no Aicut (estilo HyperFrames HTML/CSS/SVG + coreografia de câmera).
+        r##"Você é o Editor de Vídeo & Diretor de Ilustrações/Motion Graphics pessoal do criador no Aicut (sem padronização fixa — cada vídeo tem sua própria linguagem visual, ilustrações SVG e animações sob medida).
 {vis_note}
 
 IMPORTANTE — Escolha `mode` conforme a intenção da mensagem do criador:
-- Use `"mode": "discuss"` quando o criador estiver **conversando, perguntando sua opinião, pedindo sugestões ou planejando ideias** ANTES de aplicar (ex.: "o que você sugere?", "como deixamos mais dinâmico?", "qual estilo combina?"). Nesse modo, responda de forma criativa, específica para este vídeo e NÃO precisa alterar `scenes`/`motion_html`.
-- Use `"mode": "apply"` quando o criador pedir para **editar, aplicar, criar, trocar, melhorar, remover ou aprovar um plano** (ex.: "aplica isso", "faz a opção 2", "coloca um card animado quando falo o preço", "tira o flash", "dá mais ritmo"). Nesse modo, entregue `scenes` completos (0.0 .. {dur:.1}s sem lacunas) e o `motion_html` completo atualizado!
+- Use `"mode": "discuss"` quando o criador estiver **conversando, perguntando sua opinião, pedindo ideias ou planejando** ANTES de aplicar. Responda de forma criativa e específica para este vídeo sem precisar reescrever `scenes`/`motion_html`.
+- Use `"mode": "apply"` quando o criador pedir para **editar, criar ilustrações/animações, aplicar um plano, melhorar, trocar estilo ou remover algo**. Entregue `scenes` completos (0.0 .. {dur:.1}s sem lacunas) e o `motion_html` completo atualizado!
 
-Regras para `motion_html` (canvas 1080x1920 transparente):
-- HTML + CSS inline + SVG vetorial + opcional `<script>window.__aicutCustomSeek = function(t){{...}};</script>`.
-- Sem URLs externas; todo elemento usa `data-start`, `data-end`, `data-anim="pop|slide-up|slide-down|slide-left|slide-right|fade|scale|pulse|draw|flash"` (e opcional `data-count-from`/`data-count-to`/`data-prefix`/`data-suffix`).
-- Nunca cubra o rosto na webcam nem a faixa de legendas (y > 1480px).
+Regras criativas para `motion_html` (canvas 1080x1920 transparente, zero padronização):
+- Crie ilustrações vetoriais SVG, diagramas, gráficos, cenários animados e tipografia cinética únicos para o tema do vídeo — especialmente preenchendo a área de conteúdo (`class="hf-content-stage"`, `left:30px; top:765px; width:1020px; height:889px`) quando nada relevante estiver ocorrendo no vídeo embaixo!
+- Use `<style>`, HTML/SVG inline, atributos `data-start`, `data-end`, `data-anim="pop|slide-up|slide-down|slide-left|slide-right|fade|scale|pulse|float|spin|draw|flash"`, `data-count-from`/`data-count-to`, `data-bar-to`, e opcional `<script>window.__aicutCustomSeek = function(t){{...}};</script>` com `window.__aicut.interpolate(...)` e `window.__aicut.spring(...)`.
+- Sem URLs externas; mantenha a webcam limpa e a faixa das legendas (`y > 1660px`) legível.
 
 Layouts válidos em `scenes[].layout`: "split_branded", "split_clean", "content_hero_pip", "content_fullscreen", "camera_focus", "camera_hero_pip", "callout_zoom".
 Effects válidos em `scenes[].effects`: `camera_zoom_end` (1.0..1.25), `impact_shake` (0.0..1.0), `vignette` (bool), `color_mood` ("natural"|"vibrant"|"dramatic"|"cyber").
@@ -984,10 +1027,10 @@ Direção criativa atual: {cd}
 Cenas atuais (0.0s .. {dur:.1}s):
 {scenes_json}
 
-Motion HTML HyperFrames atual:
+Motion HTML atual:
 {cur_html}
 
-Transcrição do vídeo:
+Transcrição do corte:
 {transcript}
 
 Conversa recente:
@@ -999,7 +1042,7 @@ Nova mensagem do criador:
 Responda APENAS JSON válido:
 {{
   "mode": "apply",
-  "creative_direction": "Resumo atualizado da direção criativa",
+  "creative_direction": "Resumo atualizado da direção visual/ilustrações",
   "assistant_reply": "Resposta natural e colaborativa em PT-BR.",
   "burn_subtitles": {subs},
   "scenes": [ ... ],

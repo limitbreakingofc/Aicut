@@ -8,11 +8,14 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
+use crate::engine::SETTING_LOCAL_VISION_MODEL;
 use crate::frames::{
     extract_candidate_frames, extract_storyboard_sheets, format_transcript_window, plan_windows,
     TimeWindow,
 };
+use crate::models::resolve_any_installed_vision_model;
 use crate::prompts::{
     build_pass_a_prompt, build_pass_b_prompt, extract_json_object, CandidateWindow, PassAResponse,
     PassBResponse, RawClipPlan,
@@ -23,12 +26,14 @@ use crate::prompts::{
 struct LlamaServerGuard {
     child: Child,
     base_url: String,
+    stderr_log: PathBuf,
 }
 
 impl Drop for LlamaServerGuard {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.stderr_log);
     }
 }
 
@@ -51,7 +56,7 @@ impl LlamaServerGuard {
         llama_bin: &Path,
         model_path: &Path,
         mmproj_path: &Path,
-        accel: AccelBackend,
+        gpu_layers: u32,
         logical_cores: usize,
         ctx_size: usize,
     ) -> AicutResult<Self> {
@@ -63,12 +68,13 @@ impl LlamaServerGuard {
             .port();
         drop(listener);
 
-        let gpu_layers = match accel {
-            AccelBackend::CpuOnly => "0",
-            _ => "99",
-        };
+        let gpu_layers_str = gpu_layers.to_string();
         let threads = logical_cores.clamp(2, 12).to_string();
         let ctx_str = ctx_size.to_string();
+        let stderr_log = std::env::temp_dir().join(format!("aicut-llama-{}.log", Uuid::new_v4()));
+        let stderr_stdio = std::fs::File::create(&stderr_log)
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null());
 
         let mut cmd = Command::new(llama_bin);
         configure_std_command(&mut cmd);
@@ -85,7 +91,7 @@ impl LlamaServerGuard {
             "--port",
             &port.to_string(),
             "-ngl",
-            gpu_layers,
+            &gpu_layers_str,
             "-c",
             &ctx_str,
             "-t",
@@ -95,9 +101,10 @@ impl LlamaServerGuard {
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(stderr_stdio);
 
         let child = cmd.spawn().map_err(|e| {
+            let _ = std::fs::remove_file(&stderr_log);
             AicutError::internal(format!(
                 "Falha ao iniciar llama-server ({}): {e}",
                 llama_bin.display()
@@ -107,7 +114,23 @@ impl LlamaServerGuard {
         Ok(Self {
             child,
             base_url: format!("http://127.0.0.1:{port}"),
+            stderr_log,
         })
+    }
+
+    fn read_stderr_tail(&self) -> String {
+        let raw = std::fs::read_to_string(&self.stderr_log).unwrap_or_default();
+        let lines: Vec<&str> = raw
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        let tail = if lines.len() > 6 {
+            &lines[lines.len() - 6..]
+        } else {
+            &lines[..]
+        };
+        tail.join(" | ")
     }
 
     async fn wait_ready(
@@ -121,10 +144,16 @@ impl LlamaServerGuard {
                 return Err(AicutError::cancelled("Inicializacao do llama-server cancelada."));
             }
             if let Ok(Some(exit)) = self.child.try_wait() {
+                let tail = self.read_stderr_tail();
+                let detail = if tail.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Detalhe: {tail}")
+                };
                 return Err(AicutError::new(
                     "LLAMA_SERVER_EXITED",
                     format!(
-                        "llama-server encerrou inesperadamente ao carregar o modelo (codigo {:?}). Verifique a VRAM disponivel ou tente uma versao menor (ex.: 3B Q4_K_M).",
+                        "llama-server encerrou ao carregar o modelo (codigo {:?}).{detail}",
                         exit.code()
                     ),
                 ));
@@ -140,6 +169,99 @@ impl LlamaServerGuard {
             "Tempo esgotado aguardando llama-server carregar o modelo visual.",
         ))
     }
+
+    /// Spawns `llama-server` with automatic VRAM resilience: tries optimal GPU offload first,
+    /// then lighter partial GPU offload, and finally CPU-only if GPU VRAM is temporarily busy.
+    async fn spawn_ready_with_fallback(
+        llama_bin: &Path,
+        model_path: &Path,
+        mmproj_path: &Path,
+        accel: AccelBackend,
+        logical_cores: usize,
+        preferred_ctx: usize,
+        http: &reqwest::Client,
+        cancel: &CancellationToken,
+    ) -> AicutResult<Self> {
+        let attempts: Vec<(u32, usize)> = match accel {
+            AccelBackend::CpuOnly => vec![(0, preferred_ctx.min(8_192))],
+            _ => vec![
+                (99, preferred_ctx),
+                (24, preferred_ctx.min(8_192)),
+                (0, preferred_ctx.min(6_144)),
+            ],
+        };
+
+        let mut last_err: Option<AicutError> = None;
+        for (ngl, ctx) in attempts {
+            if cancel.is_cancelled() {
+                return Err(AicutError::cancelled("Inicializacao do llama-server cancelada."));
+            }
+            match Self::spawn(llama_bin, model_path, mmproj_path, ngl, logical_cores, ctx) {
+                Ok(mut guard) => match guard.wait_ready(http, cancel).await {
+                    Ok(()) => return Ok(guard),
+                    Err(e) => {
+                        last_err = Some(e);
+                    }
+                },
+                Err(e) => {
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| AicutError::internal("Falha ao iniciar llama-server local.")))
+    }
+}
+
+/// Runs a single multimodal (optional base64 JPEG + prompt) JSON completion against the user's
+/// installed local `llama-server` + `Qwen2.5-VL` model and immediately releases GPU VRAM when done.
+/// Used by Motion Studio (both when "Local grátis" is selected AND as automatic fallback when Gemini fails).
+pub async fn generate_with_local_vlm_once(
+    kernel: &AicutKernel,
+    image_b64: Option<&str>,
+    system_prompt: &str,
+    user_prompt: &str,
+    max_tokens: u32,
+) -> AicutResult<(String, String)> {
+    let llama_bin = kernel.tools.resolve_tool("llama-server")?;
+    let preferred_id = kernel
+        .repo
+        .get_setting(SETTING_LOCAL_VISION_MODEL)
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .filter(|s| !s.trim().is_empty());
+
+    let (model_id, model_path, mmproj_path) =
+        resolve_any_installed_vision_model(kernel, preferred_id.as_deref())?;
+
+    let ctx_size = pick_context_size(&kernel.hardware).min(12_288);
+    let http = kernel.tools.http_client();
+    let cancel = CancellationToken::new();
+
+    let server = LlamaServerGuard::spawn_ready_with_fallback(
+        &llama_bin,
+        &model_path,
+        &mmproj_path,
+        kernel.hardware.recommended_accel,
+        kernel.hardware.logical_cores,
+        ctx_size,
+        http,
+        &cancel,
+    )
+    .await?;
+
+    let b64_slice: Vec<String> = image_b64.map(|s| vec![s.to_string()]).unwrap_or_default();
+    let raw = chat_multimodal_b64_json(
+        http,
+        &server.base_url,
+        &b64_slice,
+        system_prompt,
+        user_prompt,
+        max_tokens.clamp(512, 4096),
+    )
+    .await?;
+
+    Ok((raw, model_id))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -177,17 +299,18 @@ pub async fn analyze_with_local_vlm(
         format!("Iniciando llama-server local com contexto -c {ctx_size}"),
     );
 
-    let mut server = LlamaServerGuard::spawn(
+    let http = kernel.tools.http_client();
+    let server = LlamaServerGuard::spawn_ready_with_fallback(
         llama_bin,
         model_path,
         mmproj_path,
         kernel.hardware.recommended_accel,
         kernel.hardware.logical_cores,
         ctx_size,
-    )?;
-
-    let http = kernel.tools.http_client();
-    server.wait_ready(http, cancel).await?;
+        http,
+        cancel,
+    )
+    .await?;
 
     // 10-minute windows with 3-minute overlap keep local context sharp & dense even on multi-hour lives
     let windows = plan_windows(duration_sec, 600.0, 180.0);
@@ -400,16 +523,38 @@ async fn chat_multimodal_json(
     image_paths: &[PathBuf],
     prompt: &str,
 ) -> AicutResult<String> {
-    let mut active_images: Vec<PathBuf> = image_paths.to_vec();
+    let mut b64_images: Vec<String> = Vec::with_capacity(image_paths.len());
+    for img_path in image_paths {
+        let bytes = tokio::fs::read(img_path).await?;
+        b64_images.push(base64::engine::general_purpose::STANDARD.encode(&bytes));
+    }
+    chat_multimodal_b64_json(
+        http,
+        base_url,
+        &b64_images,
+        "Voce e um editor de video multimodal especialista em Shorts coerentes. Responda SEMPRE com JSON valido apenas.",
+        prompt,
+        1800,
+    )
+    .await
+}
+
+async fn chat_multimodal_b64_json(
+    http: &reqwest::Client,
+    base_url: &str,
+    b64_images: &[String],
+    system_prompt: &str,
+    prompt: &str,
+    max_tokens: u32,
+) -> AicutResult<String> {
+    let mut active_images: Vec<String> = b64_images.to_vec();
     let mut active_prompt = prompt.to_string();
 
     // Up to 3 attempts: if `llama-server` reports `exceed_context_size_error`, automatically
     // compact images + prompt safely on UTF-8 boundaries and retry.
     for attempt in 0..3 {
         let mut parts: Vec<Value> = Vec::with_capacity(active_images.len() + 1);
-        for img_path in &active_images {
-            let bytes = tokio::fs::read(img_path).await?;
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        for b64 in &active_images {
             parts.push(serde_json::json!({
                 "type": "image_url",
                 "image_url": {
@@ -426,15 +571,15 @@ async fn chat_multimodal_json(
             "messages": [
                 {
                     "role": "system",
-                    "content": "Voce e um editor de video multimodal especialista em Shorts coerentes. Responda SEMPRE com JSON valido apenas."
+                    "content": system_prompt
                 },
                 {
                     "role": "user",
                     "content": parts
                 }
             ],
-            "temperature": 0.25,
-            "max_tokens": 1800
+            "temperature": 0.3,
+            "max_tokens": max_tokens
         });
 
         let url = format!("{base_url}/v1/chat/completions");
@@ -465,14 +610,12 @@ async fn chat_multimodal_json(
             || err_body.contains("exceeds the available context size");
 
         if is_ctx_overflow && attempt < 2 {
-            // Keep evenly spaced half of the images (at least 1 if any existed)
             if active_images.len() > 1 {
-                active_images = active_images
-                    .into_iter()
-                    .step_by(2)
-                    .collect();
+                active_images = active_images.into_iter().step_by(2).collect();
+            } else if !active_images.is_empty() && attempt == 1 {
+                // On 2nd overflow with a single image, drop image so text-only completion still succeeds
+                active_images.clear();
             }
-            // Trim prompt to 65% of current char count preserving UTF-8 boundaries + JSON instruction footer
             let current_chars = active_prompt.chars().count();
             let target_chars = ((current_chars as f64) * 0.65) as usize;
             if target_chars > 600 {

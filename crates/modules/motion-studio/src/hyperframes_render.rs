@@ -150,6 +150,21 @@ pub fn build_live_hyperframes_document(comp: &AicutComposition) -> String {
       background: #ffffff;
       pointer-events: none;
     }}
+    /* Full bespoke illustration stage covering the idle bottom content area (webcam above stays 100% clear!) */
+    .hf-content-stage {{
+      position: absolute;
+      left: 30px;
+      top: 765px;
+      width: 1020px;
+      height: 889px;
+      border-radius: 26px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 44px;
+    }}
   </style>
 </head>
 <body data-width="{w}" data-height="{h}" data-duration="{dur:.2}">
@@ -160,13 +175,36 @@ pub fn build_live_hyperframes_document(comp: &AicutComposition) -> String {
     (function () {{
       function clamp01(v) {{ return v < 0 ? 0 : (v > 1 ? 1 : v); }}
       function easeOutCubic(x) {{ return 1 - Math.pow(1 - x, 3); }}
+      function easeInOutCubic(x) {{ return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2; }}
       function easeOutBack(x) {{
         const c1 = 1.70158, c3 = c1 + 1;
         return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2);
       }}
+      function interpolate(t, inStart, inEnd, outStart, outEnd, ease) {{
+        const span = Math.max(0.0001, inEnd - inStart);
+        let p = clamp01((t - inStart) / span);
+        if (ease === 'out') p = easeOutCubic(p);
+        else if (ease === 'back') p = easeOutBack(p);
+        else if (ease === 'inout') p = easeInOutCubic(p);
+        return outStart + (outEnd - outStart) * p;
+      }}
+      function spring(t, start, stiffness, damping) {{
+        const dt = Math.max(0, t - (start || 0));
+        if (dt <= 0) return 0;
+        const k = stiffness || 180;
+        const c = damping || 18;
+        const w = Math.sqrt(k);
+        const zeta = c / (2 * w);
+        if (zeta < 1) {{
+          const wd = w * Math.sqrt(1 - zeta * zeta);
+          return 1 - Math.exp(-zeta * w * dt) * (Math.cos(wd * dt) + (zeta * w / wd) * Math.sin(wd * dt));
+        }}
+        return 1 - Math.exp(-w * dt) * (1 + w * dt);
+      }}
+      window.__aicut = {{ clamp01, easeOutCubic, easeInOutCubic, easeOutBack, interpolate, spring }};
 
       // Prepare SVG paths for deterministic stroke drawing
-      document.querySelectorAll('[data-anim="draw"] path, [data-anim="draw"] circle, [data-anim="draw"] rect, [data-anim="draw"] line, path[data-anim="draw"]').forEach((el) => {{
+      document.querySelectorAll('[data-anim="draw"] path, [data-anim="draw"] circle, [data-anim="draw"] rect, [data-anim="draw"] line, [data-anim="draw"] polyline, path[data-anim="draw"]').forEach((el) => {{
         try {{
           const len = el.getTotalLength ? el.getTotalLength() : 600;
           el.dataset.pathLen = String(len);
@@ -210,6 +248,18 @@ pub fn build_live_hyperframes_document(comp: &AicutComposition) -> String {
             el.textContent = prefix + val.toLocaleString('pt-BR') + suffix;
           }}
 
+          // Deterministic animated chart bar width/height
+          if (el.dataset.barTo !== undefined) {{
+            const targetPct = parseFloat(el.dataset.barTo || '100');
+            const barDur = Math.max(0.2, parseFloat(el.dataset.barDur || '0.8'));
+            const bp = easeOutCubic(clamp01((time - s) / barDur));
+            if (el.dataset.barAxis === 'y') {{
+              el.style.height = (targetPct * bp).toFixed(1) + '%';
+            }} else {{
+              el.style.width = (targetPct * bp).toFixed(1) + '%';
+            }}
+          }}
+
           if (anim === 'flash') {{
             const peak = Math.sin(clamp01((time - s) / Math.max(0.08, e - s)) * Math.PI);
             el.style.opacity = String((peak * 0.72).toFixed(3));
@@ -219,7 +269,7 @@ pub fn build_live_hyperframes_document(comp: &AicutComposition) -> String {
           if (anim === 'draw') {{
             el.style.opacity = String(env.toFixed(3));
             const drawP = easeOutCubic(clamp01((time - s) / Math.max(0.15, inDur * 1.6)));
-            const targets = el.matches('path,circle,rect,line') ? [el] : el.querySelectorAll('path,circle,rect,line');
+            const targets = el.matches('path,circle,rect,line,polyline') ? [el] : el.querySelectorAll('path,circle,rect,line,polyline');
             targets.forEach((p) => {{
               const len = parseFloat(p.dataset.pathLen || '600');
               p.style.strokeDashoffset = String((len * (1 - drawP)).toFixed(1));
@@ -227,7 +277,7 @@ pub fn build_live_hyperframes_document(comp: &AicutComposition) -> String {
             return;
           }}
 
-          let dx = 0, dy = 0, sc = 1;
+          let dx = 0, dy = 0, sc = 1, rot = 0;
           if (anim === 'pop') {{
             sc = pIn < 1 ? (0.78 + 0.22 * easeOutBack(pIn)) : (0.94 + 0.06 * easeOutCubic(pOut));
             dy = (1 - easeOutCubic(pIn)) * 18;
@@ -241,12 +291,16 @@ pub fn build_live_hyperframes_document(comp: &AicutComposition) -> String {
             dx = -(1 - easeOutCubic(pIn)) * 64;
           }} else if (anim === 'pulse') {{
             sc = 1 + Math.sin((time - s) * 7.5) * 0.045;
+          }} else if (anim === 'float') {{
+            dy = Math.sin((time - s) * 3.2) * 14;
+          }} else if (anim === 'spin') {{
+            rot = (time - s) * 45;
           }} else if (anim === 'scale') {{
             sc = 0.85 + 0.15 * easeOutCubic(pIn);
           }}
 
           el.style.opacity = String(env.toFixed(3));
-          el.style.transform = 'translate(' + baseTx + ', ' + baseTy + ') translate3d(' + dx.toFixed(1) + 'px, ' + dy.toFixed(1) + 'px, 0) scale(' + sc.toFixed(4) + ')';
+          el.style.transform = 'translate(' + baseTx + ', ' + baseTy + ') translate3d(' + dx.toFixed(1) + 'px, ' + dy.toFixed(1) + 'px, 0) rotate(' + rot.toFixed(1) + 'deg) scale(' + sc.toFixed(4) + ')';
         }});
 
         if (typeof window.__aicutCustomSeek === 'function') {{

@@ -3,7 +3,7 @@ import type { RouteId } from "../lib/types";
 
 /** Single source of truth for app navigation: 5 studio workspaces + Settings hub pinned at bottom. */
 
-export const APP_VERSION = "0.9.1";
+export const APP_VERSION = "0.9.2";
 
 export type PrimaryRouteId = "ingest" | "library" | "transcribe" | "smart-clips" | "motion-studio" | "settings";
 export type SmartClipsTabId = "generate" | "results" | "framing";

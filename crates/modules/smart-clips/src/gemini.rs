@@ -45,9 +45,13 @@ pub async fn analyze_with_gemini(
     let (scan_model, director_model) =
         resolve_active_gemini_models(http, &cfg.api_key, &cfg.scan_model, &cfg.director_model)
             .await;
+    let ranked_models = list_ranked_gemini_models(http, &cfg.api_key, &director_model).await;
     kernel.jobs.append_log(
         job_id,
-        format!("Modelos Gemini ativos resolvidos: varredura={scan_model} | diretor={director_model}"),
+        format!(
+            "Modelos Gemini ativos resolvidos: varredura={scan_model} | diretor={director_model} | fallback={}",
+            ranked_models.join(", ")
+        ),
     );
 
     // 25-minute windows with 3-minute overlap so 3-minute stories never get split across chunks
@@ -116,10 +120,11 @@ pub async fn analyze_with_gemini(
             false,
         );
 
-        let gen_res = generate_with_video_file(
+        let gen_res = generate_with_video_file_with_fallback(
             http,
             &cfg.api_key,
             &scan_model,
+            &ranked_models,
             &uploaded.uri,
             &prompt,
         )
@@ -222,29 +227,15 @@ pub async fn analyze_with_gemini(
             &detailed_tr,
         );
 
-        let gen_res = match generate_with_video_file(
+        let gen_res = generate_with_video_file_with_fallback(
             http,
             &cfg.api_key,
             &director_model,
+            &ranked_models,
             &uploaded.uri,
             &prompt,
         )
-        .await
-        {
-            Ok(txt) => Ok(txt),
-            Err(_) if director_model != scan_model => {
-                // Safe fallback to verified scan_model (e.g. gemini-3.8-flash) if Pro model is unavailable
-                generate_with_video_file(
-                    http,
-                    &cfg.api_key,
-                    &scan_model,
-                    &uploaded.uri,
-                    &prompt,
-                )
-                .await
-            }
-            Err(e) => Err(e),
-        };
+        .await;
 
         let _ = delete_gemini_file(http, &cfg.api_key, &uploaded.name).await;
         let _ = std::fs::remove_file(&refine_proxy);
@@ -399,6 +390,40 @@ async fn upload_video_to_gemini(
     ))
 }
 
+async fn generate_with_video_file_with_fallback(
+    http: &reqwest::Client,
+    api_key: &str,
+    primary_model: &str,
+    ranked_models: &[String],
+    file_uri: &str,
+    prompt: &str,
+) -> AicutResult<String> {
+    let mut candidates: Vec<&str> = Vec::new();
+    if !primary_model.trim().is_empty() {
+        candidates.push(primary_model.trim());
+    }
+    for m in ranked_models {
+        if !candidates.contains(&m.as_str()) {
+            candidates.push(m.as_str());
+        }
+    }
+    let mut last_err: Option<AicutError> = None;
+    for model in candidates {
+        match generate_with_video_file(http, api_key, model, file_uri, prompt).await {
+            Ok(txt) => return Ok(txt),
+            Err(e) => {
+                // Auth errors (400/401/403 API key invalid) shouldn't spin through every model
+                let msg = e.message.to_lowercase();
+                if msg.contains("api_key_invalid") || msg.contains("http 401") || msg.contains("http 403") {
+                    return Err(e);
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| AicutError::internal("Nenhum modelo Gemini disponível.")))
+}
+
 async fn generate_with_video_file(
     http: &reqwest::Client,
     api_key: &str,
@@ -406,9 +431,6 @@ async fn generate_with_video_file(
     file_uri: &str,
     prompt: &str,
 ) -> AicutResult<String> {
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-    );
     let body = serde_json::json!({
         "contents": [{
             "role": "user",
@@ -428,33 +450,66 @@ async fn generate_with_video_file(
         }
     });
 
-    let resp = http
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| AicutError::internal(format!("Gemini generateContent failed: {e}")))?;
+    post_gemini_generate_content(http, api_key, model, &body).await
+}
 
-    if !resp.status().is_success() {
+fn is_transient_gemini_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
+}
+
+/// Shared Gemini `:generateContent` caller with automatic retry/backoff on transient
+/// 503 ("high demand" / UNAVAILABLE), 429, and 5xx spikes + thinking-part filtering.
+async fn post_gemini_generate_content(
+    http: &reqwest::Client,
+    api_key: &str,
+    model: &str,
+    body: &Value,
+) -> AicutResult<String> {
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    );
+    let backoffs_ms = [1_200u64, 3_000u64];
+
+    for attempt in 0..=backoffs_ms.len() {
+        let resp = match http.post(&url).json(body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                if attempt < backoffs_ms.len() {
+                    tokio::time::sleep(std::time::Duration::from_millis(backoffs_ms[attempt])).await;
+                    continue;
+                }
+                return Err(AicutError::internal(format!(
+                    "Gemini API ({model}) falha de rede: {e}"
+                )));
+            }
+        };
+
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            let val: Value = resp
+                .json()
+                .await
+                .map_err(|e| AicutError::internal(format!("Failed parsing Gemini response JSON: {e}")))?;
+            return extract_candidate_text(&val)
+                .ok_or_else(|| AicutError::internal("Gemini returned empty response text"));
+        }
+
+        let err_txt = resp.text().await.unwrap_or_default();
+        if is_transient_gemini_status(status) && attempt < backoffs_ms.len() {
+            tokio::time::sleep(std::time::Duration::from_millis(backoffs_ms[attempt])).await;
+            continue;
+        }
+
         return Err(AicutError::new(
             "GEMINI_API_ERROR",
-            format!("Gemini API ({model}) retornou HTTP {status}: {text}"),
+            format!("Gemini API ({model}) retornou HTTP {status}: {err_txt}"),
         ));
     }
 
-    let val: Value = resp
-        .json()
-        .await
-        .map_err(|e| AicutError::internal(format!("Invalid Gemini response JSON: {e}")))?;
-
-    let text = val
-        .pointer("/candidates/0/content/parts/0/text")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AicutError::internal("Gemini returned empty response text"))?;
-
-    Ok(text.to_string())
+    Err(AicutError::new(
+        "GEMINI_API_ERROR",
+        format!("Gemini API ({model}) indisponível após retentativas."),
+    ))
 }
 
 async fn delete_gemini_file(http: &reqwest::Client, api_key: &str, name: &str) -> AicutResult<()> {
@@ -509,9 +564,6 @@ pub async fn generate_with_inline_image(
     jpeg_b64: &str,
     prompt: &str,
 ) -> AicutResult<String> {
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-    );
     let body = serde_json::json!({
         "contents": [{
             "role": "user",
@@ -532,28 +584,7 @@ pub async fn generate_with_inline_image(
         }
     });
 
-    let resp = http
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| AicutError::internal(format!("Gemini multimodal request failed: {e}")))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err_txt = resp.text().await.unwrap_or_default();
-        return Err(AicutError::new(
-            "GEMINI_API_ERROR",
-            format!("Gemini API ({model}) retornou HTTP {status}: {err_txt}"),
-        ));
-    }
-
-    let val: Value = resp
-        .json()
-        .await
-        .map_err(|e| AicutError::internal(format!("Failed parsing Gemini response JSON: {e}")))?;
-    extract_candidate_text(&val)
-        .ok_or_else(|| AicutError::internal("Gemini returned empty response text"))
+    post_gemini_generate_content(http, api_key, model, &body).await
 }
 
 /// Sends a text prompt to an active Gemini model requesting strict JSON output.
@@ -563,9 +594,6 @@ pub async fn generate_json_text(
     model: &str,
     prompt: &str,
 ) -> AicutResult<String> {
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-    );
     let body = serde_json::json!({
         "contents": [{
             "role": "user",
@@ -578,28 +606,7 @@ pub async fn generate_json_text(
         }
     });
 
-    let resp = http
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| AicutError::internal(format!("Gemini JSON request failed: {e}")))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err_txt = resp.text().await.unwrap_or_default();
-        return Err(AicutError::new(
-            "GEMINI_API_ERROR",
-            format!("Gemini API ({model}) retornou HTTP {status}: {err_txt}"),
-        ));
-    }
-
-    let val: Value = resp
-        .json()
-        .await
-        .map_err(|e| AicutError::internal(format!("Failed parsing Gemini JSON response: {e}")))?;
-    extract_candidate_text(&val)
-        .ok_or_else(|| AicutError::internal("Gemini returned empty response text"))
+    post_gemini_generate_content(http, api_key, model, &body).await
 }
 
 /// Queries the user's Gemini API key for currently available `generateContent` models so deprecated
@@ -662,6 +669,97 @@ pub async fn resolve_active_gemini_models(
     (scan, director)
 }
 
+/// Returns a deduplicated, priority-ranked fallback chain of active Gemini models available
+/// to this API key (up to 6 distinct models across versions/tiers) so temporary HTTP 503
+/// high-demand spikes on a single model automatically fail over to healthy Gemini models.
+pub async fn list_ranked_gemini_models(
+    http: &reqwest::Client,
+    api_key: &str,
+    requested_director: &str,
+) -> Vec<String> {
+    let available = fetch_available_gemini_models(http, api_key).await;
+    rank_gemini_fallback_chain(&available, requested_director)
+}
+
+pub fn rank_gemini_fallback_chain(available: &[String], requested_director: &str) -> Vec<String> {
+    let mut ranked: Vec<String> = Vec::new();
+    let mut push_unique = |id: String| {
+        if !id.is_empty() && !ranked.iter().any(|x| x == &id) {
+            ranked.push(id);
+        }
+    };
+
+    if available.is_empty() {
+        let req = requested_director.trim().trim_start_matches("models/");
+        if !req.is_empty() && !req.eq_ignore_ascii_case("auto") {
+            push_unique(req.to_string());
+        }
+        for fallback in [
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
+            "gemini-3.8-flash",
+            "gemini-3.8-pro",
+            "gemini-2.5-flash-lite",
+        ] {
+            push_unique(fallback.to_string());
+        }
+        return ranked;
+    }
+
+    let req = requested_director.trim().trim_start_matches("models/");
+    if !req.is_empty() && !req.eq_ignore_ascii_case("auto") {
+        if available.iter().any(|m| m == req) {
+            push_unique(req.to_string());
+        }
+    }
+
+    let mut sorted = available.to_vec();
+    sorted.sort_by(|a, b| {
+        let sa = gemini_fallback_score(a);
+        let sb = gemini_fallback_score(b);
+        sb.cmp(&sa)
+    });
+
+    // Interleave best Pro, best Flash, older stable Flash/Pro, and Flash-Lite so a 503 on
+    // one tier/version immediately tries a different version/tier.
+    if let Some(best_flash) = pick_best_gemini_model(&sorted, true) {
+        push_unique(best_flash);
+    }
+    if let Some(best_pro) = pick_best_gemini_model(&sorted, false) {
+        push_unique(best_pro);
+    }
+    for m in sorted {
+        push_unique(m);
+        if ranked.len() >= 6 {
+            break;
+        }
+    }
+    ranked
+}
+
+fn gemini_fallback_score(id: &str) -> (u8, u32, u32, u8) {
+    let lower = id.to_lowercase();
+    let is_lite = lower.contains("lite");
+    let tier = if is_lite {
+        1
+    } else if lower.contains("flash") {
+        3
+    } else if lower.contains("pro") {
+        2
+    } else {
+        1
+    };
+    let (maj, min) = parse_gemini_version(&lower);
+    let stability = if lower.contains("exp") {
+        0
+    } else if lower.contains("preview") || lower.contains("latest") {
+        1
+    } else {
+        2
+    };
+    (tier, maj, min, stability)
+}
+
 async fn fetch_available_gemini_models(http: &reqwest::Client, api_key: &str) -> Vec<String> {
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100&key={api_key}"
@@ -704,7 +802,6 @@ async fn fetch_available_gemini_models(http: &reqwest::Client, api_key: &str) ->
                 || lower.contains("robotics")
                 || lower.contains("computer-use")
                 || lower.contains("aqa")
-                || lower.contains("lite")
             {
                 return None;
             }
@@ -717,7 +814,10 @@ async fn fetch_available_gemini_models(http: &reqwest::Client, api_key: &str) ->
 pub fn pick_best_gemini_model(models: &[String], prefer_flash: bool) -> Option<String> {
     let score = |id: &str| -> (u8, u32, u32, u8) {
         let lower = id.to_lowercase();
-        let tier_match = if prefer_flash {
+        let is_lite = lower.contains("lite");
+        let tier_match = if is_lite {
+            0
+        } else if prefer_flash {
             if lower.contains("flash") { 2 } else { 1 }
         } else if lower.contains("pro") {
             2
@@ -781,5 +881,22 @@ mod tests {
             pick_best_gemini_model(&list, false).as_deref(),
             Some("gemini-3.8-flash")
         );
+    }
+
+    #[test]
+    fn ranked_fallback_chain_spans_multiple_versions_and_tiers() {
+        let list = vec![
+            "gemini-2.5-flash-lite".to_string(),
+            "gemini-2.5-flash".to_string(),
+            "gemini-2.5-pro".to_string(),
+            "gemini-3.8-flash".to_string(),
+            "gemini-3.8-pro".to_string(),
+        ];
+        let chain = rank_gemini_fallback_chain(&list, "auto");
+        assert!(chain.len() >= 4);
+        assert!(chain.contains(&"gemini-3.8-flash".to_string()));
+        assert!(chain.contains(&"gemini-3.8-pro".to_string()));
+        assert!(chain.contains(&"gemini-2.5-flash".to_string()));
+        assert!(chain.contains(&"gemini-2.5-flash-lite".to_string()));
     }
 }
