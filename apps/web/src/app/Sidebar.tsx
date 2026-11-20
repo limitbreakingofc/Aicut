@@ -1,6 +1,5 @@
 import { useContextMenu, type MenuItems } from "../components";
-import type { RouteId } from "../lib/types";
-import { NAV_GROUPS, ROUTES, ROUTE_MAP, routeDigit, type RouteMeta } from "./navigation";
+import { ROUTES, ROUTE_MAP, routeDigit, type PrimaryRouteId, type RouteMeta } from "./navigation";
 
 export interface NavCount {
   value: number;
@@ -9,17 +8,18 @@ export interface NavCount {
 }
 
 interface SidebarProps {
-  route: RouteId;
+  route: PrimaryRouteId;
   collapsed: boolean;
-  counts: Partial<Record<RouteId, NavCount>>;
-  onNavigate: (route: RouteId) => void;
-  /** Extra context-menu entries per route (e.g. "Limpar finalizadas" on the job queue). */
-  menuFor?: (route: RouteId) => MenuItems;
+  counts: Partial<Record<PrimaryRouteId, NavCount>>;
+  onNavigate: (route: PrimaryRouteId) => void;
+  menuFor?: (route: PrimaryRouteId) => MenuItems;
 }
 
 export function Sidebar({ route, collapsed, counts, onNavigate, menuFor }: SidebarProps) {
+  const mainItems = ROUTES.filter((r) => !r.footer);
   const settings = ROUTE_MAP.settings;
-  const item = (meta: RouteMeta) => (
+
+  const renderItem = (meta: RouteMeta) => (
     <NavItem
       key={meta.id}
       meta={meta}
@@ -34,14 +34,9 @@ export function Sidebar({ route, collapsed, counts, onNavigate, menuFor }: Sideb
   return (
     <aside className="sidebar">
       <nav className="sidebar-scroll" aria-label="Navegação principal">
-        {NAV_GROUPS.map((group) => (
-          <div key={group.id} className="nav-section">
-            <div className="nav-section-label">{group.label}</div>
-            {ROUTES.filter((r) => r.group === group.id && !r.footer).map(item)}
-          </div>
-        ))}
+        <div className="nav-section">{mainItems.map(renderItem)}</div>
       </nav>
-      <div className="sidebar-footer">{item(settings)}</div>
+      <div className="sidebar-footer">{renderItem(settings)}</div>
     </aside>
   );
 }

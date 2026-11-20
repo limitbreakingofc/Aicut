@@ -1,11 +1,24 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
-import { Command, Copy, Keyboard, PanelLeft, Palette, RefreshCw, Trash2 } from "lucide-react";
+import {
+  Activity,
+  Blocks,
+  Bot,
+  Command,
+  Copy,
+  Cpu,
+  Crop,
+  Keyboard,
+  PanelLeft,
+  RefreshCw,
+  Sparkles,
+  Trash2,
+  Wrench,
+} from "lucide-react";
 import {
   createEventSocket,
   fetchActions,
   fetchActivity,
   fetchModules,
-  getPublicServerUrl,
   runAction,
 } from "./lib/client";
 import type {
@@ -23,8 +36,17 @@ import type {
 } from "./lib/types";
 import { copyToClipboard, storage, useMediaQuery } from "./lib/ui";
 import { ContextMenuProvider, useContextMenu } from "./components";
-import { ROUTES, ROUTE_MAP, routeDigit, routeForDigit } from "./app/navigation";
-import { THEMES, isThemeId, themeLabel, type ThemeId } from "./app/themes";
+import {
+  ROUTES,
+  ROUTE_MAP,
+  resolveRouteTarget,
+  routeDigit,
+  routeForDigit,
+  type PrimaryRouteId,
+  type SettingsTabId,
+  type SmartClipsTabId,
+} from "./app/navigation";
+import { isThemeId, type ThemeId } from "./app/themes";
 import { Sidebar, type NavCount } from "./app/Sidebar";
 import { Topbar } from "./app/Topbar";
 import { StatusBar } from "./app/StatusBar";
@@ -35,11 +57,7 @@ import { IngestView } from "./modules/media-ingest/IngestView";
 import { LibraryView } from "./modules/media-ingest/LibraryView";
 import { TranscribeView } from "./modules/transcribe/TranscribeView";
 import { SmartClipsView } from "./modules/smart-clips/SmartClipsView";
-import { FramingStudioView } from "./modules/smart-clips/FramingStudioView";
 import { MotionStudioView, type MotionSeed } from "./modules/motion-studio/MotionStudioView";
-import { JobsView } from "./modules/core/JobsView";
-import { ModulesView } from "./modules/core/ModulesView";
-import { AiConnectView } from "./modules/core/AiConnectView";
 import { SettingsView } from "./modules/core/SettingsView";
 
 /** True when a keystroke belongs to a text field (shortcuts must not hijack typing). */
@@ -63,7 +81,10 @@ export function App() {
 
 function AicutApp() {
   const ctxMenu = useContextMenu();
-  const [route, setRoute] = useState<RouteId>("ingest");
+  const [route, setRoute] = useState<PrimaryRouteId>("ingest");
+  const [smartClipsTab, setSmartClipsTab] = useState<SmartClipsTabId>("generate");
+  const [settingsTab, setSettingsTab] = useState<SettingsTabId>("ai");
+
   const [connected, setConnected] = useState(false);
   const [theme, setTheme] = useState<ThemeId>(() => {
     const saved = storage.get("aicut_theme");
@@ -173,6 +194,14 @@ function AicutApp() {
     }
   }, [pushToast, refreshJobs]);
 
+  const applyRouteTarget = useCallback((rawRoute: RouteId) => {
+    const resolved = resolveRouteTarget(rawRoute);
+    setRoute(resolved.route);
+    if (resolved.clipsTab) setSmartClipsTab(resolved.clipsTab);
+    if (resolved.settingsTab) setSettingsTab(resolved.settingsTab);
+    return resolved.route;
+  }, []);
+
   useEffect(() => {
     void bootstrapAll();
 
@@ -220,7 +249,7 @@ function AicutApp() {
           }
           case "ui_state_changed": {
             const st = ev.payload as UiState;
-            if (st.active_route) setRoute(st.active_route);
+            if (st.active_route) applyRouteTarget(st.active_route);
             setSelectedMediaId(st.selected_media_id ?? null);
             setSearchQuery(st.search_query ?? "");
             setFilterKind(st.active_filter_kind ?? null);
@@ -257,7 +286,7 @@ function AicutApp() {
 
     socketRef.current = sock;
     return () => sock.close();
-  }, [bootstrapAll, pushToast, refreshModulesAndActions]);
+  }, [applyRouteTarget, bootstrapAll, pushToast, refreshModulesAndActions]);
 
   const syncUi = useCallback(
     (next: Partial<UiState>) => {
@@ -278,8 +307,17 @@ function AicutApp() {
 
   const navigate = useCallback(
     (nextRoute: RouteId) => {
-      setRoute(nextRoute);
-      syncUi({ active_route: nextRoute });
+      const target = applyRouteTarget(nextRoute);
+      syncUi({ active_route: target });
+    },
+    [applyRouteTarget, syncUi],
+  );
+
+  const openSettingsTab = useCallback(
+    (tab: SettingsTabId) => {
+      setRoute("settings");
+      setSettingsTab(tab);
+      syncUi({ active_route: "settings" });
     },
     [syncUi],
   );
@@ -296,12 +334,11 @@ function AicutApp() {
   const openPalette = useCallback(() => setPaletteOpen(true), []);
   const openShortcuts = useCallback(() => setShortcutsOpen(true), []);
 
-  // Every view starts at the top
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: 0 });
   }, [route]);
 
-  // Global keyboard shortcuts
+  // Global keyboard shortcuts (Alt+1..Alt+6)
   const navigateRef = useRef(navigate);
   navigateRef.current = navigate;
   useEffect(() => {
@@ -338,11 +375,17 @@ function AicutApp() {
 
   const activeJobsCount = jobs.filter((j) => j.status === "queued" || j.status === "running").length;
   const toolsNeedAttention = tools.filter((t) => !t.installed || t.update_available).length;
+  const settingsAlertCount = toolsNeedAttention + activeJobsCount;
 
-  const navCounts: Partial<Record<RouteId, NavCount>> = {
+  const navCounts: Partial<Record<PrimaryRouteId, NavCount>> = {
     library: { value: media.length, title: `${media.length} item(ns) na Biblioteca` },
-    jobs: { value: activeJobsCount, tone: "accent", title: `${activeJobsCount} tarefa(s) em andamento` },
-    settings: { value: toolsNeedAttention, tone: "warning", title: "Ferramentas para instalar ou atualizar" },
+    settings: settingsAlertCount > 0
+      ? {
+          value: settingsAlertCount,
+          tone: toolsNeedAttention > 0 ? "warning" : "accent",
+          title: toolsNeedAttention > 0 ? "Ferramentas pendentes" : `${activeJobsCount} tarefa(s) em andamento`,
+        }
+      : undefined,
   };
 
   const paletteCommands = useMemo<PaletteCommand[]>(
@@ -352,11 +395,77 @@ function AicutApp() {
         label: r.label,
         description: r.description,
         icon: r.icon,
-        group: "Ir para",
+        group: "Abas principais",
         shortcut: `Alt+${routeDigit(r.id)}`,
         keywords: r.keywords,
         run: () => navigate(r.id),
       })),
+      {
+        id: "tab:framing",
+        label: "Cortes Shorts → Enquadramento",
+        description: "Calibrar área da webcam, conteúdo, revisão IA e formato 9:16",
+        icon: Crop,
+        group: "Sub-abas",
+        keywords: "webcam bordas enquadramento framing",
+        run: () => {
+          setRoute("smart-clips");
+          setSmartClipsTab("framing");
+        },
+      },
+      {
+        id: "cfg:ai",
+        label: "Configurações → IA & Chaves",
+        description: "Chave Gemini API e modelos locais Qwen2.5-VL",
+        icon: Sparkles,
+        group: "Sub-abas",
+        keywords: "gemini api key ia local qwen",
+        run: () => openSettingsTab("ai"),
+      },
+      {
+        id: "cfg:tools",
+        label: "Configurações → Ferramentas",
+        description: "Instalar/atualizar FFmpeg, yt-dlp, whisper.cpp e llama-server",
+        icon: Wrench,
+        group: "Sub-abas",
+        keywords: "ffmpeg yt-dlp whisper ferramentas",
+        run: () => openSettingsTab("tools"),
+      },
+      {
+        id: "cfg:system",
+        label: "Configurações → Sistema",
+        description: "Aparência, hardware GPU CUDA e pastas do workspace",
+        icon: Cpu,
+        group: "Sub-abas",
+        keywords: "tema cores hardware gpu workspace",
+        run: () => openSettingsTab("system"),
+      },
+      {
+        id: "cfg:integrations",
+        label: "Configurações → Integrações (MCP)",
+        description: "Conectar Claude, Cursor, OpenAPI 3.1 e CLI",
+        icon: Bot,
+        group: "Sub-abas",
+        keywords: "mcp claude cursor openapi cli",
+        run: () => openSettingsTab("integrations"),
+      },
+      {
+        id: "cfg:modules",
+        label: "Configurações → Módulos",
+        description: "Módulos plugáveis e Action Playground",
+        icon: Blocks,
+        group: "Sub-abas",
+        keywords: "modulos plugins actions",
+        run: () => openSettingsTab("modules"),
+      },
+      {
+        id: "cfg:jobs",
+        label: "Configurações → Tarefas",
+        description: "Acompanhar fila de downloads, transcrições e renderizações",
+        icon: Activity,
+        group: "Sub-abas",
+        keywords: "fila tarefas jobs progresso",
+        run: () => openSettingsTab("jobs"),
+      },
       {
         id: "ui:sidebar",
         label: sidebarCollapsed ? "Expandir menu lateral" : "Recolher menu lateral",
@@ -372,22 +481,12 @@ function AicutApp() {
         icon: Keyboard,
         group: "Interface",
         shortcut: "?",
-        keywords: "teclado ajuda help",
+        keywords: "teclado ajuda",
         run: openShortcuts,
       },
-      ...THEMES.map((t) => ({
-        id: `theme:${t.id}`,
-        label: `Esquema de cores: ${t.label}${t.id === theme ? " (atual)" : ""}`,
-        description: t.description,
-        icon: Palette,
-        group: "Interface",
-        keywords: "tema cores aparência escuro claro",
-        run: () => setTheme(t.id),
-      })),
       {
         id: "data:refresh",
         label: "Recarregar dados do core",
-        description: "Biblioteca, fila, ferramentas, módulos e atividade",
         icon: RefreshCw,
         group: "Dados",
         keywords: "atualizar sincronizar reload",
@@ -402,10 +501,10 @@ function AicutApp() {
         run: () => void clearFinishedJobs(),
       },
     ],
-    [navigate, sidebarCollapsed, toggleSidebar, openShortcuts, theme, bootstrapAll, clearFinishedJobs],
+    [navigate, openSettingsTab, sidebarCollapsed, toggleSidebar, openShortcuts, bootstrapAll, clearFinishedJobs],
   );
 
-  // Right click on empty areas: app-level menu (editable fields keep the native menu)
+  // Clean background context menu (no duplicated theme submenu — themes live in Configurações → Sistema)
   const onBackgroundContextMenu = (e: ReactMouseEvent) => {
     const target = e.target as HTMLElement;
     if (target.closest("input, textarea, select, video, audio, [contenteditable='true']")) return;
@@ -421,9 +520,6 @@ function AicutApp() {
         onSelect: toggleSidebar,
       },
       { label: "Atalhos de teclado", icon: Keyboard, shortcut: "?", onSelect: openShortcuts },
-      { type: "separator" },
-      { type: "label", label: `Esquema de cores · ${themeLabel(theme)}` },
-      ...THEMES.map((t) => ({ label: t.label, checked: t.id === theme, onSelect: () => setTheme(t.id) })),
       { type: "separator" },
       { label: "Recarregar dados", icon: RefreshCw, onSelect: () => void bootstrapAll() },
     ]);
@@ -441,26 +537,25 @@ function AicutApp() {
         route={route}
         sidebarCollapsed={sidebarCollapsed}
         sidebarLocked={sidebarLocked}
-        theme={theme}
         onToggleSidebar={toggleSidebar}
         onOpenPalette={openPalette}
-        onOpenShortcuts={openShortcuts}
-        onThemeChange={setTheme}
       />
 
       <Sidebar
         route={route}
         collapsed={sidebarCollapsed || sidebarLocked}
         counts={navCounts}
-        onNavigate={navigate}
+        onNavigate={(r) => navigate(r)}
         menuFor={(id) =>
-          id === "jobs"
-            ? [{ label: "Limpar finalizadas", icon: Trash2, onSelect: () => void clearFinishedJobs() }]
-            : id === "library"
-              ? [{ label: "Recarregar Biblioteca", icon: RefreshCw, onSelect: () => void refreshMedia() }]
-              : id === "settings"
-                ? [{ label: "Recarregar ferramentas", icon: RefreshCw, onSelect: () => void refreshTools() }]
-                : []
+          id === "library"
+            ? [{ label: "Recarregar Biblioteca", icon: RefreshCw, onSelect: () => void refreshMedia() }]
+            : id === "settings"
+              ? [
+                  { label: "IA & Chaves", icon: Sparkles, onSelect: () => openSettingsTab("ai") },
+                  { label: "Ferramentas", icon: Wrench, onSelect: () => openSettingsTab("tools") },
+                  { label: "Tarefas", icon: Activity, onSelect: () => openSettingsTab("jobs") },
+                ]
+              : []
         }
       />
 
@@ -499,6 +594,7 @@ function AicutApp() {
               }}
               onSmartClipMedia={(mediaId) => {
                 setSmartClipsTargetId(mediaId);
+                setSmartClipsTab("generate");
                 navigate("smart-clips");
               }}
               onNotify={pushToast}
@@ -521,12 +617,14 @@ function AicutApp() {
 
           {route === "smart-clips" && (
             <SmartClipsView
+              activeTab={smartClipsTab}
+              onTabChange={setSmartClipsTab}
               media={media}
               tools={tools}
               jobs={jobs}
-              hardware={hardware}
               preselectedMediaId={smartClipsTargetId}
               onNavigate={navigate}
+              onOpenSettingsTab={openSettingsTab}
               onSelectMedia={(mediaId) => {
                 setSelectedMediaId(mediaId);
                 navigate("library");
@@ -536,18 +634,7 @@ function AicutApp() {
                 navigate("motion-studio");
               }}
               onNotify={pushToast}
-              onRefreshTools={refreshTools}
               onRefreshMedia={refreshMedia}
-            />
-          )}
-
-          {route === "framing" && (
-            <FramingStudioView
-              media={media}
-              tools={tools}
-              preselectedMediaId={smartClipsTargetId ?? selectedMediaId}
-              onNavigate={navigate}
-              onNotify={pushToast}
             />
           )}
 
@@ -567,37 +654,25 @@ function AicutApp() {
             />
           )}
 
-          {route === "jobs" && (
-            <JobsView jobs={jobs} onRefresh={refreshJobs} onClearFinished={clearFinishedJobs} onNotify={pushToast} />
-          )}
-
-          {route === "modules" && (
-            <ModulesView
-              modules={modules}
-              actions={actions}
-              onRefresh={refreshModulesAndActions}
-              onNotify={pushToast}
-            />
-          )}
-
-          {route === "ai-connect" && (
-            <AiConnectView
-              activity={activity}
-              actionCount={actions.length}
-              connected={connected}
-              onNavigate={navigate}
-              onNotify={pushToast}
-            />
-          )}
-
           {route === "settings" && (
             <SettingsView
+              activeTab={settingsTab}
+              onTabChange={setSettingsTab}
               hardware={hardware}
               tools={tools}
               workspace={workspace}
               theme={theme}
+              jobs={jobs}
+              modules={modules}
+              actions={actions}
+              activity={activity}
+              connected={connected}
               onThemeChange={setTheme}
               onRefreshTools={refreshTools}
+              onRefreshJobs={refreshJobs}
+              onClearFinishedJobs={clearFinishedJobs}
+              onRefreshModules={refreshModulesAndActions}
+              onNavigate={navigate}
               onNotify={pushToast}
             />
           )}
@@ -606,14 +681,11 @@ function AicutApp() {
 
       <StatusBar
         connected={connected}
-        serverUrl={getPublicServerUrl()}
         activeJobs={activeJobsCount}
-        mediaCount={media.length}
         toolsNeedAttention={toolsNeedAttention}
         hardware={hardware}
-        onNavigate={navigate}
+        onOpenSettingsTab={openSettingsTab}
         onOpenShortcuts={openShortcuts}
-        onOpenPalette={openPalette}
         onClearFinished={() => void clearFinishedJobs()}
         onRefreshTools={() => void refreshTools()}
         onCopy={copy}

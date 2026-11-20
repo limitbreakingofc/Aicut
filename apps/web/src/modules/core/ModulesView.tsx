@@ -3,14 +3,12 @@ import { Blocks, CircleCheck, Copy, Play, Terminal, TriangleAlert, Wrench } from
 import { runAction } from "../../lib/client";
 import type { ActionSpec, ModuleInfo, NotifyFn } from "../../lib/types";
 import { copyToClipboard } from "../../lib/ui";
-import { pageMeta } from "../../app/navigation";
 import {
   Badge,
   BusyIcon,
   CodeBlock,
   Field,
   MoreButton,
-  PageHeader,
   Panel,
   Switch,
   useContextMenu,
@@ -100,16 +98,16 @@ export const ModulesView: React.FC<ModulesViewProps> = ({ modules, actions, onRe
   const ann = selectedSpec?.annotations;
 
   return (
-    <>
-      <PageHeader
-        {...pageMeta("modules")}
-        actions={
-          <span className="row gap-xs">
-            <Badge>{modules.length} módulos</Badge>
-            <Badge tone="accent">{actions.length} actions</Badge>
-          </span>
-        }
-      />
+    <div className="stack">
+      <div className="row row-between wrap gap-xs">
+        <span className="secondary text-xs">
+          Cada módulo registra suas Actions e JSON Schemas compartilhados entre a interface e as IAs.
+        </span>
+        <span className="row gap-xs">
+          <Badge>{modules.length} módulos</Badge>
+          <Badge tone="accent">{actions.length} actions</Badge>
+        </span>
+      </div>
 
       <div className="table-wrap">
         <table className="table">
@@ -279,6 +277,6 @@ export const ModulesView: React.FC<ModulesViewProps> = ({ modules, actions, onRe
         </div>
       </Panel>
       </div>
-    </>
+    </div>
   );
 };

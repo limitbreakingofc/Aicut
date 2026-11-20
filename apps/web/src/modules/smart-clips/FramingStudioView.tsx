@@ -9,7 +9,6 @@ import {
   Minimize2,
   RefreshCw,
   Save,
-  Scissors,
   ShieldAlert,
   ShieldCheck,
   Sparkles,
@@ -30,8 +29,7 @@ import type {
   RouteId,
   ToolStatus,
 } from "../../lib/types";
-import { pageMeta } from "../../app/navigation";
-import { Badge, BusyIcon, Callout, Checkbox, EmptyState, Field, PageHeader, Panel } from "../../components";
+import { Badge, BusyIcon, Callout, Checkbox, EmptyState, Field, Panel } from "../../components";
 import "./framing-studio.css";
 
 interface FramingStudioViewProps {
@@ -544,16 +542,7 @@ export const FramingStudioView: React.FC<FramingStudioViewProps> = ({
   const reviewTone = !review ? "neutral" : review.approved ? "success" : review.score >= 55 ? "warning" : "danger";
 
   return (
-    <>
-      <PageHeader
-        {...pageMeta("framing")}
-        actions={
-          <button type="button" className="btn btn-sm" onClick={() => onNavigate("smart-clips")}>
-            <Scissors aria-hidden /> Voltar para Cortes IA
-          </button>
-        }
-      />
-
+    <div className="stack">
       {!ffmpegTool?.installed && (
         <Callout
           tone="warning"
@@ -1087,6 +1076,6 @@ export const FramingStudioView: React.FC<FramingStudioViewProps> = ({
           </Panel>
         </div>
       )}
-    </>
+    </div>
   );
 };

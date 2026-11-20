@@ -1,52 +1,37 @@
-import { Activity, Cpu, Film, Keyboard, TriangleAlert } from "lucide-react";
+import { Activity, Cpu, Keyboard, TriangleAlert } from "lucide-react";
 import { Spinner, useContextMenu } from "../components";
-import type { HardwareProfile, RouteId } from "../lib/types";
+import type { HardwareProfile } from "../lib/types";
+import type { SettingsTabId } from "./navigation";
 
 interface StatusBarProps {
   connected: boolean;
-  serverUrl: string;
   activeJobs: number;
-  mediaCount: number;
   toolsNeedAttention: number;
   hardware: HardwareProfile | null;
-  onNavigate: (route: RouteId) => void;
+  onOpenSettingsTab: (tab: SettingsTabId) => void;
   onOpenShortcuts: () => void;
-  onOpenPalette: () => void;
   onClearFinished: () => void;
   onRefreshTools: () => void;
   onCopy: (text: string, label: string) => void;
 }
 
-/** tmux/VS Code-style status line: every segment is clickable and has a context menu. */
+/** Slim, non-redundant status bar: live core status, active jobs, tool alerts, GPU and shortcuts hint. */
 export function StatusBar({
   connected,
-  serverUrl,
   activeJobs,
-  mediaCount,
   toolsNeedAttention,
   hardware,
-  onNavigate,
+  onOpenSettingsTab,
   onOpenShortcuts,
-  onOpenPalette,
   onClearFinished,
   onRefreshTools,
   onCopy,
 }: StatusBarProps) {
   const menu = useContextMenu();
-  const host = serverUrl.replace(/^https?:\/\//, "");
   const gpu = hardware?.gpus[0];
   const hwLabel = hardware
     ? `${gpu ? gpu.name : hardware.cpu_brand}${hardware.cuda_version ? ` · CUDA ${hardware.cuda_version}` : ""}`
     : null;
-
-  const serverMenu = [
-    { type: "label" as const, label: `Core local · ${host}` },
-    { label: "Abrir Conectar IA", onSelect: () => onNavigate("ai-connect") },
-    { type: "separator" as const },
-    { label: "Copiar URL do servidor", onSelect: () => onCopy(serverUrl, "URL do servidor") },
-    { label: "Copiar endpoint MCP", onSelect: () => onCopy(`${serverUrl}/mcp`, "Endpoint MCP") },
-    { label: "Copiar URL OpenAPI", onSelect: () => onCopy(`${serverUrl}/openapi.json`, "URL OpenAPI") },
-  ];
 
   return (
     <footer className="statusbar">
@@ -54,33 +39,22 @@ export function StatusBar({
         type="button"
         className="status-item status-mode"
         data-state={connected ? "online" : "offline"}
-        title={connected ? "Core local conectado" : "Tentando reconectar ao core local"}
-        onClick={() => onNavigate("ai-connect")}
-        onContextMenu={(e) => menu.open(e, serverMenu)}
+        title={connected ? "Core local conectado — clique para ver Integrações MCP" : "Reconectando ao core local"}
+        onClick={() => onOpenSettingsTab("integrations")}
       >
         {connected ? "● ONLINE" : "○ OFFLINE"}
       </button>
 
       <button
         type="button"
-        className="status-item status-optional"
-        title="Servidor MCP / REST local"
-        onClick={() => onNavigate("ai-connect")}
-        onContextMenu={(e) => menu.open(e, serverMenu)}
-      >
-        mcp {host}
-      </button>
-
-      <button
-        type="button"
         className="status-item"
         data-tone={activeJobs > 0 ? "accent" : undefined}
-        title="Fila de tarefas"
-        onClick={() => onNavigate("jobs")}
+        title="Ver fila de tarefas em Configurações → Tarefas"
+        onClick={() => onOpenSettingsTab("jobs")}
         onContextMenu={(e) =>
           menu.open(e, [
-            { type: "label", label: "Fila de tarefas" },
-            { label: "Abrir fila", icon: Activity, shortcut: "Alt+5", onSelect: () => onNavigate("jobs") },
+            { type: "label", label: "Tarefas" },
+            { label: "Abrir fila de tarefas", icon: Activity, onSelect: () => onOpenSettingsTab("jobs") },
             { label: "Limpar finalizadas", onSelect: onClearFinished },
           ])
         }
@@ -89,21 +63,16 @@ export function StatusBar({
         {activeJobs > 0 ? `${activeJobs} em andamento` : "fila ociosa"}
       </button>
 
-      <button type="button" className="status-item" title="Biblioteca" onClick={() => onNavigate("library")}>
-        <Film aria-hidden />
-        {mediaCount} {mediaCount === 1 ? "mídia" : "mídias"}
-      </button>
-
       {toolsNeedAttention > 0 && (
         <button
           type="button"
           className="status-item"
           data-tone="warning"
-          title="Ferramentas para instalar ou atualizar"
-          onClick={() => onNavigate("settings")}
+          title="Ferramentas pendentes em Configurações → Ferramentas"
+          onClick={() => onOpenSettingsTab("tools")}
           onContextMenu={(e) =>
             menu.open(e, [
-              { label: "Abrir ferramentas", onSelect: () => onNavigate("settings") },
+              { label: "Abrir Ferramentas", onSelect: () => onOpenSettingsTab("tools") },
               { label: "Recarregar status", onSelect: onRefreshTools },
             ])
           }
@@ -120,11 +89,11 @@ export function StatusBar({
           type="button"
           className="status-item status-right status-optional"
           title={hardware?.recommendation_summary}
-          onClick={() => onNavigate("settings")}
+          onClick={() => onOpenSettingsTab("system")}
           onContextMenu={(e) =>
             menu.open(e, [
-              { label: "Ver hardware e ferramentas", icon: Cpu, onSelect: () => onNavigate("settings") },
-              { label: "Copiar resumo do hardware", onSelect: () => onCopy(hwLabel, "Resumo do hardware") },
+              { label: "Ver Sistema & Hardware", icon: Cpu, onSelect: () => onOpenSettingsTab("system") },
+              { label: "Copiar hardware", onSelect: () => onCopy(hwLabel, "Hardware") },
             ])
           }
         >
@@ -133,11 +102,8 @@ export function StatusBar({
         </button>
       )}
 
-      <button type="button" className="status-item status-right" title="Atalhos de teclado" onClick={onOpenShortcuts}>
-        <Keyboard aria-hidden />? atalhos
-      </button>
-      <button type="button" className="status-item status-right" title="Paleta de comandos" onClick={onOpenPalette}>
-        ctrl+k
+      <button type="button" className="status-item status-right" title="Atalhos de teclado (?)" onClick={onOpenShortcuts}>
+        <Keyboard aria-hidden />?
       </button>
     </footer>
   );

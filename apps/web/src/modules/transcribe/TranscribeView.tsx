@@ -34,7 +34,6 @@ import type {
   WhisperModelStatus,
 } from "../../lib/types";
 import { copyToClipboard, normalizeSearch, storage } from "../../lib/ui";
-import { pageMeta } from "../../app/navigation";
 import {
   ActiveJobsPanel,
   Badge,
@@ -45,7 +44,6 @@ import {
   EmptyState,
   Field,
   MoreButton,
-  PageHeader,
   Panel,
   Switch,
   Tabs,
@@ -463,13 +461,15 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
 
   return (
     <>
-      <PageHeader
-        {...pageMeta("transcribe")}
-        actions={
-          <button type="button" className="btn btn-sm" onClick={() => onNavigate("library")}>
-            Biblioteca <ArrowRight aria-hidden />
-          </button>
-        }
+      <Tabs
+        ariaLabel="Seções de transcrição"
+        value={tab}
+        onChange={setTab}
+        items={[
+          { id: "new", label: "Transcrever", icon: Mic },
+          { id: "results", label: "Transcrições", icon: ListVideo, count: transcripts.length },
+          { id: "models", label: "Modelos", icon: Layers, count: installedModels.length },
+        ]}
       />
 
       {engineMissing && (
@@ -490,7 +490,7 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
                 </button>
               )}
               <button type="button" className="btn btn-sm" onClick={() => onNavigate("settings")}>
-                Configurações
+                Ferramentas
               </button>
             </>
           }
@@ -500,17 +500,6 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
             : "FFmpeg necessário para extrair o áudio do vídeo."}
         </Callout>
       )}
-
-      <Tabs
-        ariaLabel="Seções de transcrição"
-        value={tab}
-        onChange={setTab}
-        items={[
-          { id: "new", label: "Nova transcrição", icon: Mic },
-          { id: "results", label: "Transcrições", icon: ListVideo, count: transcripts.length },
-          { id: "models", label: "Modelos", icon: Layers, count: installedModels.length },
-        ]}
-      />
 
       {/* ================================================================ */}
       {/* NEW TRANSCRIPTION                                                */}

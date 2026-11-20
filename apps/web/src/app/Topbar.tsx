@@ -1,34 +1,25 @@
-import { Keyboard, PanelLeftClose, PanelLeftOpen, Palette } from "lucide-react";
-import { Kbd, useContextMenu } from "../components";
-import type { RouteId } from "../lib/types";
+import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
+import { Kbd } from "../components";
 import { BrandMark } from "./BrandMark";
-import { APP_VERSION, routePath } from "./navigation";
-import { THEMES, type ThemeId } from "./themes";
+import { APP_VERSION, ROUTE_MAP, type PrimaryRouteId } from "./navigation";
 
 interface TopbarProps {
-  route: RouteId;
+  route: PrimaryRouteId;
   sidebarCollapsed: boolean;
-  /** When the window is too narrow the sidebar is always an icon rail. */
   sidebarLocked: boolean;
-  theme: ThemeId;
   onToggleSidebar: () => void;
   onOpenPalette: () => void;
-  onOpenShortcuts: () => void;
-  onThemeChange: (theme: ThemeId) => void;
 }
 
+/** Minimalist topbar: brand, active workspace name, and single quick-command trigger (no redundant menus). */
 export function Topbar({
   route,
   sidebarCollapsed,
   sidebarLocked,
-  theme,
   onToggleSidebar,
   onOpenPalette,
-  onOpenShortcuts,
-  onThemeChange,
 }: TopbarProps) {
-  const menu = useContextMenu();
-  const [group, page] = routePath(route).split("/");
+  const meta = ROUTE_MAP[route];
 
   return (
     <header className="topbar" data-tauri-drag-region>
@@ -49,54 +40,25 @@ export function Topbar({
           <span>aicut</span>
           <span className="brand-version">v{APP_VERSION}</span>
         </div>
-        <nav className="topbar-path" aria-label="Você está em">
-          <span className="path-parent">~/{group}/</span>
-          <span className="path-current">{page}</span>
-        </nav>
-      </div>
-
-      <button
-        type="button"
-        className="command-center"
-        onClick={onOpenPalette}
-        aria-label="Abrir paleta de comandos (Ctrl+K)"
-        title="Paleta de comandos (Ctrl+K)"
-      >
-        <span className="palette-prompt" aria-hidden>
-          ›
+        <span className="topbar-path" aria-label="Aba atual">
+          <span className="path-parent">/</span>
+          <span className="path-current">{meta.label}</span>
         </span>
-        <span className="command-label">buscar páginas e comandos…</span>
-        <Kbd>Ctrl K</Kbd>
-      </button>
+      </div>
 
       <div className="topbar-right">
         <button
           type="button"
-          className="btn btn-ghost btn-icon btn-sm"
-          aria-label="Esquema de cores"
-          aria-haspopup="menu"
-          title="Esquema de cores"
-          onClick={(e) =>
-            menu.openAt(e.currentTarget, [
-              { type: "label", label: "Esquema de cores" },
-              ...THEMES.map((t) => ({
-                label: t.label,
-                checked: t.id === theme,
-                onSelect: () => onThemeChange(t.id),
-              })),
-            ])
-          }
+          className="command-center"
+          onClick={onOpenPalette}
+          aria-label="Abrir paleta de comandos (Ctrl+K)"
+          title="Paleta de comandos (Ctrl+K)"
         >
-          <Palette aria-hidden />
-        </button>
-        <button
-          type="button"
-          className="btn btn-ghost btn-icon btn-sm"
-          aria-label="Atalhos de teclado"
-          title="Atalhos de teclado (?)"
-          onClick={onOpenShortcuts}
-        >
-          <Keyboard aria-hidden />
+          <span className="palette-prompt" aria-hidden>
+            ›
+          </span>
+          <span className="command-label">comandos…</span>
+          <Kbd>Ctrl K</Kbd>
         </button>
       </div>
     </header>

@@ -83,6 +83,18 @@ jobs:
           body: |
             ## Aicut ${{ steps.tag.outputs.name }} — Estúdio Modular AI-First para Windows 11
 
+            ### Novidades da v0.9.0 — Revisão Completa da Interface em Abas por Categoria (Zero Redundância)
+            - **Menu Lateral Limpo (5 abas do Estúdio + Configurações fixa embaixo):** eliminados os 4 itens duplicados do menu lateral (`Enquadramento`, `Fila de Tarefas`, `Módulos`, `Conectar IA`). Agora são apenas **Importar (`Alt+1`)**, **Biblioteca (`Alt+2`)**, **Transcrever (`Alt+3`)**, **Cortes Shorts (`Alt+4`)**, **Motion Studio (`Alt+5`)** e **Configurações (`Alt+6`)** isolada no rodapé.
+            - **Topbar e Barra de Status sem menus repetidos:** removidos botões duplicados de Tema, Atalhos, Biblioteca, MCP e Ctrl+K que apareciam repetidos em múltiplos lugares, além dos cabeçalhos duplicados (`PageHeader`) em cima das abas.
+            - **`Configurações` unificada em 6 abas (1 aba = 1 categoria):**
+              - **IA & Chaves:** fonte única para Chave Gemini API, modelo diretor e modelos locais `Qwen2.5-VL` + `llama-server` (usados por Cortes Shorts, Enquadramento e Motion Studio).
+              - **Ferramentas:** `FFmpeg`, `yt-dlp`, `whisper.cpp` e `llama-server`.
+              - **Sistema:** Aparência/temas, hardware/GPU CUDA e pastas do workspace.
+              - **Integrações:** MCP (Claude/Cursor), OpenAPI 3.1, CLI e feed de atividade.
+              - **Módulos:** módulos plugáveis e Action Playground.
+              - **Tarefas:** fila de progresso, logs e cancelamento.
+            - **`Cortes Shorts` reorganizada em 3 abas por categoria:** **Gerar Cortes** (vídeo + briefing limpo) · **Resultados** (cortes, pontuações, renderização e envio ao Motion Studio) · **Enquadramento** (fonte única para estilo 9:16 + editor visual da webcam/conteúdo + revisão IA).
+
             ### Correções da v0.8.2 — Preview 100% Funcional + Motor IA/HyperFrames Confiável
             - **Corrigido Preview Quebrado no Motion Studio (WebView2 / Windows 11):**
               - Resolvida a tela branca/opaca do `<iframe>` HyperFrames causada por divergência de `color-scheme` (`dark` vs `light`) no Edge WebView2.

@@ -4,8 +4,7 @@ import { getPublicServerUrl } from "../../lib/client";
 import { formatClock, formatRelativeDate } from "../../lib/format";
 import type { ActivityEntry, NotifyFn, RouteId } from "../../lib/types";
 import { copyToClipboard } from "../../lib/ui";
-import { pageMeta } from "../../app/navigation";
-import { Badge, CodeBlock, EmptyState, PageHeader, Panel, SegmentedControl, useContextMenu, type MenuItems } from "../../components";
+import { Badge, CodeBlock, EmptyState, Panel, SegmentedControl, useContextMenu, type MenuItems } from "../../components";
 import "./core.css";
 
 interface AiConnectViewProps {
@@ -106,16 +105,15 @@ export const AiConnectView: React.FC<AiConnectViewProps> = ({ activity, actionCo
   ];
 
   return (
-    <>
-      <PageHeader
-        {...pageMeta("ai-connect")}
-        description={`O Aicut expõe ${actionCount} actions com paridade total entre humanos e IAs via MCP (stdio + HTTP/SSE), OpenAPI 3.1 e CLI JSON.`}
-        actions={
-          <Badge tone={connected ? "success" : "danger"} dot>
-            {connected ? `servidor local ativo · ${baseUrl}` : "core offline — reconectando"}
-          </Badge>
-        }
-      />
+    <div className="stack">
+      <div className="row row-between wrap gap-xs">
+        <span className="secondary text-xs">
+          {actionCount} actions expostas via MCP (stdio + HTTP/SSE), OpenAPI 3.1 e CLI JSON.
+        </span>
+        <Badge tone={connected ? "success" : "danger"} dot>
+          {connected ? `servidor local ativo · ${baseUrl}` : "core offline — reconectando"}
+        </Badge>
+      </div>
 
       <div className="grid-2 integrations">
         {integrations.map((it) => (
@@ -189,6 +187,6 @@ export const AiConnectView: React.FC<AiConnectViewProps> = ({ activity, actionCo
           </div>
         )}
       </Panel>
-    </>
+    </div>
   );
 };

@@ -18,12 +18,10 @@ import { runAction } from "../../lib/client";
 import { formatBytes, formatDuration, formatRelativeDate, formatSpeed } from "../../lib/format";
 import type { JobRecord, JobStatus, NotifyFn } from "../../lib/types";
 import { copyToClipboard } from "../../lib/ui";
-import { pageMeta } from "../../app/navigation";
 import {
   Callout,
   EmptyState,
   MoreButton,
-  PageHeader,
   ProgressBar,
   Spinner,
   Tabs,
@@ -113,33 +111,29 @@ export const JobsView: React.FC<JobsViewProps> = ({ jobs, onRefresh, onClearFini
   ];
 
   return (
-    <>
-      <PageHeader
-        {...pageMeta("jobs")}
-        actions={
-          <>
-            <button type="button" className="btn btn-sm" onClick={onRefresh}>
-              <RefreshCw aria-hidden /> Atualizar
-            </button>
-            <button type="button" className="btn btn-sm" onClick={() => void onClearFinished()}>
-              <Trash2 aria-hidden /> Limpar finalizadas
-            </button>
-          </>
-        }
-      />
-
-      <Tabs
-        ariaLabel="Filtrar tarefas"
-        value={filter}
-        onChange={setFilter}
-        items={[
-          { id: "all", label: "Todas", count: counts.all },
-          { id: "active", label: "Em andamento", count: counts.active },
-          { id: "completed", label: "Concluídas", count: counts.completed },
-          { id: "failed", label: "Com falha", count: counts.failed },
-          { id: "cancelled", label: "Canceladas", count: counts.cancelled },
-        ]}
-      />
+    <div className="stack">
+      <div className="row row-between wrap gap-sm">
+        <Tabs
+          ariaLabel="Filtrar tarefas"
+          value={filter}
+          onChange={setFilter}
+          items={[
+            { id: "all", label: "Todas", count: counts.all },
+            { id: "active", label: "Em andamento", count: counts.active },
+            { id: "completed", label: "Concluídas", count: counts.completed },
+            { id: "failed", label: "Com falha", count: counts.failed },
+            { id: "cancelled", label: "Canceladas", count: counts.cancelled },
+          ]}
+        />
+        <div className="row gap-xs">
+          <button type="button" className="btn btn-sm" onClick={onRefresh}>
+            <RefreshCw aria-hidden /> Atualizar
+          </button>
+          <button type="button" className="btn btn-sm" onClick={() => void onClearFinished()}>
+            <Trash2 aria-hidden /> Limpar finalizadas
+          </button>
+        </div>
+      </div>
 
       {visible.length === 0 ? (
         <div className="panel">
@@ -277,6 +271,6 @@ export const JobsView: React.FC<JobsViewProps> = ({ jobs, onRefresh, onClearFini
           </table>
         </div>
       )}
-    </>
+    </div>
   );
 };

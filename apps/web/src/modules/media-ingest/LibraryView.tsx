@@ -33,7 +33,6 @@ import { fetchMediaText, mediaStreamUrl, mediaTextUrl, mediaThumbnailUrl, runAct
 import { formatBytes, formatDuration, formatRelativeDate } from "../../lib/format";
 import type { MediaAsset, MediaKind, MediaSourceType, NotifyFn, RouteId } from "../../lib/types";
 import { copyToClipboard, normalizeSearch, splitList, storage } from "../../lib/ui";
-import { pageMeta } from "../../app/navigation";
 import {
   Badge,
   BusyIcon,
@@ -43,7 +42,6 @@ import {
   Field,
   KeyValueGrid,
   MoreButton,
-  PageHeader,
   ResizeHandle,
   SegmentedControl,
   Tabs,
@@ -676,54 +674,39 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
 
   return (
     <>
-      <PageHeader
-        {...pageMeta("library")}
-        title={isTrash ? "Lixeira da Biblioteca" : "Biblioteca"}
-        description={
-          isTrash
-            ? `Arquivos removidos da Biblioteca mas preservados no disco (${trashedItems.length} item(ns) · ${formatBytes(trashTotalBytes)}). Restaure ou exclua permanentemente.`
-            : `${media.length} item(ns) — vídeos e áudios baixados ou importados, mais legendas, timelines e cortes gerados pela IA.`
-        }
-        actions={
-          <>
+      <div className="row row-between wrap gap-sm">
+        <Tabs
+          ariaLabel="Biblioteca ou Lixeira"
+          value={viewMode}
+          onChange={switchViewMode}
+          items={[
+            { id: "library", label: "Biblioteca", icon: Film, count: media.length },
+            { id: "trash", label: "Lixeira", icon: Trash2, count: trashedItems.length },
+          ]}
+        />
+        <div className="row gap-xs">
+          <button
+            type="button"
+            className="btn btn-sm"
+            onClick={() => {
+              onRefresh();
+              void loadTrash();
+            }}
+          >
+            <RefreshCw aria-hidden /> Atualizar
+          </button>
+          {isTrash && trashedItems.length > 0 && (
             <button
               type="button"
-              className="btn btn-sm"
-              onClick={() => {
-                onRefresh();
-                void loadTrash();
-              }}
+              className="btn btn-danger btn-sm"
+              disabled={bulkBusy}
+              onClick={() => handlePurgeTrash(undefined, true)}
             >
-              <RefreshCw aria-hidden /> Atualizar
+              <Trash2 aria-hidden /> Esvaziar Lixeira ({formatBytes(trashTotalBytes)})
             </button>
-            {!isTrash && (
-              <button type="button" className="btn btn-primary btn-sm" onClick={() => onNavigate("ingest")}>
-                <Download aria-hidden /> Baixar / Importar
-              </button>
-            )}
-            {isTrash && trashedItems.length > 0 && (
-              <button
-                type="button"
-                className="btn btn-danger btn-sm"
-                disabled={bulkBusy}
-                onClick={() => handlePurgeTrash(undefined, true)}
-              >
-                <Trash2 aria-hidden /> Esvaziar Lixeira ({formatBytes(trashTotalBytes)})
-              </button>
-            )}
-          </>
-        }
-      />
-
-      <Tabs
-        ariaLabel="Biblioteca ou Lixeira"
-        value={viewMode}
-        onChange={switchViewMode}
-        items={[
-          { id: "library", label: "Biblioteca", icon: Film, count: media.length },
-          { id: "trash", label: "Lixeira", icon: Trash2, count: trashedItems.length },
-        ]}
-      />
+          )}
+        </div>
+      </div>
 
       {/* Toolbar */}
       <div className="toolbar library-toolbar">

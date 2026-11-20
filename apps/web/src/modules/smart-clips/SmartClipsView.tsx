@@ -1,30 +1,24 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  Award,
+  Captions,
   CircleCheck,
-  Cloud,
   Copy,
-  Cpu,
   Crop,
-  Download,
   Eye,
   Film,
-  HardDrive,
-  KeyRound,
   Layers,
   Lightbulb,
   Play,
   Scissors,
+  Settings,
   Sparkles,
-  Captions,
   Trash2,
   Zap,
 } from "lucide-react";
 import { AicutActionError, runAction } from "../../lib/client";
-import { formatBytes, formatDuration, formatRelativeDate } from "../../lib/format";
+import { formatDuration, formatRelativeDate } from "../../lib/format";
 import type {
   ClipsConfig,
-  HardwareProfile,
   JobRecord,
   MediaAsset,
   MediaContextInfo,
@@ -33,10 +27,9 @@ import type {
   SmartClipPlan,
   SmartClipRun,
   ToolStatus,
-  VisionModelStatus,
 } from "../../lib/types";
 import { copyToClipboard } from "../../lib/ui";
-import { pageMeta } from "../../app/navigation";
+import type { SettingsTabId, SmartClipsTabId } from "../../app/navigation";
 import {
   ActiveJobsPanel,
   Badge,
@@ -48,24 +41,26 @@ import {
   Field,
   Meter,
   MoreButton,
-  PageHeader,
   Panel,
+  Tabs,
   useContextMenu,
   type MenuItems,
 } from "../../components";
+import { FramingStudioView } from "./FramingStudioView";
 import "./smart-clips.css";
 
 interface SmartClipsViewProps {
+  activeTab: SmartClipsTabId;
+  onTabChange: (tab: SmartClipsTabId) => void;
   media: MediaAsset[];
   tools: ToolStatus[];
   jobs: JobRecord[];
-  hardware: HardwareProfile | null;
   preselectedMediaId?: string | null;
   onNavigate: (route: RouteId) => void;
+  onOpenSettingsTab: (tab: SettingsTabId) => void;
   onSelectMedia: (mediaId: string) => void;
   onOpenInMotionStudio?: (seed: { mediaId: string; startSec?: number; endSec?: number; title?: string }) => void;
   onNotify: NotifyFn;
-  onRefreshTools: () => Promise<void>;
   onRefreshMedia: () => Promise<void>;
 }
 
@@ -96,26 +91,26 @@ const SHORTS_LAYOUTS: Array<{ id: ShortsLayout; short: string; label: string; de
   {
     id: "template_split",
     short: "Moldura SMOKING33",
-    label: "Moldura Shorts (SMOKING33) · Câmera em cima + foco em quem fala/ação em baixo",
-    desc: "Moldura 9:16 com borda dourada: webcam sem bordas com rastreamento facial em cima e IA Diretor enquadrando quem fala ou a ação em destaque em baixo.",
+    label: "Moldura Shorts (SMOKING33) · Câmera em cima + conteúdo em baixo",
+    desc: "Moldura 9:16 com borda dourada: webcam limpa em cima e IA Diretor no conteúdo em baixo.",
   },
   {
     id: "gaming_split",
-    short: "Split sem moldura",
-    label: "Split 9:16 sem moldura · Câmera em cima + foco em quem fala/ação em baixo",
-    desc: "Webcam cheia com rastreamento facial em cima e IA Diretor enquadrando quem fala ou o momento de ação em baixo, sem moldura.",
+    short: "Split limpo",
+    label: "Split 9:16 sem moldura · Câmera em cima + conteúdo em baixo",
+    desc: "Webcam sem bordas em cima e conteúdo dinâmico em baixo, sem moldura.",
   },
   {
     id: "fit_blur",
     short: "Tela inteira + blur",
     label: "Shorts 9:16 · Tela inteira + blur",
-    desc: "Mantém o vídeo 16:9 sem cortar bordas sobre fundo desfocado (ideal para tutoriais e tela única).",
+    desc: "Mantém o 16:9 completo sem cortar laterais sobre fundo desfocado.",
   },
   {
     id: "center_crop",
     short: "Foco central",
     label: "Shorts 9:16 · Foco central",
-    desc: "Enquadramento vertical cheio focado no centro (ideal para vlogs, podcasts e câmera principal).",
+    desc: "Enquadramento vertical cheio focado no centro.",
   },
   {
     id: "original",
@@ -125,7 +120,6 @@ const SHORTS_LAYOUTS: Array<{ id: ShortsLayout; short: string; label: string; de
   },
 ];
 
-/** Tiny CSS-drawn preview of each 9:16 framing. */
 function LayoutPreview({ id }: { id: ShortsLayout }) {
   return (
     <span className={`lp lp-${id}`} aria-hidden>
@@ -139,48 +133,35 @@ const clipTimecodes = (clip: SmartClipPlan) =>
   clip.segments.map((s) => `${formatDuration(s.start_sec)} → ${formatDuration(s.end_sec)}`).join("  +  ");
 
 export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
+  activeTab,
+  onTabChange,
   media,
   tools,
   jobs,
-  hardware,
   preselectedMediaId,
   onNavigate,
+  onOpenSettingsTab,
   onSelectMedia,
   onOpenInMotionStudio,
   onNotify,
-  onRefreshTools,
   onRefreshMedia,
 }) => {
   const menu = useContextMenu();
   const videoMedia = useMemo(() => media.filter((m) => m.kind === "video" || m.kind === "video_only"), [media]);
 
   const [selectedMediaId, setSelectedMediaId] = useState<string>(preselectedMediaId ?? videoMedia[0]?.id ?? "");
-  const [provider, setProvider] = useState<"gemini" | "local_free">("gemini");
   const [description, setDescription] = useState<string>(DESCRIPTION_PRESETS[0].text);
   const [maxDurationSec, setMaxDurationSec] = useState<number>(180);
   const [maxClips, setMaxClips] = useState<number>(5);
   const [allowJumpCuts, setAllowJumpCuts] = useState<boolean>(false);
 
-  // Provider configuration
+  // Saved global AI config (edited exclusively in Configurações → IA & Chaves)
   const [config, setConfig] = useState<ClipsConfig | null>(null);
-  const [geminiKeyInput, setGeminiKeyInput] = useState<string>("");
-  const [geminiDirectorModel, setGeminiDirectorModel] = useState<string>("auto");
-  const [savingConfig, setSavingConfig] = useState<boolean>(false);
-
-  // Local Free vision models
-  const [visionModels, setVisionModels] = useState<VisionModelStatus[]>([]);
-  const [totalVisionBytes, setTotalVisionBytes] = useState<number>(0);
-  const [selectedLocalModel, setSelectedLocalModel] = useState<string>("");
-  const [installingLlama, setInstallingLlama] = useState<boolean>(false);
-  const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
-  const [uninstallingModel, setUninstallingModel] = useState<string | null>(null);
-
-  // Runs & full-library video context
   const [runs, setRuns] = useState<SmartClipRun[]>([]);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [mediaContext, setMediaContext] = useState<MediaContextInfo | null>(null);
 
-  // Shorts rendering options
+  // 9:16 export format preferences (configured in the Enquadramento tab)
   const [layout, setLayout] = useState<ShortsLayout>("template_split");
   const [webcamCorner, setWebcamCorner] = useState<WebcamCorner>("auto_face");
   const [contentFit, setContentFit] = useState<ContentFitMode>("smart_focus");
@@ -189,11 +170,11 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
   const [borderTrimPct, setBorderTrimPct] = useState<number>(0.045);
   const [customTemplatePath, setCustomTemplatePath] = useState<string>("");
   const [burnSubtitles, setBurnSubtitles] = useState<boolean>(true);
+
   const [analyzing, setAnalyzing] = useState<boolean>(false);
   const [renderingKey, setRenderingKey] = useState<string | null>(null);
 
   const ffmpegTool = tools.find((t) => t.id === "ffmpeg");
-  const llamaTool = tools.find((t) => t.id === "llama-server");
 
   useEffect(() => {
     if (preselectedMediaId) {
@@ -201,9 +182,9 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
     } else if (!selectedMediaId && videoMedia.length > 0) {
       setSelectedMediaId(videoMedia[0].id);
     }
-  }, [preselectedMediaId, videoMedia.length]);
+  }, [preselectedMediaId, selectedMediaId, videoMedia]);
 
-  const loadMediaContext = async (mediaId: string) => {
+  const loadMediaContext = useCallback(async (mediaId: string) => {
     if (!mediaId) {
       setMediaContext(null);
       return;
@@ -214,307 +195,183 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
     } catch {
       setMediaContext(null);
     }
-  };
+  }, []);
 
-  const loadAll = async () => {
+  const loadAll = useCallback(async () => {
     try {
-      const [cfgRes, modelsRes, runsRes] = await Promise.all([
+      const [cfgRes, runsRes] = await Promise.all([
         runAction<ClipsConfig>("clips.config_get"),
-        runAction<{
-          models: VisionModelStatus[];
-          recommended_model_id: string;
-          total_installed_bytes: number;
-        }>("clips.models_list"),
         runAction<{ runs: SmartClipRun[] }>("clips.runs_list"),
       ]);
-
       setConfig(cfgRes.data);
       setCustomTemplatePath(cfgRes.data.template_path ?? "");
-      if (cfgRes.data.default_provider === "local_free") {
-        setProvider("local_free");
-      } else {
-        setProvider("gemini");
-      }
-      setGeminiDirectorModel(cfgRes.data.gemini_director_model || "auto");
-
-      const mList = modelsRes.data.models ?? [];
-      setVisionModels(mList);
-      setTotalVisionBytes(modelsRes.data.total_installed_bytes ?? 0);
-      setSelectedLocalModel((curr) => {
-        if (curr && mList.some((m) => m.id === curr && m.installed)) return curr;
-        const firstInst = mList.find((m) => m.installed);
-        if (firstInst) return firstInst.id;
-        return cfgRes.data.local_vision_model || modelsRes.data.recommended_model_id || "";
-      });
-
       const rList = runsRes.data.runs ?? [];
       setRuns(rList);
-      if (rList.length > 0 && !activeRunId) {
-        setActiveRunId(rList[0].id);
-      }
+      setActiveRunId((curr) => (curr && rList.some((r) => r.id === curr) ? curr : (rList[0]?.id ?? null)));
     } catch {
-      // ignore if backend offline
+      // ignore if offline
     }
-  };
+  }, []);
 
   useEffect(() => {
     void loadAll();
-  }, []);
+  }, [loadAll]);
 
-  const clipJobKinds = ["clips.analyze", "clips.render", "clips.model_download"];
+  useEffect(() => {
+    void loadMediaContext(selectedMediaId);
+  }, [selectedMediaId, media.length, loadMediaContext]);
+
   const activeClipJobs = jobs.filter(
-    (j) => clipJobKinds.includes(j.kind) && (j.status === "queued" || j.status === "running"),
+    (j) => (j.kind === "clips.analyze" || j.kind === "clips.render") && (j.status === "queued" || j.status === "running"),
   );
-  // Transcriptions also matter: a finished transcript instantly links to this video's context
-  const completedRelatedJobsCount = jobs.filter(
-    (j) => (clipJobKinds.includes(j.kind) || j.kind === "transcribe.run") && j.status === "completed",
+  const finishedCount = jobs.filter(
+    (j) => (j.kind === "clips.analyze" || j.kind === "clips.render") && j.status === "completed",
   ).length;
 
   useEffect(() => {
-    if (selectedMediaId) {
-      void loadMediaContext(selectedMediaId);
-    } else {
-      setMediaContext(null);
-    }
-  }, [selectedMediaId, media.length, completedRelatedJobsCount]);
-
-  useEffect(() => {
-    if (completedRelatedJobsCount > 0) {
+    if (finishedCount > 0) {
       void loadAll();
       void onRefreshMedia();
     }
-  }, [completedRelatedJobsCount]);
+  }, [finishedCount, loadAll, onRefreshMedia]);
 
-  const resolvedTranscript = mediaContext?.resolved_transcript ?? null;
-  const relatedCount = Math.max(0, (mediaContext?.related_assets?.length ?? 1) - 1);
+  const activeProvider = config?.default_provider === "local_free" ? "local_free" : "gemini";
+  const providerReady = activeProvider === "gemini" ? Boolean(config?.gemini_configured) : true;
+  const activeRun = runs.find((r) => r.id === activeRunId) ?? runs[0] ?? null;
+  const resolvedTranscript = mediaContext?.transcript ?? null;
+  const relatedCount = mediaContext?.related_media.length ?? 0;
+  const currentLayout = SHORTS_LAYOUTS.find((l) => l.id === layout) ?? SHORTS_LAYOUTS[0];
+  const isSplit = layout === "template_split" || layout === "gaming_split";
 
-  const activeRun = useMemo(() => runs.find((r) => r.id === activeRunId) ?? runs[0] ?? null, [runs, activeRunId]);
-
-  const saveGeminiSettings = async () => {
-    setSavingConfig(true);
+  async function saveTemplatePath() {
     try {
-      const payload: Record<string, unknown> = {
-        default_provider: provider,
-        gemini_director_model: geminiDirectorModel,
-      };
-      if (geminiKeyInput.trim()) {
-        payload.gemini_api_key = geminiKeyInput.trim();
-      }
-      const res = await runAction<ClipsConfig>("clips.config_set", payload);
-      setConfig(res.data);
-      setGeminiKeyInput("");
-      onNotify("success", "Configuração salva", "Preferências da Gemini API atualizadas.");
-    } catch (e) {
-      onNotify("error", "Erro ao salvar", e instanceof AicutActionError ? e.message : "Falha ao salvar configuração.");
-    } finally {
-      setSavingConfig(false);
-    }
-  };
-
-  const installLlamaServer = async () => {
-    setInstallingLlama(true);
-    try {
-      await runAction("tools.install", { tool_id: "llama-server" });
-      await onRefreshTools();
-      onNotify("success", "llama.cpp instalado", "Runtime visual local pronto na melhor build para sua GPU/hardware.");
-    } catch (e) {
-      onNotify("error", "Erro ao instalar llama.cpp", e instanceof AicutActionError ? e.message : "Falha na instalação.");
-    } finally {
-      setInstallingLlama(false);
-    }
-  };
-
-  const handleDownloadModel = async (modelId: string) => {
-    setDownloadingModel(modelId);
-    try {
-      await runAction("clips.model_download", { model_id: modelId });
-      setSelectedLocalModel(modelId);
-      await runAction("clips.config_set", { local_vision_model: modelId }).catch(() => {});
+      await runAction("clips.config_set", { template_path: customTemplatePath.trim() });
       await loadAll();
-      onNotify("success", "Modelo visual pronto", `Modelo ${modelId} baixado com sucesso.`);
+      onNotify(
+        "success",
+        "Moldura atualizada",
+        customTemplatePath.trim() ? "Moldura PNG personalizada salva." : "Restaurada moldura padrão SMOKING33.",
+      );
     } catch (e) {
-      onNotify("error", "Erro no download", e instanceof AicutActionError ? e.message : "Falha ao baixar modelo visual.");
-    } finally {
-      setDownloadingModel(null);
+      onNotify("error", "Erro ao salvar moldura", (e as Error).message);
     }
-  };
+  }
 
-  const handleDeleteModel = async (modelId: string) => {
-    setUninstallingModel(modelId);
-    try {
-      const res = await runAction<{ freed_bytes: number }>("clips.model_delete", { model_id: modelId });
-      await loadAll();
-      onNotify("info", "Modelo desinstalado", `Espaço liberado: ${formatBytes(res.data.freed_bytes ?? 0)}.`);
-    } catch (e) {
-      onNotify("error", "Erro ao desinstalar", e instanceof AicutActionError ? e.message : "Falha ao remover modelo.");
-    } finally {
-      setUninstallingModel(null);
-    }
-  };
-
-  const handleStartAnalyze = async () => {
+  async function handleStartAnalyze() {
     if (!selectedMediaId) {
-      onNotify("warning", "Selecione um vídeo", "Escolha um vídeo ou live da Biblioteca primeiro.");
+      onNotify("warning", "Selecione um vídeo", "Escolha um vídeo da Biblioteca para analisar.");
       return;
     }
     if (!description.trim()) {
-      onNotify("warning", "Descreva o que procurar", "Informe uma descrição editorial para guiar a IA visual.");
+      onNotify("warning", "Descreva os cortes", "Informe o que a IA deve procurar no vídeo.");
+      return;
+    }
+    if (activeProvider === "gemini" && !config?.gemini_configured) {
+      onNotify("warning", "Configure sua IA primeiro", "Adicione sua Gemini API Key em Configurações → IA & Chaves.");
+      onOpenSettingsTab("ai");
       return;
     }
     setAnalyzing(true);
     try {
-      await runAction("clips.config_set", {
-        default_provider: provider,
-        gemini_director_model: geminiDirectorModel,
-        local_vision_model: selectedLocalModel,
-      }).catch(() => {});
-
-      await runAction("clips.analyze", {
+      const res = await runAction<{ job_id: string }>("clips.analyze", {
         media_id: selectedMediaId,
         description: description.trim(),
-        provider,
-        model_id: provider === "local_free" ? selectedLocalModel : geminiDirectorModel,
+        provider: activeProvider,
+        model_id: activeProvider === "local_free" ? config?.local_vision_model || undefined : undefined,
         max_duration_sec: maxDurationSec,
-        min_duration_sec: 25,
         max_clips: maxClips,
         allow_jump_cuts: allowJumpCuts,
         wait: false,
       });
-      onNotify(
-        "info",
-        "Análise visual iniciada",
-        "A IA está assistindo ao vídeo para encontrar cortes coerentes de até 3 min. Acompanhe o progresso abaixo.",
-      );
+      onNotify("success", "Análise iniciada", `Acompanhe o progresso (${res.data.job_id.slice(0, 8)}).`);
+      onTabChange("results");
     } catch (e) {
-      onNotify(
-        "error",
-        "Não foi possível iniciar",
-        e instanceof AicutActionError ? e.message : "Verifique os pré-requisitos do motor escolhido.",
-      );
+      const msg = e instanceof AicutActionError ? e.message : (e as Error).message;
+      onNotify("error", "Falha ao iniciar análise", msg);
     } finally {
       setAnalyzing(false);
     }
-  };
+  }
 
-  const handleRender = async (runId: string, clipId?: string) => {
+  async function handleRender(runId: string, clipId?: string) {
     const key = clipId ?? `all:${runId}`;
     setRenderingKey(key);
     try {
-      await runAction("clips.render", {
+      const res = await runAction<{ job_id: string }>("clips.render", {
         run_id: runId,
         clip_id: clipId,
         layout,
         webcam_corner: webcamCorner,
         content_fit: contentFit,
-        template_path: customTemplatePath.trim() ? customTemplatePath.trim() : undefined,
         face_tracking: faceTracking,
         face_zoom: faceZoom,
         border_trim_pct: borderTrimPct,
+        template_path: layout === "template_split" && customTemplatePath.trim() ? customTemplatePath.trim() : undefined,
         burn_subtitles: burnSubtitles,
         wait: false,
       });
-      onNotify(
-        "info",
-        "Renderização Shorts iniciada",
-        "Os cortes serão salvos automaticamente na Biblioteca assim que o FFmpeg concluir.",
-      );
+      onNotify("success", "Renderização iniciada", `Shorts serão salvos na Biblioteca (${res.data.job_id.slice(0, 8)}).`);
     } catch (e) {
-      onNotify("error", "Erro ao renderizar", e instanceof AicutActionError ? e.message : "Falha ao iniciar renderização.");
+      const msg = e instanceof AicutActionError ? e.message : (e as Error).message;
+      onNotify("error", "Erro ao renderizar", msg);
     } finally {
       setRenderingKey(null);
     }
-  };
+  }
 
-  const handleDeleteRun = async (runId: string) => {
+  async function handleDeleteRun(runId: string) {
     try {
-      await runAction("clips.run_delete", { id: runId });
-      if (activeRunId === runId) setActiveRunId(null);
+      await runAction("clips.run_delete", { run_id: runId });
       await loadAll();
-    } catch {
-      // ignore
+      onNotify("info", "Análise removida", "Plano de cortes excluído do histórico.");
+    } catch (e) {
+      onNotify("error", "Erro ao remover análise", (e as Error).message);
     }
-  };
+  }
 
-  const saveTemplatePath = () => {
-    void runAction("clips.config_set", {
-      template_path: customTemplatePath.trim(),
-    })
-      .then(() =>
-        onNotify(
-          "success",
-          "Moldura salva",
-          customTemplatePath.trim() ? "Moldura PNG personalizada salva como padrão." : "Moldura padrão SMOKING33 restaurada.",
-        ),
-      )
-      .catch(() => {});
-  };
-
-  const primaryGpu = hardware?.gpus?.[0];
-  const currentLayout = SHORTS_LAYOUTS.find((l) => l.id === layout) ?? SHORTS_LAYOUTS[0];
-  const isSplit = layout === "template_split" || layout === "gaming_split";
-
-  /* ---------- Context menus ---------- */
-  const clipMenu = (run: SmartClipRun, clip: SmartClipPlan, index: number): MenuItems => [
-    { type: "label", label: `#${index + 1} · ${clip.title}` },
+  const clipMenu = (run: SmartClipRun, clip: SmartClipPlan, idx: number): MenuItems => [
+    { type: "label", label: `#${String(idx + 1).padStart(2, "0")} · ${clip.title}` },
     {
       label: clip.rendered_media_id ? "Re-renderizar Short" : "Renderizar Short",
       icon: Scissors,
       disabled: renderingKey !== null,
       onSelect: () => void handleRender(run.id, clip.id),
     },
+    onOpenInMotionStudio &&
+      clip.segments.length > 0 && {
+        label: "Editar no Motion Studio",
+        icon: Layers,
+        onSelect: () =>
+          onOpenInMotionStudio({
+            mediaId: run.media_id,
+            startSec: clip.segments[0].start_sec,
+            endSec: clip.segments[clip.segments.length - 1].end_sec,
+            title: clip.title,
+          }),
+      },
     clip.rendered_media_id && {
-      label: "Abrir na Biblioteca",
+      label: "Abrir Short na Biblioteca",
       icon: Play,
       onSelect: () => onSelectMedia(clip.rendered_media_id!),
     },
     { type: "separator" },
     { label: "Copiar título", icon: Copy, onSelect: () => void copyToClipboard(clip.title, onNotify, "Título") },
     { label: "Copiar timecodes", icon: Copy, onSelect: () => void copyToClipboard(clipTimecodes(clip), onNotify, "Timecodes") },
-    clip.hook_first_5s && {
-      label: "Copiar gancho",
-      icon: Copy,
-      onSelect: () => void copyToClipboard(clip.hook_first_5s, onNotify, "Gancho"),
-    },
   ];
 
-  const visionMenu = (m: VisionModelStatus): MenuItems => [
-    { type: "label", label: m.display_name },
-    m.installed && {
-      label: selectedLocalModel === m.id ? "Modelo ativo" : "Usar este modelo",
-      icon: CircleCheck,
-      disabled: selectedLocalModel === m.id,
-      onSelect: () => setSelectedLocalModel(m.id),
-    },
-    !m.installed && {
-      label: `Baixar (${(m.size_mb / 1024).toFixed(1)} GB)`,
-      icon: Download,
-      disabled: downloadingModel !== null,
-      onSelect: () => void handleDownloadModel(m.id),
-    },
-    m.model_path && {
-      label: "Copiar caminho do modelo",
-      icon: Copy,
-      onSelect: () => void copyToClipboard(m.model_path ?? "", onNotify, "Caminho do modelo"),
-    },
-    m.installed && { type: "separator" },
-    m.installed && {
-      label: "Desinstalar",
-      icon: Trash2,
-      danger: true,
-      disabled: uninstallingModel === m.id,
-      onSelect: () => void handleDeleteModel(m.id),
-    },
-  ];
+  const totalClipsCount = runs.reduce((acc, r) => acc + r.clips.length, 0);
 
   return (
-    <>
-      <PageHeader
-        {...pageMeta("smart-clips")}
-        actions={
-          <button type="button" className="btn btn-sm" onClick={() => onNavigate("ingest")}>
-            <Download aria-hidden /> Baixar YouTube / Twitch / PC
-          </button>
-        }
+    <div className="stack">
+      <Tabs
+        ariaLabel="Categorias de Cortes Shorts"
+        value={activeTab}
+        onChange={onTabChange}
+        items={[
+          { id: "generate", label: "Gerar Cortes", icon: Sparkles },
+          { id: "results", label: "Resultados", icon: Scissors, count: totalClipsCount || undefined },
+          { id: "framing", label: "Enquadramento", icon: Crop },
+        ]}
       />
 
       {!ffmpegTool?.installed && (
@@ -522,23 +379,42 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
           tone="warning"
           title="FFmpeg necessário"
           actions={
-            <button type="button" className="btn btn-primary btn-sm" onClick={() => onNavigate("settings")}>
+            <button type="button" className="btn btn-primary btn-sm" onClick={() => onOpenSettingsTab("tools")}>
               Instalar em Ferramentas
             </button>
           }
         >
-          O FFmpeg precisa estar instalado para extrair frames e renderizar Shorts.
+          Instale o FFmpeg em Configurações → Ferramentas para analisar frames e renderizar Shorts.
         </Callout>
       )}
 
-      <ActiveJobsPanel jobs={activeClipJobs} title="Cortes IA em andamento" tone="accent" onViewAll={() => onNavigate("jobs")} />
+      <ActiveJobsPanel
+        jobs={activeClipJobs}
+        title="Cortes IA em andamento"
+        tone="accent"
+        onViewAll={() => onOpenSettingsTab("jobs")}
+      />
 
-      <div className="clips-config">
-        {/* Step 1: video + editorial brief */}
+      {/* TAB 1: GERAR CORTES (Briefing + Disparo — sem configurações duplicadas!) */}
+      {activeTab === "generate" && (
         <Panel
-          step={1}
-          title="Vídeo & briefing"
+          title="Vídeo & briefing editorial"
           icon={Film}
+          actions={
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm"
+              onClick={() => onOpenSettingsTab("ai")}
+              title="Alterar motor de IA em Configurações → IA & Chaves"
+            >
+              <Settings size={13} aria-hidden />
+              {activeProvider === "gemini"
+                ? config?.gemini_configured
+                  ? "Gemini API · pronto"
+                  : "Configurar Gemini API"
+                : "Local grátis · GPU"}
+            </button>
+          }
           footer={
             <button
               type="button"
@@ -547,20 +423,34 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
               onClick={handleStartAnalyze}
             >
               <BusyIcon busy={analyzing} icon={Sparkles} />
-              Analisar vídeo e gerar planos de cortes
+              Analisar vídeo e gerar cortes
             </button>
           }
         >
+          {!providerReady && (
+            <Callout
+              tone="warning"
+              title="Chave Gemini API não configurada"
+              actions={
+                <button type="button" className="btn btn-primary btn-sm" onClick={() => onOpenSettingsTab("ai")}>
+                  Configurar em IA & Chaves
+                </button>
+              }
+            >
+              Adicione sua chave Gemini ou selecione o modo Local Grátis em Configurações → IA & Chaves.
+            </Callout>
+          )}
+
           <Field label="Vídeo / live da Biblioteca" htmlFor="sc-media">
             {videoMedia.length === 0 ? (
               <Callout
                 actions={
                   <button type="button" className="btn btn-sm" onClick={() => onNavigate("ingest")}>
-                    Baixar & Importar
+                    Importar vídeo
                   </button>
                 }
               >
-                Nenhum vídeo na Biblioteca ainda. Baixe do YouTube/Twitch ou importe um arquivo local.
+                Nenhum vídeo na Biblioteca ainda. Baixe um link ou importe um arquivo local.
               </Callout>
             ) : (
               <select
@@ -585,8 +475,8 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
               icon={Captions}
               title={
                 resolvedTranscript
-                  ? `Transcrição vinculada automaticamente · ${resolvedTranscript.segment_count} falas · ${resolvedTranscript.language.toUpperCase()}`
-                  : "Nenhuma transcrição encontrada na Biblioteca para este vídeo ainda"
+                  ? `Transcrição vinculada · ${resolvedTranscript.segment_count} falas · ${resolvedTranscript.language.toUpperCase()}`
+                  : "Sem transcrição vinculada (opcional, mas melhora o corte)"
               }
               actions={
                 !resolvedTranscript && (
@@ -598,14 +488,12 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
             >
               <span className="lineage">
                 {resolvedTranscript && <span>origem: {resolvedTranscript.source}</span>}
-                <span>video_id: {selectedMediaId.slice(0, 12)}</span>
-                {mediaContext?.external_video_key && <span>{mediaContext.external_video_key}</span>}
-                <span>{relatedCount} arquivo(s) vinculado(s) na Biblioteca</span>
+                <span>{relatedCount} arquivo(s) vinculado(s)</span>
               </span>
             </Callout>
           )}
 
-          <Field label="O que a IA visual deve procurar nos cortes?" htmlFor="sc-desc">
+          <Field label="O que a IA deve procurar nos cortes?" htmlFor="sc-desc">
             <div className="row wrap gap-xs">
               {DESCRIPTION_PRESETS.map((p) => (
                 <button
@@ -625,12 +513,12 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
               rows={4}
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              placeholder="Ex.: Ache os momentos mais engraçados da live, jogadas absurdas com reação na webcam ou explicações completas que façam sentido do início ao fim..."
+              placeholder="Ex.: Ache os momentos mais engraçados, jogadas marcantes com reação na webcam ou explicações completas..."
             />
           </Field>
 
           <div className="grid-2">
-            <Field label="Duração máxima (Shorts até 3 min)" htmlFor="sc-maxdur">
+            <Field label="Duração máxima por corte" htmlFor="sc-maxdur">
               <select
                 id="sc-maxdur"
                 className="select"
@@ -643,7 +531,7 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
                 <option value={180}>Até 3 minutos (180s · Recomendado)</option>
               </select>
             </Field>
-            <Field label="Quantidade máxima de cortes" htmlFor="sc-maxclips">
+            <Field label="Quantidade máxima" htmlFor="sc-maxclips">
               <select
                 id="sc-maxclips"
                 className="select"
@@ -662,454 +550,302 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
             checked={allowJumpCuts}
             onChange={setAllowJumpCuts}
             label="Permitir jump-cuts internos leves"
-            description={`Pula pausas longas e tempos mortos mantendo início–meio–fim em até ${maxDurationSec}s.`}
+            description={`Pula pausas longas mantendo início–meio–fim em até ${maxDurationSec}s.`}
           />
         </Panel>
+      )}
 
-        {/* Step 2: visual AI engine */}
-        <Panel step={2} title="Motor de IA visual" icon={Eye}>
-          <ChoiceCards
-            ariaLabel="Motor de IA visual"
-            value={provider}
-            onChange={setProvider}
-            options={[
-              { id: "gemini", title: "Gemini API", icon: Cloud, description: "Visão + áudio nativos de vídeo na nuvem." },
-              { id: "local_free", title: "Local grátis", icon: Cpu, description: "Qwen2.5-VL offline na sua GPU." },
-            ]}
-          />
-
-          {provider === "gemini" ? (
-            <>
-              <Callout tone="info" icon={Cloud}>
-                O Gemini assiste diretamente aos blocos de vídeo (25 min com 3 min de sobreposição) usando{" "}
-                <strong>Gemini 3.8 Flash (auto)</strong> na varredura e <strong>{geminiDirectorModel}</strong> na direção final. 0 MB de
-                download local.
-              </Callout>
-
-              <Field
-                label="Chave Gemini API"
-                htmlFor="sc-key"
-                aside={
-                  config?.gemini_configured && (
-                    <span className="text-success text-xs row gap-xs">
-                      <CircleCheck size={12} aria-hidden /> configurada ({config.gemini_key_preview})
-                    </span>
-                  )
-                }
-              >
-                <div className="row">
-                  <input
-                    id="sc-key"
-                    type="password"
-                    className="input"
-                    value={geminiKeyInput}
-                    onChange={(e) => setGeminiKeyInput(e.target.value)}
-                    placeholder={
-                      config?.gemini_configured
-                        ? "cole uma nova chave apenas se quiser trocar…"
-                        : "AIza… (obtenha grátis no Google AI Studio)"
-                    }
-                  />
-                  <button type="button" className="btn btn-primary" disabled={savingConfig} onClick={saveGeminiSettings}>
-                    <BusyIcon busy={savingConfig} icon={KeyRound} /> Salvar
-                  </button>
-                </div>
-              </Field>
-
-              <Field label="Modelo diretor (passagem B — coerência início–meio–fim)" htmlFor="sc-director">
-                <select
-                  id="sc-director"
-                  className="select"
-                  value={geminiDirectorModel}
-                  onChange={(e) => setGeminiDirectorModel(e.target.value)}
-                >
-                  <option value="auto">Automático (Melhor Gemini disponível na chave · Recomendado)</option>
-                  <option value="gemini-3.8-pro">Gemini 3.8 Pro (Máxima inteligência visual e narrativa)</option>
-                  <option value="gemini-3.8-flash">Gemini 3.8 Flash (Mais rápido e econômico)</option>
-                </select>
-              </Field>
-            </>
-          ) : (
-            <>
-              <div className="row row-between wrap text-xs secondary">
-                <span className="row gap-xs">
-                  <Cpu size={13} className="text-accent" aria-hidden />
-                  {primaryGpu
-                    ? `${primaryGpu.name}${primaryGpu.vram_mb ? ` (${Math.round(primaryGpu.vram_mb / 1024)} GB VRAM)` : ""}`
-                    : "Modo CPU"}
-                  {hardware?.cuda_version ? ` · CUDA ${hardware.cuda_version}` : ""}
-                </span>
-                <span className="row gap-xs">
-                  <HardDrive size={13} aria-hidden /> {formatBytes(totalVisionBytes)} em disco
-                </span>
-              </div>
-
-              <Callout
-                tone={llamaTool?.installed ? "success" : "warning"}
-                title={`Motor llama.cpp server · ${llamaTool?.installed ? "pronto" : "não instalado"}`}
-                actions={
-                  <button
-                    type="button"
-                    className={`btn btn-sm ${llamaTool?.installed ? "" : "btn-primary"}`}
-                    disabled={installingLlama}
-                    onClick={installLlamaServer}
-                  >
-                    <BusyIcon busy={installingLlama} icon={Download} size={13} />
-                    {llamaTool?.installed ? "Atualizar" : "Instalar auto"}
-                  </button>
-                }
-              >
-                {llamaTool?.recommended_build ?? "Detecta automaticamente CUDA / Vulkan / CPU"}
-              </Callout>
-
-              <div className="vision-list">
-                {visionModels.map((m) => {
-                  const isActive = selectedLocalModel === m.id;
-                  return (
-                    <div
-                      key={m.id}
-                      className="vision-model hover-host"
-                      data-active={isActive || undefined}
-                      onContextMenu={(e) => menu.open(e, visionMenu(m))}
-                    >
-                      <div className="row row-between">
-                        <div className="row wrap gap-xs" style={{ minWidth: 0 }}>
-                          <span className="strong text-sm">{m.display_name}</span>
-                          {m.recommended && (
-                            <Badge tone="accent" icon={Award}>
-                              recomendado
-                            </Badge>
-                          )}
-                          <Badge>{m.quality_tier}</Badge>
-                        </div>
-                        <span className="row gap-xs">
-                          <span className="muted text-xs">{(m.size_mb / 1024).toFixed(1)} GB</span>
-                          <span className="row-actions">
-                            <MoreButton items={() => visionMenu(m)} />
-                          </span>
-                        </span>
-                      </div>
-                      <div className="secondary text-xs">{m.quality_notes}</div>
-                      <div className={`text-xs ${m.compatible ? "text-success" : "text-warning"}`}>{m.compatibility_reason}</div>
-                      <div className="row gap-xs">
-                        {m.installed ? (
-                          <>
-                            <button
-                              type="button"
-                              className={`btn btn-sm ${isActive ? "btn-primary" : ""}`}
-                              onClick={() => setSelectedLocalModel(m.id)}
-                            >
-                              {isActive ? <CircleCheck aria-hidden /> : <Play aria-hidden />}
-                              {isActive ? "Ativo" : "Usar este"}
-                            </button>
-                            <button
-                              type="button"
-                              className="btn btn-sm"
-                              disabled={uninstallingModel === m.id}
-                              onClick={() => handleDeleteModel(m.id)}
-                            >
-                              <BusyIcon busy={uninstallingModel === m.id} icon={Trash2} size={13} />
-                              Desinstalar
-                            </button>
-                          </>
-                        ) : (
-                          <button
-                            type="button"
-                            className="btn btn-primary btn-sm"
-                            disabled={downloadingModel !== null}
-                            onClick={() => handleDownloadModel(m.id)}
-                          >
-                            <BusyIcon busy={downloadingModel === m.id} icon={Download} size={13} />
-                            Baixar ({(m.size_mb / 1024).toFixed(1)} GB)
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </>
-          )}
-        </Panel>
-      </div>
-
-      {/* Step 3: results & 9:16 rendering */}
-      <Panel
-        step={3}
-        title="Cortes encontrados & renderização"
-        icon={Scissors}
-        actions={
-          runs.length > 0 && (
-            <>
-              <select
-                className="select select-sm select-auto run-select"
-                aria-label="Análise"
-                value={activeRun?.id ?? ""}
-                onChange={(e) => setActiveRunId(e.target.value)}
-              >
-                {runs.map((r) => (
-                  <option key={r.id} value={r.id}>
-                    {r.media_title} · {r.clips.length} corte(s) · {r.provider} ({formatRelativeDate(r.created_at)})
-                  </option>
-                ))}
-              </select>
-              {activeRun && (
-                <button
-                  type="button"
-                  className="btn btn-ghost btn-icon btn-sm"
-                  onClick={() => handleDeleteRun(activeRun.id)}
-                  aria-label="Excluir esta análise"
-                  title="Excluir esta análise"
-                >
-                  <Trash2 aria-hidden />
-                </button>
-              )}
-            </>
-          )
-        }
-      >
-        <div className="inset stack">
-          <div className="row row-between wrap">
-            <span className="section-label">Formato do Short</span>
-            {activeRun && activeRun.clips.length > 0 && (
+      {/* TAB 2: RESULTADOS & EXPORTAÇÃO */}
+      {activeTab === "results" && (
+        <Panel
+          title="Cortes encontrados"
+          icon={Scissors}
+          actions={
+            <div className="row wrap gap-xs">
               <button
                 type="button"
-                className="btn btn-primary btn-sm"
-                disabled={renderingKey !== null}
-                onClick={() => handleRender(activeRun.id)}
+                className="btn btn-sm"
+                onClick={() => onTabChange("framing")}
+                title="Ajustar formato 9:16 e áreas da webcam"
               >
-                <BusyIcon busy={renderingKey === `all:${activeRun.id}`} icon={Scissors} size={13} />
-                Renderizar todos ({activeRun.clips.length})
+                <Crop size={13} aria-hidden /> {currentLayout.short}
               </button>
-            )}
-          </div>
-
-          <ChoiceCards
-            ariaLabel="Enquadramento Shorts"
-            className="layout-picker"
-            columns={5}
-            value={layout}
-            onChange={setLayout}
-            options={SHORTS_LAYOUTS.map((l) => ({ id: l.id, title: l.short, preview: <LayoutPreview id={l.id} /> }))}
-          />
-          <p className="secondary text-xs">
-            <strong className="text-accent">{currentLayout.label}</strong> — {currentLayout.desc}
-          </p>
-
-          {isSplit && (
-            <div className="grid-2">
-              <Field label="Origem da câmera (janela de cima)" htmlFor="sc-cam">
-                <select
-                  id="sc-cam"
-                  className="select"
-                  value={webcamCorner}
-                  onChange={(e) => setWebcamCorner(e.target.value as WebcamCorner)}
-                >
-                  <option value="auto_face">Automático · IA detecta webcam, remove bordas e segue rosto</option>
-                  <option value="bottom_right">Canto inferior direito (com IA facial + anti-borda)</option>
-                  <option value="bottom_left">Canto inferior esquerdo (com IA facial + anti-borda)</option>
-                  <option value="top_right">Canto superior direito (com IA facial + anti-borda)</option>
-                  <option value="top_left">Canto superior esquerdo (com IA facial + anti-borda)</option>
-                  <option value="center">Centro / Tela cheia (sem webcam no canto)</option>
-                </select>
-              </Field>
-              <Field label="Conteúdo (janela de baixo)" htmlFor="sc-fit">
-                <select
-                  id="sc-fit"
-                  className="select"
-                  value={contentFit}
-                  onChange={(e) => setContentFit(e.target.value as ContentFitMode)}
-                >
-                  <option value="smart_focus">IA Diretor · Enquadra quem fala ou a ação em destaque (Recomendado)</option>
-                  <option value="fill">Centro fixo (preencher janela sem bordas)</option>
-                  <option value="fit_blur">Tela 16:9 inteira + blur</option>
-                </select>
-              </Field>
-            </div>
-          )}
-
-          {(isSplit || layout === "center_crop") && (
-            <div className="grid-2">
-              <Field label="Enquadramento da webcam (topo)" htmlFor="sc-zoom">
-                <select
-                  id="sc-zoom"
-                  className="select"
-                  value={faceZoom}
-                  onChange={(e) => setFaceZoom(Number(e.target.value))}
-                  disabled={!faceTracking}
-                >
-                  <option value={1.0}>Webcam inteira sem bordas · Sem zoom no rosto (Recomendado)</option>
-                  <option value={1.15}>Zoom leve no rosto (1.15×)</option>
-                  <option value={1.3}>Close no rosto (1.30×)</option>
-                </select>
-              </Field>
-              <Field label="Margem anti-borda (modo automático)" htmlFor="sc-trim">
-                <select
-                  id="sc-trim"
-                  className="select"
-                  value={borderTrimPct}
-                  onChange={(e) => setBorderTrimPct(Number(e.target.value))}
-                  disabled={!faceTracking}
-                >
-                  <option value={0.03}>Leve (3% — webcam sem moldura)</option>
-                  <option value={0.045}>Padrão (4.5% — remove bordas OBS)</option>
-                  <option value={0.08}>Forte (8% — remove molduras grossas / overlays)</option>
-                </select>
-              </Field>
-            </div>
-          )}
-
-          {isSplit && (
-            <div className="row row-between wrap gap-xs">
-              <span className="secondary text-xs">
-                Quer travar a área exata da webcam (sem bordas e sem zoom) e pedir para a IA revisar antes de renderizar?
-              </span>
-              <button type="button" className="btn btn-sm" onClick={() => onNavigate("framing")}>
-                <Crop size={13} aria-hidden /> Abrir aba Enquadramento (Webcam & Conteúdo)
-              </button>
-            </div>
-          )}
-
-          <div className="row wrap gap-md">
-            {(isSplit || layout === "center_crop") && (
-              <Checkbox
-                checked={faceTracking}
-                onChange={setFaceTracking}
-                label="IA Cameraman na webcam (identifica as bordas, exibe apenas o interior sem bordas e acompanha o rosto)"
-              />
-            )}
-            <Checkbox
-              checked={burnSubtitles}
-              onChange={setBurnSubtitles}
-              label="Queimar legendas karaokê sincronizadas (se transcrito)"
-            />
-            {layout === "template_split" && (
-              <div className="row grow template-row">
-                <input
-                  type="text"
-                  className="input input-sm"
-                  aria-label="Caminho da moldura PNG"
-                  value={customTemplatePath}
-                  onChange={(e) => setCustomTemplatePath(e.target.value)}
-                  placeholder="moldura padrão SMOKING33 (ou cole o caminho de outro PNG 9:16 transparente)"
-                />
-                <button type="button" className="btn btn-sm" onClick={saveTemplatePath}>
-                  Salvar PNG
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
-
-        {!activeRun || activeRun.clips.length === 0 ? (
-          <EmptyState
-            compact
-            icon={Scissors}
-            title="nenhuma análise concluída"
-            description="Selecione um vídeo, descreva o que procurar e clique em Analisar vídeo."
-          />
-        ) : (
-          <div className="stack">
-            {activeRun.clips.map((clip, i) => (
-              <article
-                key={clip.id}
-                className="clip-card hover-host"
-                onContextMenu={(e) => menu.open(e, clipMenu(activeRun, clip, i))}
-              >
-                <header className="clip-head">
-                  <span className="clip-index">#{String(i + 1).padStart(2, "0")}</span>
-                  <div className="grow">
-                    <div className="clip-title">{clip.title}</div>
-                    <div className="clip-times">{clipTimecodes(clip)}</div>
-                  </div>
-                  <Badge tone="accent">{formatDuration(clip.total_duration_sec)}</Badge>
-                  {onOpenInMotionStudio && clip.segments.length > 0 && (
+              {runs.length > 0 && (
+                <>
+                  <select
+                    className="select select-sm select-auto run-select"
+                    aria-label="Análise"
+                    value={activeRun?.id ?? ""}
+                    onChange={(e) => setActiveRunId(e.target.value)}
+                  >
+                    {runs.map((r) => (
+                      <option key={r.id} value={r.id}>
+                        {r.media_title} · {r.clips.length} corte(s) ({formatRelativeDate(r.created_at)})
+                      </option>
+                    ))}
+                  </select>
+                  {activeRun && activeRun.clips.length > 0 && (
                     <button
                       type="button"
-                      className="btn btn-sm"
-                      title="Dirigir layouts dinâmicos cena a cena com chat da IA no Motion Studio"
-                      onClick={() =>
-                        onOpenInMotionStudio({
-                          mediaId: activeRun.media_id,
-                          startSec: clip.segments[0].start_sec,
-                          endSec: clip.segments[clip.segments.length - 1].end_sec,
-                          title: clip.title,
-                        })
-                      }
+                      className="btn btn-primary btn-sm"
+                      disabled={renderingKey !== null}
+                      onClick={() => handleRender(activeRun.id)}
                     >
-                      <Layers size={13} aria-hidden /> Motion IA
+                      <BusyIcon busy={renderingKey === `all:${activeRun.id}`} icon={Scissors} size={13} />
+                      Renderizar todos ({activeRun.clips.length})
                     </button>
                   )}
-                  {clip.rendered_media_id && (
-                    <button type="button" className="btn btn-sm" onClick={() => onSelectMedia(clip.rendered_media_id!)}>
-                      <Play aria-hidden /> Abrir
+                  {activeRun && (
+                    <button
+                      type="button"
+                      className="btn btn-ghost btn-icon btn-sm"
+                      onClick={() => handleDeleteRun(activeRun.id)}
+                      aria-label="Excluir esta análise"
+                      title="Excluir esta análise"
+                    >
+                      <Trash2 aria-hidden />
                     </button>
                   )}
-                  <button
-                    type="button"
-                    className="btn btn-primary btn-sm"
-                    disabled={renderingKey !== null}
-                    onClick={() => handleRender(activeRun.id, clip.id)}
+                </>
+              )}
+            </div>
+          }
+        >
+          {!activeRun || activeRun.clips.length === 0 ? (
+            <EmptyState
+              compact
+              icon={Scissors}
+              title="nenhuma análise concluída"
+              description="Vá na aba Gerar Cortes, escolha um vídeo e clique em Analisar vídeo."
+              actions={
+                <button type="button" className="btn btn-primary btn-sm" onClick={() => onTabChange("generate")}>
+                  Ir para Gerar Cortes
+                </button>
+              }
+            />
+          ) : (
+            <div className="stack">
+              {activeRun.clips.map((clip, i) => (
+                <article
+                  key={clip.id}
+                  className="clip-card hover-host"
+                  onContextMenu={(e) => menu.open(e, clipMenu(activeRun, clip, i))}
+                >
+                  <header className="clip-head">
+                    <span className="clip-index">#{String(i + 1).padStart(2, "0")}</span>
+                    <div className="grow">
+                      <div className="clip-title">{clip.title}</div>
+                      <div className="clip-times">{clipTimecodes(clip)}</div>
+                    </div>
+                    <Badge tone="accent">{formatDuration(clip.total_duration_sec)}</Badge>
+                    {onOpenInMotionStudio && clip.segments.length > 0 && (
+                      <button
+                        type="button"
+                        className="btn btn-sm"
+                        title="Editar layouts dinâmicos e animações no Motion Studio"
+                        onClick={() =>
+                          onOpenInMotionStudio({
+                            mediaId: activeRun.media_id,
+                            startSec: clip.segments[0].start_sec,
+                            endSec: clip.segments[clip.segments.length - 1].end_sec,
+                            title: clip.title,
+                          })
+                        }
+                      >
+                        <Layers size={13} aria-hidden /> Motion IA
+                      </button>
+                    )}
+                    {clip.rendered_media_id && (
+                      <button type="button" className="btn btn-sm" onClick={() => onSelectMedia(clip.rendered_media_id!)}>
+                        <Play aria-hidden /> Abrir
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="btn btn-primary btn-sm"
+                      disabled={renderingKey !== null}
+                      onClick={() => handleRender(activeRun.id, clip.id)}
+                    >
+                      <BusyIcon busy={renderingKey === clip.id} icon={Scissors} size={13} />
+                      {clip.rendered_media_id ? "Re-renderizar" : "Renderizar"}
+                    </button>
+                    <MoreButton items={() => clipMenu(activeRun, clip, i)} />
+                  </header>
+
+                  <div className="grid-4 clip-scores">
+                    <Meter label="Aderência" value={clip.scores.match_description} />
+                    <Meter label="Visual" value={clip.scores.visual_interest} />
+                    <Meter label="Coerência" value={clip.scores.narrative_coherence} />
+                    <Meter label="Gancho" value={clip.scores.hook_strength} />
+                  </div>
+
+                  <div className="clip-notes">
+                    {clip.visual_evidence && (
+                      <p>
+                        <Eye size={13} className="text-info" aria-hidden />
+                        <span>
+                          <span className="muted">O que a IA viu:</span> {clip.visual_evidence}
+                        </span>
+                      </p>
+                    )}
+                    {clip.hook_first_5s && (
+                      <p>
+                        <Zap size={13} className="text-warning" aria-hidden />
+                        <span>
+                          <span className="muted">Gancho (5s):</span> {clip.hook_first_5s}
+                        </span>
+                      </p>
+                    )}
+                    {clip.why_interesting && (
+                      <p>
+                        <Lightbulb size={13} className="text-magenta" aria-hidden />
+                        <span>
+                          <span className="muted">Por que funciona:</span> {clip.why_interesting}
+                        </span>
+                      </p>
+                    )}
+                  </div>
+
+                  <div className="arc">
+                    <div className="arc-step" data-step="1">
+                      <span className="arc-label">1 · início</span>
+                      {clip.narrative_arc.beginning || "—"}
+                    </div>
+                    <div className="arc-step" data-step="2">
+                      <span className="arc-label">2 · meio</span>
+                      {clip.narrative_arc.middle || "—"}
+                    </div>
+                    <div className="arc-step" data-step="3">
+                      <span className="arc-label">3 · fim</span>
+                      {clip.narrative_arc.end || "—"}
+                    </div>
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
+        </Panel>
+      )}
+
+      {/* TAB 3: ENQUADRAMENTO (Fonte única de verdade para formato 9:16 + área da webcam & conteúdo) */}
+      {activeTab === "framing" && (
+        <div className="stack">
+          <Panel title="Estilo de exportação 9:16" icon={CircleCheck}>
+            <ChoiceCards
+              ariaLabel="Formato do Short"
+              className="layout-picker"
+              columns={5}
+              value={layout}
+              onChange={setLayout}
+              options={SHORTS_LAYOUTS.map((l) => ({ id: l.id, title: l.short, preview: <LayoutPreview id={l.id} /> }))}
+            />
+            <p className="secondary text-xs">
+              <strong className="text-accent">{currentLayout.label}</strong> — {currentLayout.desc}
+            </p>
+
+            {isSplit && (
+              <div className="grid-2">
+                <Field label="Origem da câmera (janela de cima)" htmlFor="sc-cam">
+                  <select
+                    id="sc-cam"
+                    className="select"
+                    value={webcamCorner}
+                    onChange={(e) => setWebcamCorner(e.target.value as WebcamCorner)}
                   >
-                    <BusyIcon busy={renderingKey === clip.id} icon={Scissors} size={13} />
-                    {clip.rendered_media_id ? "Re-renderizar" : "Renderizar"}
+                    <option value="auto_face">Automático · IA detecta webcam, remove bordas e segue rosto</option>
+                    <option value="bottom_right">Canto inferior direito</option>
+                    <option value="bottom_left">Canto inferior esquerdo</option>
+                    <option value="top_right">Canto superior direito</option>
+                    <option value="top_left">Canto superior esquerdo</option>
+                    <option value="center">Centro / Tela cheia</option>
+                  </select>
+                </Field>
+                <Field label="Conteúdo (janela de baixo)" htmlFor="sc-fit">
+                  <select
+                    id="sc-fit"
+                    className="select"
+                    value={contentFit}
+                    onChange={(e) => setContentFit(e.target.value as ContentFitMode)}
+                  >
+                    <option value="smart_focus">IA Diretor · Quem fala ou ação em destaque (Recomendado)</option>
+                    <option value="fill">Centro fixo (sem bordas)</option>
+                    <option value="fit_blur">Tela 16:9 inteira + blur</option>
+                  </select>
+                </Field>
+              </div>
+            )}
+
+            {(isSplit || layout === "center_crop") && (
+              <div className="grid-2">
+                <Field label="Zoom na webcam (topo)" htmlFor="sc-zoom">
+                  <select
+                    id="sc-zoom"
+                    className="select"
+                    value={faceZoom}
+                    onChange={(e) => setFaceZoom(Number(e.target.value))}
+                    disabled={!faceTracking}
+                  >
+                    <option value={1.0}>Webcam inteira sem bordas · Sem zoom no rosto (Recomendado)</option>
+                    <option value={1.15}>Zoom leve no rosto (1.15×)</option>
+                    <option value={1.3}>Close no rosto (1.30×)</option>
+                  </select>
+                </Field>
+                <Field label="Margem anti-borda (automático)" htmlFor="sc-trim">
+                  <select
+                    id="sc-trim"
+                    className="select"
+                    value={borderTrimPct}
+                    onChange={(e) => setBorderTrimPct(Number(e.target.value))}
+                    disabled={!faceTracking}
+                  >
+                    <option value={0.03}>Leve (3% — sem moldura)</option>
+                    <option value={0.045}>Padrão (4.5% — bordas OBS)</option>
+                    <option value={0.08}>Forte (8% — molduras grossas)</option>
+                  </select>
+                </Field>
+              </div>
+            )}
+
+            <div className="row wrap gap-md">
+              {(isSplit || layout === "center_crop") && (
+                <Checkbox
+                  checked={faceTracking}
+                  onChange={setFaceTracking}
+                  label="IA Cameraman na webcam (remove bordas e acompanha o rosto)"
+                />
+              )}
+              <Checkbox
+                checked={burnSubtitles}
+                onChange={setBurnSubtitles}
+                label="Queimar legendas karaokê sincronizadas"
+              />
+              {layout === "template_split" && (
+                <div className="row grow template-row">
+                  <input
+                    type="text"
+                    className="input input-sm"
+                    aria-label="Caminho da moldura PNG"
+                    value={customTemplatePath}
+                    onChange={(e) => setCustomTemplatePath(e.target.value)}
+                    placeholder="moldura padrão SMOKING33 (ou caminho de outro PNG 9:16 transparente)"
+                  />
+                  <button type="button" className="btn btn-sm" onClick={saveTemplatePath}>
+                    Salvar PNG
                   </button>
-                  <MoreButton items={() => clipMenu(activeRun, clip, i)} />
-                </header>
-
-                <div className="grid-4 clip-scores">
-                  <Meter label="Aderência" value={clip.scores.match_description} />
-                  <Meter label="Visual" value={clip.scores.visual_interest} />
-                  <Meter label="Coerência" value={clip.scores.narrative_coherence} />
-                  <Meter label="Gancho" value={clip.scores.hook_strength} />
                 </div>
+              )}
+            </div>
+          </Panel>
 
-                <div className="clip-notes">
-                  {clip.visual_evidence && (
-                    <p>
-                      <Eye size={13} className="text-info" aria-hidden />
-                      <span>
-                        <span className="muted">O que a IA viu:</span> {clip.visual_evidence}
-                      </span>
-                    </p>
-                  )}
-                  {clip.hook_first_5s && (
-                    <p>
-                      <Zap size={13} className="text-warning" aria-hidden />
-                      <span>
-                        <span className="muted">Gancho (5s):</span> {clip.hook_first_5s}
-                      </span>
-                    </p>
-                  )}
-                  {clip.why_interesting && (
-                    <p>
-                      <Lightbulb size={13} className="text-magenta" aria-hidden />
-                      <span>
-                        <span className="muted">Por que funciona:</span> {clip.why_interesting}
-                      </span>
-                    </p>
-                  )}
-                </div>
-
-                <div className="arc">
-                  <div className="arc-step" data-step="1">
-                    <span className="arc-label">1 · início</span>
-                    {clip.narrative_arc.beginning || "—"}
-                  </div>
-                  <div className="arc-step" data-step="2">
-                    <span className="arc-label">2 · meio</span>
-                    {clip.narrative_arc.middle || "—"}
-                  </div>
-                  <div className="arc-step" data-step="3">
-                    <span className="arc-label">3 · fim</span>
-                    {clip.narrative_arc.end || "—"}
-                  </div>
-                </div>
-              </article>
-            ))}
-          </div>
-        )}
-      </Panel>
-    </>
+          <FramingStudioView
+            media={media}
+            tools={tools}
+            preselectedMediaId={selectedMediaId}
+            onNavigate={onNavigate}
+            onNotify={onNotify}
+          />
+        </div>
+      )}
+    </div>
   );
 };
