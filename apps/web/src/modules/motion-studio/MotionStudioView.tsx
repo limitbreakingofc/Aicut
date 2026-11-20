@@ -831,8 +831,8 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
                     <span>
                       Cena {activeSceneIndex + 1}/{comp.scenes.length} ·{" "}
                       {LAYOUT_SHORT_LABELS[activeScene.layout] ?? activeScene.layout}
-                      {activeScene.effects?.camera_zoom_end > 1.02
-                        ? ` · Zoom ${activeScene.effects.camera_zoom_end.toFixed(2)}x`
+                      {(activeScene.effects?.camera_zoom_end ?? 1) > 1.02
+                        ? ` · Zoom ${(activeScene.effects?.camera_zoom_end ?? 1).toFixed(2)}x`
                         : ""}
                     </span>
                     {comp.motion_html && <span className="ms-hf-dot">HyperFrames</span>}

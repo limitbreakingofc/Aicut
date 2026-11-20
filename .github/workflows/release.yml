@@ -83,7 +83,7 @@ jobs:
           body: |
             ## Aicut ${{ steps.tag.outputs.name }} — Estúdio Modular AI-First para Windows 11
 
-            ### Correções da v0.8.1 — Preview 100% Funcional + Motor IA/HyperFrames Confiável
+            ### Correções da v0.8.2 — Preview 100% Funcional + Motor IA/HyperFrames Confiável
             - **Corrigido Preview Quebrado no Motion Studio (WebView2 / Windows 11):**
               - Resolvida a tela branca/opaca do `<iframe>` HyperFrames causada por divergência de `color-scheme` (`dark` vs `light`) no Edge WebView2.
               - Removidos `display: none` e `crossOrigin="anonymous"` do `<video>` (que suspendiam a decodificação de frames e bloqueavam HTTP Range sem `expose_headers`), além de expor headers CORS no servidor local.
