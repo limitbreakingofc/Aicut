@@ -1,38 +1,64 @@
 import React, { useState } from "react";
 import {
-  CheckCircle2,
+  CircleCheck,
+  Copy,
   Cpu,
   Download,
   Folder,
   HardDrive,
-  Loader2,
-  Moon,
+  MemoryStick,
+  Monitor,
+  Palette,
   RefreshCw,
-  Sun,
+  Server,
   Wrench,
 } from "lucide-react";
 import { getPublicServerUrl, runAction } from "../../lib/client";
-import type { HardwareProfile, ToolStatus, WorkspaceConfig } from "../../lib/types";
+import type { HardwareProfile, NotifyFn, ToolStatus, WorkspaceConfig } from "../../lib/types";
+import { copyToClipboard } from "../../lib/ui";
+import { pageMeta } from "../../app/navigation";
+import { THEMES, type ThemeId } from "../../app/themes";
+import {
+  Badge,
+  BusyIcon,
+  ChoiceCards,
+  MoreButton,
+  PageHeader,
+  Panel,
+  StatTile,
+  useContextMenu,
+  type MenuItems,
+} from "../../components";
+import "./core.css";
 
 interface SettingsViewProps {
   hardware: HardwareProfile | null;
   tools: ToolStatus[];
   workspace: WorkspaceConfig | null;
-  theme: "dark" | "light";
-  onToggleTheme: () => void;
+  theme: ThemeId;
+  onThemeChange: (theme: ThemeId) => void;
   onRefreshTools: () => Promise<void>;
-  onNotify: (level: "info" | "success" | "warning" | "error", title: string, message: string) => void;
+  onNotify: NotifyFn;
 }
+
+const ACCEL_LABEL: Record<string, string> = {
+  cuda_nvenc: "NVIDIA CUDA / NVENC",
+  amf_directml: "AMD AMF / DirectML",
+  qsv_openvino: "Intel QuickSync / OpenVINO",
+  metal: "Apple Silicon Metal",
+  cpu_only: "CPU Nativa Multithread",
+};
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
   hardware,
   tools,
   workspace,
   theme,
-  onToggleTheme,
+  onThemeChange,
   onRefreshTools,
   onNotify,
 }) => {
+  const menu = useContextMenu();
   const [checking, setChecking] = useState(false);
   const [updatingAll, setUpdatingAll] = useState(false);
   const [busyTool, setBusyTool] = useState<string | null>(null);
@@ -76,209 +102,220 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   }
 
-  const accelLabel: Record<string, string> = {
-    cuda_nvenc: "NVIDIA CUDA / NVENC",
-    amf_directml: "AMD AMF / DirectML",
-    qsv_openvino: "Intel QuickSync / OpenVINO",
-    metal: "Apple Silicon Metal",
-    cpu_only: "CPU Nativa Multithread",
-  };
+  const installLabel = (tool: ToolStatus) =>
+    !tool.installed ? "Instalar melhor versão" : tool.update_available ? "Atualizar" : "Reinstalar / atualizar";
+
+  const toolMenu = (tool: ToolStatus): MenuItems => [
+    { type: "label", label: `${tool.display_name} · ${tool.owner_module}` },
+    {
+      label: installLabel(tool),
+      icon: Download,
+      disabled: busyTool === tool.id || updatingAll,
+      onSelect: () => void handleInstallTool(tool.id, tool.display_name),
+    },
+    { type: "separator" },
+    tool.binary_path && {
+      label: "Copiar caminho do binário",
+      icon: Copy,
+      onSelect: () => void copyToClipboard(tool.binary_path ?? "", onNotify, "Caminho do binário"),
+    },
+    tool.installed_version && {
+      label: "Copiar versão instalada",
+      icon: Copy,
+      onSelect: () => void copyToClipboard(tool.installed_version ?? "", onNotify, "Versão"),
+    },
+    { label: "Copiar build recomendada", icon: Copy, onSelect: () => void copyToClipboard(tool.recommended_build, onNotify, "Build") },
+  ];
+
+  const paths: Array<{ label: string; value: string; icon: typeof Folder }> = workspace
+    ? [
+        { label: "Downloads (yt-dlp)", value: workspace.downloads_dir, icon: Download },
+        { label: "Importações (modo cópia)", value: workspace.imports_dir, icon: Folder },
+        { label: "Legendas & timelines geradas", value: workspace.exports_dir, icon: Folder },
+        { label: "Modelos de IA local", value: workspace.models_dir, icon: Cpu },
+        { label: "Binários gerenciados", value: workspace.bin_dir, icon: Wrench },
+        { label: "Endpoint local de IA (MCP / REST / OpenAPI)", value: getPublicServerUrl(), icon: Server },
+      ]
+    : [];
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
-      <div className="page-header">
-        <div>
-          <h1 className="page-title">Configurações & Ferramentas</h1>
-          <p className="page-subtitle">
-            O Aicut detecta automaticamente o hardware do seu PC e instala/atualiza as melhores versões do yt-dlp, FFmpeg e futuras ferramentas dos módulos.
-          </p>
-        </div>
-        <button type="button" className="btn" onClick={onToggleTheme}>
-          {theme === "dark" ? <Sun size={15} /> : <Moon size={15} />}
-          {theme === "dark" ? "Tema Claro" : "Tema Escuro"}
-        </button>
-      </div>
+    <>
+      <PageHeader {...pageMeta("settings")} />
 
-      {/* Hardware Profile Card */}
+      <Panel title="Aparência" icon={Palette} description="Esquemas de cor inspirados em terminais. A escolha fica salva neste computador.">
+        <ChoiceCards
+          ariaLabel="Esquema de cores"
+          className="theme-picker"
+          columns={4}
+          value={theme}
+          onChange={onThemeChange}
+          options={THEMES.map((t) => ({
+            id: t.id,
+            title: t.label,
+            description: t.description,
+            preview: (
+              <span className="theme-swatch" style={{ background: t.swatch[0] }} aria-hidden>
+                <span style={{ background: t.swatch[1] }} />
+                <span style={{ background: t.swatch[2] }} />
+              </span>
+            ),
+          }))}
+        />
+      </Panel>
+
       {hardware && (
-        <div className="panel" style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-          <div className="panel-header" style={{ marginBottom: 0 }}>
-            <h2 className="panel-title">
-              <Cpu size={16} color="var(--accent)" /> Hardware Detectado Automaticamente
-            </h2>
-            <span className="pill accent">
-              {hardware.platform_tag} · {accelLabel[hardware.recommended_accel] ?? hardware.recommended_accel}
+        <Panel
+          title="Hardware detectado"
+          icon={Cpu}
+          actions={
+            <Badge tone="accent">
+              {hardware.platform_tag} · {ACCEL_LABEL[hardware.recommended_accel] ?? hardware.recommended_accel}
               {hardware.cuda_version ? ` (CUDA ${hardware.cuda_version})` : ""}
-            </span>
-          </div>
-
+            </Badge>
+          }
+        >
           <div className="grid-4">
-            <div style={{ padding: 12, borderRadius: "var(--radius-md)", background: "var(--bg-elevated)" }}>
-              <div style={{ fontSize: 11.5, color: "var(--text-muted)" }}>Sistema & Arquitetura</div>
-              <div style={{ fontWeight: 600, marginTop: 4 }}>{hardware.os_version}</div>
-              <div style={{ fontSize: 12, color: "var(--text-secondary)", fontFamily: "var(--font-mono)" }}>
-                {hardware.arch} ({hardware.platform_tag})
-              </div>
-            </div>
-
-            <div style={{ padding: 12, borderRadius: "var(--radius-md)", background: "var(--bg-elevated)" }}>
-              <div style={{ fontSize: 11.5, color: "var(--text-muted)" }}>Processador (CPU)</div>
-              <div style={{ fontWeight: 600, marginTop: 4 }}>{hardware.cpu_brand}</div>
-              <div style={{ fontSize: 12, color: "var(--text-secondary)" }}>
-                {hardware.physical_cores} núcleos físicos · {hardware.logical_cores} threads
-              </div>
-            </div>
-
-            <div style={{ padding: 12, borderRadius: "var(--radius-md)", background: "var(--bg-elevated)" }}>
-              <div style={{ fontSize: 11.5, color: "var(--text-muted)" }}>Memória RAM</div>
-              <div style={{ fontWeight: 600, marginTop: 4 }}>
-                {(hardware.total_memory_mb / 1024).toFixed(1)} GB
-              </div>
-              <div style={{ fontSize: 12, color: "var(--text-secondary)" }}>
-                {(hardware.available_memory_mb / 1024).toFixed(1)} GB livre agora
-              </div>
-            </div>
-
-            <div style={{ padding: 12, borderRadius: "var(--radius-md)", background: "var(--bg-elevated)" }}>
-              <div style={{ fontSize: 11.5, color: "var(--text-muted)" }}>GPU / Aceleração</div>
-              <div style={{ fontWeight: 600, marginTop: 4 }}>
-                {hardware.gpus.length > 0 ? hardware.gpus[0].name : "CPU Integrada"}
-              </div>
-              <div style={{ fontSize: 12, color: "var(--text-secondary)" }}>
-                {accelLabel[hardware.recommended_accel] ?? hardware.recommended_accel}
-                {hardware.cuda_version ? ` · CUDA ${hardware.cuda_version}` : ""}
-              </div>
-            </div>
+            <StatTile
+              icon={Monitor}
+              label="Sistema"
+              value={hardware.os_version}
+              detail={`${hardware.arch} (${hardware.platform_tag})`}
+            />
+            <StatTile
+              icon={Cpu}
+              label="Processador"
+              value={hardware.cpu_brand}
+              detail={`${hardware.physical_cores} núcleos · ${hardware.logical_cores} threads`}
+            />
+            <StatTile
+              icon={MemoryStick}
+              label="Memória RAM"
+              value={`${(hardware.total_memory_mb / 1024).toFixed(1)} GB`}
+              detail={`${(hardware.available_memory_mb / 1024).toFixed(1)} GB livre agora`}
+            />
+            <StatTile
+              icon={HardDrive}
+              label="GPU / aceleração"
+              value={hardware.gpus.length > 0 ? hardware.gpus[0].name : "CPU integrada"}
+              detail={`${ACCEL_LABEL[hardware.recommended_accel] ?? hardware.recommended_accel}${
+                hardware.cuda_version ? ` · CUDA ${hardware.cuda_version}` : ""
+              }`}
+            />
           </div>
-
-          <div style={{ fontSize: 12.5, color: "var(--text-secondary)" }}>
-            {hardware.recommendation_summary}
-          </div>
-        </div>
+          <p className="secondary text-sm">{hardware.recommendation_summary}</p>
+        </Panel>
       )}
 
-      {/* Extensible Tools & Auto-Updater */}
-      <div className="panel" style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-        <div className="panel-header" style={{ marginBottom: 0 }}>
-          <h2 className="panel-title">
-            <Wrench size={16} color="var(--accent)" /> Gerenciador de Ferramentas (yt-dlp, FFmpeg e Futuros Módulos)
-          </h2>
-          <div style={{ display: "flex", gap: 8 }}>
+      <Panel
+        title="Ferramentas gerenciadas"
+        icon={Wrench}
+        flush
+        actions={
+          <>
             <button type="button" className="btn btn-sm" disabled={checking} onClick={handleCheckUpdates}>
-              {checking ? <Loader2 size={14} /> : <RefreshCw size={14} />}
-              Verificar Atualizações
+              <BusyIcon busy={checking} icon={RefreshCw} size={13} />
+              Verificar atualizações
             </button>
-            <button
-              type="button"
-              className="btn btn-primary btn-sm"
-              disabled={updatingAll}
-              onClick={handleUpdateAll}
-            >
-              {updatingAll ? <Loader2 size={14} /> : <Download size={14} />}
-              Instalar / Atualizar Tudo
+            <button type="button" className="btn btn-primary btn-sm" disabled={updatingAll} onClick={handleUpdateAll}>
+              <BusyIcon busy={updatingAll} icon={Download} size={13} />
+              Instalar / atualizar tudo
             </button>
-          </div>
-        </div>
-
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          {tools.map((tool) => {
-            const isBusy = busyTool === tool.id || updatingAll;
-            return (
-              <div
-                key={tool.id}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: 16,
-                  padding: "14px 16px",
-                  borderRadius: "var(--radius-md)",
-                  background: "var(--bg-elevated)",
-                  border: "1px solid var(--border-subtle)",
-                }}
-              >
-                <div style={{ display: "flex", flexDirection: "column", gap: 5, minWidth: 0 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                    <strong style={{ fontSize: 14.5 }}>{tool.display_name}</strong>
-                    <span className="pill">módulo: {tool.owner_module}</span>
-                    {tool.installed ? (
-                      <span className={`pill ${tool.update_available ? "warning" : "success"}`}>
-                        <CheckCircle2 size={11} />
-                        {tool.installed_version ? `v${tool.installed_version}` : "Instalado"}
-                        {tool.update_available && tool.latest_version ? ` → ${tool.latest_version} disponível` : ""}
+          </>
+        }
+      >
+        <div className="table-wrap">
+          <table className="table tools-table">
+            <thead>
+              <tr>
+                <th>ferramenta</th>
+                <th className="col-fit">status</th>
+                <th className="col-fit c-opt">módulo</th>
+                <th>build ideal p/ seu pc</th>
+                <th className="col-fit" aria-label="Ações" />
+              </tr>
+            </thead>
+            <tbody>
+              {tools.map((tool) => {
+                const isBusy = busyTool === tool.id || updatingAll;
+                return (
+                  <tr key={tool.id} onContextMenu={(e) => menu.open(e, toolMenu(tool))}>
+                    <td className="tool-cell">
+                      <div className="row gap-xs">
+                        <span className="strong">{tool.display_name}</span>
+                        {tool.managed_by_aicut && <Badge tone="info">gerenciado</Badge>}
+                      </div>
+                      <div className="secondary text-xs">{tool.description}</div>
+                      {tool.binary_path && <div className="muted text-xs break-all">{tool.binary_path}</div>}
+                    </td>
+                    <td className="col-fit">
+                      {tool.installed ? (
+                        <Badge tone={tool.update_available ? "warning" : "success"} icon={CircleCheck}>
+                          {tool.installed_version ? `v${tool.installed_version}` : "instalado"}
+                          {tool.update_available && tool.latest_version ? ` → ${tool.latest_version}` : ""}
+                        </Badge>
+                      ) : (
+                        <Badge tone="danger">não instalado</Badge>
+                      )}
+                    </td>
+                    <td className="col-fit muted c-opt">{tool.owner_module}</td>
+                    <td className="tool-build">
+                      <div className="text-sm">{tool.recommended_build}</div>
+                      <div className="muted text-xs">{tool.hardware_note}</div>
+                    </td>
+                    <td className="col-fit">
+                      <span className="row gap-xs">
+                        <button
+                          type="button"
+                          className={`btn btn-sm ${!tool.installed || tool.update_available ? "btn-primary" : ""}`}
+                          disabled={isBusy}
+                          onClick={() => handleInstallTool(tool.id, tool.display_name)}
+                        >
+                          <BusyIcon busy={isBusy} icon={Download} size={13} />
+                          {installLabel(tool)}
+                        </button>
+                        <MoreButton items={() => toolMenu(tool)} />
                       </span>
-                    ) : (
-                      <span className="pill danger">Não instalado</span>
-                    )}
-                    {tool.managed_by_aicut && <span className="pill accent">Gerenciado pelo Aicut</span>}
-                  </div>
-                  <div style={{ fontSize: 12.5, color: "var(--text-secondary)" }}>{tool.description}</div>
-                  <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
-                    <strong>Build ideal p/ seu PC:</strong> {tool.recommended_build} — {tool.hardware_note}
-                  </div>
-                  {tool.binary_path && (
-                    <div style={{ fontSize: 11.5, fontFamily: "var(--font-mono)", color: "var(--text-muted)" }}>
-                      {tool.binary_path}
-                    </div>
-                  )}
-                </div>
-
-                <button
-                  type="button"
-                  className={`btn btn-sm ${!tool.installed || tool.update_available ? "btn-primary" : ""}`}
-                  disabled={isBusy}
-                  onClick={() => handleInstallTool(tool.id, tool.display_name)}
-                >
-                  {isBusy ? <Loader2 size={14} /> : <Download size={14} />}
-                  {!tool.installed
-                    ? "Instalar Melhor Versão"
-                    : tool.update_available
-                      ? "Atualizar"
-                      : "Reinstalar / Atualizar"}
-                </button>
-              </div>
-            );
-          })}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
         </div>
-      </div>
+      </Panel>
 
-      {/* Workspace Paths & Server */}
       {workspace && (
-        <div className="panel" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          <h2 className="panel-title">
-            <Folder size={16} color="var(--accent)" /> Workspace & Servidor Local
-          </h2>
-          <div className="grid-2" style={{ fontSize: 12.5 }}>
-            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-              <span style={{ color: "var(--text-muted)" }}>Pasta de Downloads (yt-dlp)</span>
-              <code className="code-block" style={{ padding: "7px 10px" }}>{workspace.downloads_dir}</code>
-            </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-              <span style={{ color: "var(--text-muted)" }}>Pasta de Importações (Modo Cópia)</span>
-              <code className="code-block" style={{ padding: "7px 10px" }}>{workspace.imports_dir}</code>
-            </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-              <span style={{ color: "var(--text-muted)" }}>Legendas & Timelines Geradas (Exports)</span>
-              <code className="code-block" style={{ padding: "7px 10px" }}>{workspace.exports_dir}</code>
-            </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-              <span style={{ color: "var(--text-muted)" }}>Modelos de IA Local (Whisper GGML)</span>
-              <code className="code-block" style={{ padding: "7px 10px" }}>{workspace.models_dir}</code>
-            </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-              <span style={{ color: "var(--text-muted)" }}>Binários Gerenciados (yt-dlp / FFmpeg / whisper.cpp)</span>
-              <code className="code-block" style={{ padding: "7px 10px" }}>{workspace.bin_dir}</code>
-            </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-              <span style={{ color: "var(--text-muted)" }}>Endpoint Local de IA (MCP / REST / OpenAPI)</span>
-              <code className="code-block" style={{ padding: "7px 10px" }}>
-                <HardDrive size={12} style={{ verticalAlign: "middle", marginRight: 6 }} />
-                {getPublicServerUrl()}
-              </code>
-            </div>
+        <Panel title="Workspace & servidor local" icon={Folder} flush>
+          <div className="path-list">
+            {paths.map((p) => (
+              <div
+                key={p.label}
+                className="path-row hover-host"
+                onContextMenu={(e) =>
+                  menu.open(e, [{ label: "Copiar caminho", icon: Copy, onSelect: () => void copyToClipboard(p.value, onNotify, p.label) }])
+                }
+              >
+                <p.icon size={14} className="text-accent shrink-0" aria-hidden />
+                <span className="path-label">{p.label}</span>
+                <code className="path-value" title={p.value}>
+                  {p.value}
+                </code>
+                <span className="row-actions">
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-icon btn-xs"
+                    aria-label={`Copiar ${p.label}`}
+                    title="Copiar"
+                    onClick={() => void copyToClipboard(p.value, onNotify, p.label)}
+                  >
+                    <Copy aria-hidden />
+                  </button>
+                </span>
+              </div>
+            ))}
           </div>
-        </div>
+        </Panel>
       )}
-    </div>
+    </>
   );
 };

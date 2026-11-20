@@ -25,3 +25,22 @@ Todo módulo implementa a trait `AicutModule` definida em `crates/aicut-core/src
 - Tanto o clique humano na interface quanto uma chamada de IA passam por `AicutKernel::dispatch(action_id, json_input, actor)`.
 - Todas as mutações emitem eventos pelo `EventBus` (`tokio::sync::broadcast`), entregues em tempo real via WebSocket (`/api/v1/events`).
 - O estado visual (`UiStateStore`) sincroniza rota ativa, mídia selecionada e busca entre o app desktop e qualquer agente conectado.
+
+## Frontend (`apps/web`)
+
+```
+src/
+├── App.tsx              # estado global, WebSocket de eventos, atalhos e roteamento das telas
+├── app/                 # shell: navigation.ts (registro único de rotas), Topbar, Sidebar,
+│                        # StatusBar, CommandPalette, ShortcutsDialog, Toaster, themes.ts
+├── components/          # kit de UI: Panel, PageHeader, Tabs, Disclosure, ChoiceCards,
+│                        # ProgressBar, Callout, Modal, ResizeHandle, ContextMenu…
+├── styles/              # tokens.css (cores/tipografia/esquemas), base, layout, components
+├── lib/                 # client (REST/WS), types, format, ui (cx, clipboard, storage)
+└── modules/<módulo>/    # uma tela por módulo + CSS da própria tela
+```
+
+- **Nova tela**: registre a rota em `app/navigation.ts` (rótulo, ícone, grupo, descrição) e renderize a view em `App.tsx` — sidebar, breadcrumb, paleta de comandos e atalho `Alt+N` são gerados automaticamente.
+- **Menus de botão direito**: dentro de qualquer view, `const menu = useContextMenu()` e `onContextMenu={(e) => menu.open(e, itens)}`; use `<MoreButton items={() => itens} />` para o botão `⋯` equivalente.
+- **Cores e esquemas**: todos os componentes usam apenas os tokens de `styles/tokens.css`; um novo esquema é um bloco `[data-theme="…"]` nesse arquivo + uma entrada em `app/themes.ts`.
+

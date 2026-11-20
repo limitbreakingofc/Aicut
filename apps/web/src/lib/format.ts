@@ -37,3 +37,12 @@ export function formatRelativeDate(iso: string): string {
     return iso;
   }
 }
+
+/** Clock-style timestamp for log lines (e.g. "14:03:21"). */
+export function formatClock(iso: string): string {
+  try {
+    return new Intl.DateTimeFormat("pt-BR", { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date(iso));
+  } catch {
+    return iso;
+  }
+}

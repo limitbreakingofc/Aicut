@@ -18,6 +18,13 @@
   - **CLI estruturada**: `aicut run <action> --json '{...}'`.
   - **Sincronização bidirecional de UI**: a IA vê em qual aba/vídeo você está e pode navegar, abrir vídeos na tela e notificar você ao vivo.
 
+## Interface (v0.4.5)
+
+- **Estilo terminal moderno, em largura total**: fonte mono, painéis com bordas finas, tabelas densas e barra de status inferior clicável (core MCP, tarefas, mídias, ferramentas, GPU).
+- **Menus de botão direito** em mídias, seleções em lote, tarefas, transcrições, cortes, modelos, ferramentas e módulos (também via botões `⋯` e `Shift+F10`).
+- **Atalhos**: `Ctrl+K` paleta · `Alt+1…8` telas · `Ctrl+B` menu lateral · `?` lista completa · Biblioteca: `/` busca, `↑ ↓`, `Espaço`, `Ctrl+A`, `Del`.
+- **Esquemas de cor**: Noite, Fósforo, Âmbar e Claro (Configurações → Aparência ou botão de paleta no topo).
+
 ## Arquitetura do Monorepo
 
 - `crates/aicut-core` — Microkernel modular, `AicutModule` trait, `ActionRegistry` (JSON Schema), `EventBus`, `JobManager`, `HardwareProfiler`, `ToolManager`, SQLite `MediaRepository`, `UiStateStore`.
@@ -26,7 +33,7 @@
 - `crates/aicut-mcp` — Servidor nativo MCP JSON-RPC 2.0 (`stdio` + HTTP/SSE).
 - `crates/aicut-server` — Daemon local Axum (REST, OpenAPI 3.1, WebSocket, Media Streaming, MCP).
 - `crates/aicut-cli` — Binário unificado `aicut`.
-- `apps/web` — Interface moderna Fluent 2 (React 19 + TypeScript + Vite).
+- `apps/web` — Interface estilo terminal moderno (React 19 + TypeScript + Vite): shell em `src/app`, kit de componentes em `src/components`, design tokens em `src/styles` e uma pasta por módulo em `src/modules`.
 - `apps/desktop` — Shell nativo Windows 11 (Tauri v2).
 
 ## Desenvolvimento Local

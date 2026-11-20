@@ -131,15 +131,18 @@ export function createEventSocket(
     if (closed) return;
     try {
       ws = new WebSocket(getWsUrl());
-      ws.onopen = () => onStatusChange(true);
+      ws.onopen = () => {
+        if (!closed) onStatusChange(true);
+      };
       ws.onclose = () => {
+        // A socket closed on purpose (effect cleanup / StrictMode remount) must not
+        // overwrite the status reported by its replacement.
+        if (closed) return;
         onStatusChange(false);
-        if (!closed) {
-          retryTimer = window.setTimeout(connect, 2000);
-        }
+        retryTimer = window.setTimeout(connect, 2000);
       };
       ws.onerror = () => {
-        onStatusChange(false);
+        if (!closed) onStatusChange(false);
       };
       ws.onmessage = (ev) => {
         try {

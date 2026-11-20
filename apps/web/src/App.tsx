@@ -1,21 +1,11 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
-import {
-  Activity,
-  Blocks,
-  Bot,
-  Command,
-  Download,
-  Film,
-  Mic,
-  Scissors,
-  Settings,
-  X,
-} from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
+import { Command, Copy, Keyboard, PanelLeft, Palette, RefreshCw, Trash2 } from "lucide-react";
 import {
   createEventSocket,
   fetchActions,
   fetchActivity,
   fetchModules,
+  getPublicServerUrl,
   runAction,
 } from "./lib/client";
 import type {
@@ -25,11 +15,22 @@ import type {
   JobRecord,
   MediaAsset,
   ModuleInfo,
+  NotifyLevel,
   RouteId,
   ToolStatus,
   UiState,
   WorkspaceConfig,
 } from "./lib/types";
+import { copyToClipboard, storage, useMediaQuery } from "./lib/ui";
+import { ContextMenuProvider, useContextMenu } from "./components";
+import { ROUTES, ROUTE_MAP, routeDigit, routeForDigit } from "./app/navigation";
+import { THEMES, isThemeId, themeLabel, type ThemeId } from "./app/themes";
+import { Sidebar, type NavCount } from "./app/Sidebar";
+import { Topbar } from "./app/Topbar";
+import { StatusBar } from "./app/StatusBar";
+import { CommandPalette, type PaletteCommand } from "./app/CommandPalette";
+import { ShortcutsDialog } from "./app/ShortcutsDialog";
+import { Toaster, type ToastItem } from "./app/Toaster";
 import { IngestView } from "./modules/media-ingest/IngestView";
 import { LibraryView } from "./modules/media-ingest/LibraryView";
 import { TranscribeView } from "./modules/transcribe/TranscribeView";
@@ -39,20 +40,35 @@ import { ModulesView } from "./modules/core/ModulesView";
 import { AiConnectView } from "./modules/core/AiConnectView";
 import { SettingsView } from "./modules/core/SettingsView";
 
-interface ToastItem {
-  id: string;
-  level: "info" | "success" | "warning" | "error";
-  title: string;
-  message: string;
+/** True when a keystroke belongs to a text field (shortcuts must not hijack typing). */
+function isTypingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable) return true;
+  if (target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) return true;
+  if (target instanceof HTMLInputElement) {
+    return !["checkbox", "radio", "button", "submit", "range", "color", "file"].includes(target.type);
+  }
+  return false;
 }
 
 export function App() {
+  return (
+    <ContextMenuProvider>
+      <AicutApp />
+    </ContextMenuProvider>
+  );
+}
+
+function AicutApp() {
+  const ctxMenu = useContextMenu();
   const [route, setRoute] = useState<RouteId>("ingest");
   const [connected, setConnected] = useState(false);
-  const [theme, setTheme] = useState<"dark" | "light">(() => {
-    const saved = localStorage.getItem("aicut_theme");
-    return saved === "light" ? "light" : "dark";
+  const [theme, setTheme] = useState<ThemeId>(() => {
+    const saved = storage.get("aicut_theme");
+    return isThemeId(saved) ? saved : "dark";
   });
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => storage.get("aicut_sidebar") === "collapsed");
+  const sidebarLocked = useMediaQuery("(max-width: 860px)");
 
   const [media, setMedia] = useState<MediaAsset[]>([]);
   const [selectedMediaId, setSelectedMediaId] = useState<string | null>(null);
@@ -70,25 +86,29 @@ export function App() {
   const [workspace, setWorkspace] = useState<WorkspaceConfig | null>(null);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const [paletteOpen, setPaletteOpen] = useState(false);
-  const [paletteQuery, setPaletteQuery] = useState("");
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
 
   const socketRef = useRef<{ sendUiSync: (state: UiState) => void; close: () => void } | null>(null);
+  const scrollRef = useRef<HTMLElement>(null);
 
-  const pushToast = useCallback(
-    (level: "info" | "success" | "warning" | "error", title: string, message: string) => {
-      const id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-      setToasts((prev) => [...prev.slice(-4), { id, level, title, message }]);
-      window.setTimeout(() => {
-        setToasts((prev) => prev.filter((t) => t.id !== id));
-      }, 4800);
-    },
-    [],
-  );
+  const pushToast = useCallback((level: NotifyLevel, title: string, message: string) => {
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    setToasts((prev) => [...prev.slice(-4), { id, level, title, message }]);
+    window.setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 4800);
+  }, []);
+
+  const copy = useCallback((text: string, label: string) => void copyToClipboard(text, pushToast, label), [pushToast]);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
-    localStorage.setItem("aicut_theme", theme);
+    storage.set("aicut_theme", theme);
   }, [theme]);
+
+  useEffect(() => {
+    storage.set("aicut_sidebar", sidebarCollapsed ? "collapsed" : "expanded");
+  }, [sidebarCollapsed]);
 
   const refreshMedia = useCallback(async () => {
     try {
@@ -120,11 +140,7 @@ export function App() {
 
   const refreshModulesAndActions = useCallback(async () => {
     try {
-      const [mods, acts, actLog] = await Promise.all([
-        fetchModules(),
-        fetchActions(),
-        fetchActivity(),
-      ]);
+      const [mods, acts, actLog] = await Promise.all([fetchModules(), fetchActions(), fetchActivity()]);
       setModules(mods);
       setActions(acts);
       setActivity(actLog);
@@ -143,6 +159,16 @@ export function App() {
     }
     await Promise.all([refreshMedia(), refreshJobs(), refreshTools(), refreshModulesAndActions()]);
   }, [refreshMedia, refreshJobs, refreshTools, refreshModulesAndActions]);
+
+  const clearFinishedJobs = useCallback(async () => {
+    try {
+      const res = await runAction<{ removed_count: number }>("jobs.clear_finished");
+      pushToast("info", "Fila limpa", `${res.data.removed_count} tarefa(s) finalizada(s) removida(s).`);
+      void refreshJobs();
+    } catch (e) {
+      pushToast("error", "Erro ao limpar fila", (e as Error).message);
+    }
+  }, [pushToast, refreshJobs]);
 
   useEffect(() => {
     void bootstrapAll();
@@ -165,9 +191,9 @@ export function App() {
             setJobs((prev) => {
               const idx = prev.findIndex((j) => j.id === job.id);
               if (idx >= 0) {
-                const copy = [...prev];
-                copy[idx] = job;
-                return copy;
+                const copyList = [...prev];
+                copyList[idx] = job;
+                return copyList;
               }
               return [job, ...prev];
             });
@@ -198,11 +224,7 @@ export function App() {
             break;
           }
           case "ui_notification": {
-            const n = ev.payload as {
-              level: "info" | "success" | "warning" | "error";
-              title: string;
-              message: string;
-            };
+            const n = ev.payload as { level: NotifyLevel; title: string; message: string };
             pushToast(n.level, n.title, n.message);
             break;
           }
@@ -238,11 +260,9 @@ export function App() {
     (next: Partial<UiState>) => {
       socketRef.current?.sendUiSync({
         active_route: next.active_route ?? route,
-        selected_media_id:
-          next.selected_media_id !== undefined ? next.selected_media_id : selectedMediaId,
+        selected_media_id: next.selected_media_id !== undefined ? next.selected_media_id : selectedMediaId,
         search_query: next.search_query ?? searchQuery,
-        active_filter_kind:
-          next.active_filter_kind !== undefined ? next.active_filter_kind : filterKind,
+        active_filter_kind: next.active_filter_kind !== undefined ? next.active_filter_kind : filterKind,
         player: {
           media_id: selectedMediaId,
           playing: false,
@@ -261,12 +281,50 @@ export function App() {
     [syncUi],
   );
 
+  const selectMedia = useCallback(
+    (id: string | null) => {
+      setSelectedMediaId(id);
+      syncUi({ selected_media_id: id });
+    },
+    [syncUi],
+  );
+
+  const toggleSidebar = useCallback(() => setSidebarCollapsed((v) => !v), []);
+  const openPalette = useCallback(() => setPaletteOpen(true), []);
+  const openShortcuts = useCallback(() => setShortcutsOpen(true), []);
+
+  // Every view starts at the top
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: 0 });
+  }, [route]);
+
+  // Global keyboard shortcuts
+  const navigateRef = useRef(navigate);
+  navigateRef.current = navigate;
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+      if (e.defaultPrevented) return;
+      const mod = e.ctrlKey || e.metaKey;
+      const key = e.key.toLowerCase();
+      if (mod && !e.shiftKey && key === "k") {
         e.preventDefault();
         setPaletteOpen((v) => !v);
-        setPaletteQuery("");
+      } else if (mod && e.shiftKey && key === "p") {
+        e.preventDefault();
+        setPaletteOpen(true);
+      } else if (mod && !e.shiftKey && key === "b") {
+        e.preventDefault();
+        setSidebarCollapsed((v) => !v);
+      } else if (e.altKey && !mod && /^Digit[1-9]$/.test(e.code)) {
+        const target = routeForDigit(Number(e.code.slice(5)));
+        if (target) {
+          e.preventDefault();
+          setPaletteOpen(false);
+          navigateRef.current(target);
+        }
+      } else if (e.key === "?" && !mod && !e.altKey && !isTypingTarget(e.target)) {
+        e.preventDefault();
+        setShortcutsOpen(true);
       } else if (e.key === "Escape") {
         setPaletteOpen(false);
       }
@@ -278,122 +336,133 @@ export function App() {
   const activeJobsCount = jobs.filter((j) => j.status === "queued" || j.status === "running").length;
   const toolsNeedAttention = tools.filter((t) => !t.installed || t.update_available).length;
 
-  const navItems: Array<{
-    id: RouteId;
-    label: string;
-    icon: React.ReactNode;
-    badge?: number;
-    badgeAccent?: boolean;
-  }> = [
-    { id: "ingest", label: "Baixar & Importar", icon: <Download size={16} /> },
-    { id: "library", label: "Biblioteca", icon: <Film size={16} />, badge: media.length },
-    { id: "transcribe", label: "Transcrever IA", icon: <Mic size={16} /> },
-    { id: "smart-clips", label: "Cortes Shorts IA", icon: <Scissors size={16} /> },
-    {
-      id: "jobs",
-      label: "Fila de Tarefas",
-      icon: <Activity size={16} />,
-      badge: activeJobsCount > 0 ? activeJobsCount : undefined,
-      badgeAccent: true,
-    },
-    { id: "modules", label: "Módulos", icon: <Blocks size={16} /> },
-    { id: "ai-connect", label: "Conectar IA", icon: <Bot size={16} /> },
-  ];
+  const navCounts: Partial<Record<RouteId, NavCount>> = {
+    library: { value: media.length, title: `${media.length} item(ns) na Biblioteca` },
+    jobs: { value: activeJobsCount, tone: "accent", title: `${activeJobsCount} tarefa(s) em andamento` },
+    settings: { value: toolsNeedAttention, tone: "warning", title: "Ferramentas para instalar ou atualizar" },
+  };
 
-  const paletteCommands: Array<{ label: string; hint: string; run: () => void }> = [
-    { label: "Ir para Baixar & Importar (yt-dlp / PC)", hint: "Aba 1", run: () => navigate("ingest") },
-    { label: "Ir para Biblioteca de Mídia", hint: "Aba 2", run: () => navigate("library") },
-    { label: "Ir para Transcrever com IA Local (Whisper)", hint: "Aba 3", run: () => navigate("transcribe") },
-    { label: "Ir para Cortes Shorts IA (Visual até 3 min)", hint: "Aba 4", run: () => navigate("smart-clips") },
-    { label: "Ir para Fila de Tarefas", hint: "Aba 5", run: () => navigate("jobs") },
-    { label: "Ir para Módulos & Action Playground", hint: "Aba 5", run: () => navigate("modules") },
-    { label: "Ir para Conectar IA (MCP / OpenAPI / CLI)", hint: "Aba 6", run: () => navigate("ai-connect") },
-    { label: "Ir para Configurações (Hardware & Ferramentas)", hint: "Menu", run: () => navigate("settings") },
-    {
-      label: "Alternar Tema Escuro / Claro",
-      hint: "Aparência",
-      run: () => setTheme((t) => (t === "dark" ? "light" : "dark")),
-    },
-  ].filter(
-    (c) =>
-      !paletteQuery.trim() ||
-      c.label.toLowerCase().includes(paletteQuery.toLowerCase()) ||
-      c.hint.toLowerCase().includes(paletteQuery.toLowerCase()),
+  const paletteCommands = useMemo<PaletteCommand[]>(
+    () => [
+      ...ROUTES.map((r) => ({
+        id: `go:${r.id}`,
+        label: r.label,
+        description: r.description,
+        icon: r.icon,
+        group: "Ir para",
+        shortcut: `Alt+${routeDigit(r.id)}`,
+        keywords: r.keywords,
+        run: () => navigate(r.id),
+      })),
+      {
+        id: "ui:sidebar",
+        label: sidebarCollapsed ? "Expandir menu lateral" : "Recolher menu lateral",
+        icon: PanelLeft,
+        group: "Interface",
+        shortcut: "Ctrl+B",
+        keywords: "sidebar barra lateral",
+        run: toggleSidebar,
+      },
+      {
+        id: "ui:shortcuts",
+        label: "Mostrar atalhos de teclado",
+        icon: Keyboard,
+        group: "Interface",
+        shortcut: "?",
+        keywords: "teclado ajuda help",
+        run: openShortcuts,
+      },
+      ...THEMES.map((t) => ({
+        id: `theme:${t.id}`,
+        label: `Esquema de cores: ${t.label}${t.id === theme ? " (atual)" : ""}`,
+        description: t.description,
+        icon: Palette,
+        group: "Interface",
+        keywords: "tema cores aparência escuro claro",
+        run: () => setTheme(t.id),
+      })),
+      {
+        id: "data:refresh",
+        label: "Recarregar dados do core",
+        description: "Biblioteca, fila, ferramentas, módulos e atividade",
+        icon: RefreshCw,
+        group: "Dados",
+        keywords: "atualizar sincronizar reload",
+        run: () => void bootstrapAll(),
+      },
+      {
+        id: "jobs:clear",
+        label: "Limpar tarefas finalizadas",
+        icon: Trash2,
+        group: "Dados",
+        keywords: "fila jobs limpar",
+        run: () => void clearFinishedJobs(),
+      },
+    ],
+    [navigate, sidebarCollapsed, toggleSidebar, openShortcuts, theme, bootstrapAll, clearFinishedJobs],
   );
 
+  // Right click on empty areas: app-level menu (editable fields keep the native menu)
+  const onBackgroundContextMenu = (e: ReactMouseEvent) => {
+    const target = e.target as HTMLElement;
+    if (target.closest("input, textarea, select, video, audio, [contenteditable='true']")) return;
+    const selection = window.getSelection()?.toString().trim() ?? "";
+    ctxMenu.open(e, [
+      selection && { label: "Copiar seleção", icon: Copy, shortcut: "Ctrl+C", onSelect: () => copy(selection, "Seleção") },
+      selection && { type: "separator" },
+      { label: "Paleta de comandos", icon: Command, shortcut: "Ctrl+K", onSelect: openPalette },
+      {
+        label: sidebarCollapsed ? "Expandir menu lateral" : "Recolher menu lateral",
+        icon: PanelLeft,
+        shortcut: "Ctrl+B",
+        onSelect: toggleSidebar,
+      },
+      { label: "Atalhos de teclado", icon: Keyboard, shortcut: "?", onSelect: openShortcuts },
+      { type: "separator" },
+      { type: "label", label: `Esquema de cores · ${themeLabel(theme)}` },
+      ...THEMES.map((t) => ({ label: t.label, checked: t.id === theme, onSelect: () => setTheme(t.id) })),
+      { type: "separator" },
+      { label: "Recarregar dados", icon: RefreshCw, onSelect: () => void bootstrapAll() },
+    ]);
+  };
+
+  const meta = ROUTE_MAP[route];
+
   return (
-    <div className="app-shell">
-      <header className="titlebar" data-tauri-drag-region>
-        <div className="titlebar-brand">
-          <span className="brand-mark">A</span>
-          <span>Aicut</span>
-          <span style={{ color: "var(--text-muted)", fontWeight: 400, fontSize: 12 }}>
-            v0.4.4 · Modular AI Studio
-          </span>
-        </div>
+    <div
+      className="app-shell"
+      data-sidebar={sidebarCollapsed ? "collapsed" : "expanded"}
+      onContextMenu={onBackgroundContextMenu}
+    >
+      <Topbar
+        route={route}
+        sidebarCollapsed={sidebarCollapsed}
+        sidebarLocked={sidebarLocked}
+        theme={theme}
+        onToggleSidebar={toggleSidebar}
+        onOpenPalette={openPalette}
+        onOpenShortcuts={openShortcuts}
+        onThemeChange={setTheme}
+      />
 
-        <div className="titlebar-meta">
-          <button
-            type="button"
-            className="status-chip"
-            style={{ cursor: "pointer" }}
-            onClick={() => setPaletteOpen(true)}
-            title="Abrir Paleta de Comandos (Ctrl+K)"
-          >
-            <Command size={12} /> Comandos <kbd style={{ opacity: 0.7 }}>Ctrl+K</kbd>
-          </button>
-          <button
-            type="button"
-            className="status-chip"
-            style={{ cursor: "pointer" }}
-            onClick={() => navigate("ai-connect")}
-          >
-            <span className={`status-dot ${connected ? "" : "offline"}`} />
-            {connected ? "IA Pronta · MCP :43210" : "Reconectando Core..."}
-          </button>
-        </div>
-      </header>
+      <Sidebar
+        route={route}
+        collapsed={sidebarCollapsed || sidebarLocked}
+        counts={navCounts}
+        onNavigate={navigate}
+        menuFor={(id) =>
+          id === "jobs"
+            ? [{ label: "Limpar finalizadas", icon: Trash2, onSelect: () => void clearFinishedJobs() }]
+            : id === "library"
+              ? [{ label: "Recarregar Biblioteca", icon: RefreshCw, onSelect: () => void refreshMedia() }]
+              : id === "settings"
+                ? [{ label: "Recarregar ferramentas", icon: RefreshCw, onSelect: () => void refreshTools() }]
+                : []
+        }
+      />
 
-      <div className="app-body">
-        <aside className="sidebar">
-          <nav className="nav-group" aria-label="Navegação Principal">
-            <div className="nav-label">Estúdio</div>
-            {navItems.map((item) => (
-              <button
-                key={item.id}
-                type="button"
-                className={`nav-item ${route === item.id ? "active" : ""}`}
-                onClick={() => navigate(item.id)}
-              >
-                {item.icon}
-                <span className="nav-text">{item.label}</span>
-                {item.badge !== undefined && (
-                  <span className={`nav-badge ${item.badgeAccent ? "accent" : ""}`}>
-                    {item.badge}
-                  </span>
-                )}
-              </button>
-            ))}
-          </nav>
-
-          <div className="sidebar-footer">
-            <button
-              type="button"
-              className={`nav-item ${route === "settings" ? "active" : ""}`}
-              onClick={() => navigate("settings")}
-            >
-              <Settings size={16} />
-              <span className="nav-text">Configurações</span>
-              {toolsNeedAttention > 0 && (
-                <span className="nav-badge accent" title="Ferramentas para instalar ou atualizar">
-                  {toolsNeedAttention}
-                </span>
-              )}
-            </button>
-          </div>
-        </aside>
-
-        <main className="main-viewport">
+      <main className="page-scroll" ref={scrollRef} aria-label={meta.title}>
+        <div className="page">
           {route === "ingest" && (
             <IngestView
               tools={tools}
@@ -410,10 +479,7 @@ export function App() {
               selectedMediaId={selectedMediaId}
               searchQuery={searchQuery}
               filterKind={filterKind}
-              onSelectMedia={(id) => {
-                setSelectedMediaId(id);
-                syncUi({ selected_media_id: id });
-              }}
+              onSelectMedia={selectMedia}
               onSearchChange={(q) => {
                 setSearchQuery(q);
                 syncUi({ search_query: q });
@@ -469,7 +535,7 @@ export function App() {
           )}
 
           {route === "jobs" && (
-            <JobsView jobs={jobs} onRefresh={refreshJobs} onNotify={pushToast} />
+            <JobsView jobs={jobs} onRefresh={refreshJobs} onClearFinished={clearFinishedJobs} onNotify={pushToast} />
           )}
 
           {route === "modules" && (
@@ -485,6 +551,8 @@ export function App() {
             <AiConnectView
               activity={activity}
               actionCount={actions.length}
+              connected={connected}
+              onNavigate={navigate}
               onNotify={pushToast}
             />
           )}
@@ -495,70 +563,32 @@ export function App() {
               tools={tools}
               workspace={workspace}
               theme={theme}
-              onToggleTheme={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+              onThemeChange={setTheme}
               onRefreshTools={refreshTools}
               onNotify={pushToast}
             />
           )}
-        </main>
-      </div>
-
-      {paletteOpen && (
-        <div className="modal-backdrop" onClick={() => setPaletteOpen(false)}>
-          <div
-            className="modal-card"
-            style={{ width: "min(520px, 92vw)", padding: 14, gap: 10 }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <input
-              autoFocus
-              className="input"
-              placeholder="Ir para aba ou comando..."
-              value={paletteQuery}
-              onChange={(e) => setPaletteQuery(e.target.value)}
-            />
-            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-              {paletteCommands.map((cmd) => (
-                <button
-                  key={cmd.label}
-                  type="button"
-                  className="nav-item"
-                  onClick={() => {
-                    cmd.run();
-                    setPaletteOpen(false);
-                  }}
-                >
-                  <span>{cmd.label}</span>
-                  <span className="nav-badge">{cmd.hint}</span>
-                </button>
-              ))}
-            </div>
-          </div>
         </div>
-      )}
+      </main>
 
-      {toasts.length > 0 && (
-        <div className="toast-stack" aria-live="polite">
-          {toasts.map((t) => (
-            <div key={t.id} className="toast">
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontWeight: 600, fontSize: 13 }}>{t.title}</div>
-                <div style={{ fontSize: 12.5, color: "var(--text-secondary)", marginTop: 2 }}>
-                  {t.message}
-                </div>
-              </div>
-              <button
-                type="button"
-                className="btn btn-ghost btn-sm"
-                style={{ padding: 4 }}
-                onClick={() => setToasts((prev) => prev.filter((x) => x.id !== t.id))}
-              >
-                <X size={13} />
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
+      <StatusBar
+        connected={connected}
+        serverUrl={getPublicServerUrl()}
+        activeJobs={activeJobsCount}
+        mediaCount={media.length}
+        toolsNeedAttention={toolsNeedAttention}
+        hardware={hardware}
+        onNavigate={navigate}
+        onOpenShortcuts={openShortcuts}
+        onOpenPalette={openPalette}
+        onClearFinished={() => void clearFinishedJobs()}
+        onRefreshTools={() => void refreshTools()}
+        onCopy={copy}
+      />
+
+      <CommandPalette open={paletteOpen} commands={paletteCommands} onClose={() => setPaletteOpen(false)} />
+      <ShortcutsDialog open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
+      <Toaster toasts={toasts} onDismiss={(id) => setToasts((prev) => prev.filter((t) => t.id !== id))} />
     </div>
   );
 }

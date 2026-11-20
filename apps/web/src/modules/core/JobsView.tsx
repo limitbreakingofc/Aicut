@@ -1,17 +1,60 @@
-import React, { useState } from "react";
-import { Bot, CheckCircle2, Clock, Trash2, User, XCircle } from "lucide-react";
+import React, { Fragment, useMemo, useState } from "react";
+import {
+  Activity,
+  Ban,
+  Bot,
+  ChevronRight,
+  CircleCheck,
+  CircleX,
+  Clock,
+  Copy,
+  RefreshCw,
+  ScrollText,
+  Trash2,
+  User,
+  type LucideIcon,
+} from "lucide-react";
 import { runAction } from "../../lib/client";
 import { formatBytes, formatDuration, formatRelativeDate, formatSpeed } from "../../lib/format";
-import type { JobRecord } from "../../lib/types";
+import type { JobRecord, JobStatus, NotifyFn } from "../../lib/types";
+import { copyToClipboard } from "../../lib/ui";
+import { pageMeta } from "../../app/navigation";
+import {
+  Callout,
+  EmptyState,
+  MoreButton,
+  PageHeader,
+  ProgressBar,
+  Spinner,
+  Tabs,
+  useContextMenu,
+  type MenuItems,
+} from "../../components";
+import "./core.css";
 
 interface JobsViewProps {
   jobs: JobRecord[];
   onRefresh: () => void;
-  onNotify: (level: "info" | "success" | "warning" | "error", title: string, message: string) => void;
+  onClearFinished: () => Promise<void>;
+  onNotify: NotifyFn;
 }
 
-export const JobsView: React.FC<JobsViewProps> = ({ jobs, onRefresh, onNotify }) => {
+type Filter = "all" | "active" | "completed" | "failed" | "cancelled";
+
+const STATUS_META: Record<JobStatus, { label: string; icon: LucideIcon; className: string }> = {
+  queued: { label: "na fila", icon: Clock, className: "muted" },
+  running: { label: "rodando", icon: Activity, className: "text-accent" },
+  completed: { label: "ok", icon: CircleCheck, className: "text-success" },
+  failed: { label: "falhou", icon: CircleX, className: "text-danger" },
+  cancelled: { label: "cancelado", icon: Ban, className: "text-warning" },
+};
+
+const isActive = (j: JobRecord) => j.status === "queued" || j.status === "running";
+
+export const JobsView: React.FC<JobsViewProps> = ({ jobs, onRefresh, onClearFinished, onNotify }) => {
+  const menu = useContextMenu();
   const [expandedLogs, setExpandedLogs] = useState<Record<string, boolean>>({});
+  const [filter, setFilter] = useState<Filter>("all");
 
   async function handleCancel(jobId: string) {
     try {
@@ -23,152 +66,217 @@ export const JobsView: React.FC<JobsViewProps> = ({ jobs, onRefresh, onNotify })
     }
   }
 
-  async function handleClearFinished() {
-    try {
-      const res = await runAction<{ removed_count: number }>("jobs.clear_finished");
-      onNotify("info", "Fila limpa", `${res.data.removed_count} tarefa(s) finalizada(s) removida(s).`);
-      onRefresh();
-    } catch (e) {
-      onNotify("error", "Erro ao limpar fila", (e as Error).message);
-    }
-  }
+  const counts = useMemo(
+    () => ({
+      all: jobs.length,
+      active: jobs.filter(isActive).length,
+      completed: jobs.filter((j) => j.status === "completed").length,
+      failed: jobs.filter((j) => j.status === "failed").length,
+      cancelled: jobs.filter((j) => j.status === "cancelled").length,
+    }),
+    [jobs],
+  );
+
+  const visible = jobs.filter((j) =>
+    filter === "all" ? true : filter === "active" ? isActive(j) : j.status === filter,
+  );
+
+  const toggleLogs = (id: string) => setExpandedLogs((p) => ({ ...p, [id]: !p[id] }));
+
+  const jobMenu = (job: JobRecord): MenuItems => [
+    { type: "label", label: `${job.kind} · ${job.id.slice(0, 8)}` },
+    isActive(job) && { label: "Cancelar tarefa", icon: Ban, danger: true, onSelect: () => void handleCancel(job.id) },
+    job.logs.length > 0 && {
+      label: expandedLogs[job.id] ? "Ocultar logs" : `Ver logs (${job.logs.length})`,
+      icon: ScrollText,
+      onSelect: () => toggleLogs(job.id),
+    },
+    { type: "separator" },
+    { label: "Copiar ID", icon: Copy, onSelect: () => void copyToClipboard(job.id, onNotify, "ID da tarefa") },
+    job.logs.length > 0 && {
+      label: "Copiar logs",
+      icon: Copy,
+      onSelect: () => void copyToClipboard(job.logs.join("\n"), onNotify, "Logs"),
+    },
+    job.error && {
+      label: "Copiar erro",
+      icon: Copy,
+      onSelect: () =>
+        void copyToClipboard(
+          `${job.error?.code}: ${job.error?.message}${job.error?.hint ? `\nDica: ${job.error.hint}` : ""}`,
+          onNotify,
+          "Erro",
+        ),
+    },
+    { type: "separator" },
+    { label: "Limpar finalizadas", icon: Trash2, onSelect: () => void onClearFinished() },
+  ];
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
-      <div className="page-header">
-        <div>
-          <h1 className="page-title">Fila de Tarefas</h1>
-          <p className="page-subtitle">
-            Acompanhe downloads, importações e atualizações disparados por você ou por qualquer chat de IA em tempo real.
-          </p>
-        </div>
-        <button type="button" className="btn" onClick={handleClearFinished}>
-          <Trash2 size={14} /> Limpar Finalizadas
-        </button>
-      </div>
+    <>
+      <PageHeader
+        {...pageMeta("jobs")}
+        actions={
+          <>
+            <button type="button" className="btn btn-sm" onClick={onRefresh}>
+              <RefreshCw aria-hidden /> Atualizar
+            </button>
+            <button type="button" className="btn btn-sm" onClick={() => void onClearFinished()}>
+              <Trash2 aria-hidden /> Limpar finalizadas
+            </button>
+          </>
+        }
+      />
 
-      {jobs.length === 0 ? (
-        <div className="panel" style={{ textAlign: "center", padding: "44px 20px", color: "var(--text-secondary)" }}>
-          Nenhuma tarefa na fila no momento.
+      <Tabs
+        ariaLabel="Filtrar tarefas"
+        value={filter}
+        onChange={setFilter}
+        items={[
+          { id: "all", label: "Todas", count: counts.all },
+          { id: "active", label: "Em andamento", count: counts.active },
+          { id: "completed", label: "Concluídas", count: counts.completed },
+          { id: "failed", label: "Com falha", count: counts.failed },
+          { id: "cancelled", label: "Canceladas", count: counts.cancelled },
+        ]}
+      />
+
+      {visible.length === 0 ? (
+        <div className="panel">
+          <EmptyState
+            icon={Activity}
+            title={jobs.length === 0 ? "nenhuma tarefa na fila" : "nada neste filtro"}
+            description="Downloads, importações, transcrições e renderizações — suas ou de qualquer IA — aparecem aqui em tempo real."
+          />
         </div>
       ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          {jobs.map((job) => {
-            const isActive = job.status === "queued" || job.status === "running";
-            const statusClass =
-              job.status === "completed"
-                ? "success"
-                : job.status === "failed"
-                  ? "danger"
-                  : job.status === "cancelled"
-                    ? "warning"
-                    : "accent";
-            const showLogs = Boolean(expandedLogs[job.id]);
-
-            return (
-              <div key={job.id} className="panel" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
-                    {job.status === "completed" ? (
-                      <CheckCircle2 size={17} color="var(--success)" />
-                    ) : job.status === "failed" ? (
-                      <XCircle size={17} color="var(--danger)" />
-                    ) : (
-                      <Clock size={17} color="var(--accent)" />
-                    )}
-                    <div style={{ minWidth: 0 }}>
-                      <div style={{ fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {job.title}
-                      </div>
-                      <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
-                        {job.kind} · {formatRelativeDate(job.created_at)}
-                      </div>
-                    </div>
-                  </div>
-
-                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <span className="pill">
-                      {job.actor === "ai" ? <Bot size={11} /> : <User size={11} />}
-                      {job.actor === "ai" ? "IA" : "Humano"}
-                    </span>
-                    <span className={`pill ${statusClass}`}>{job.status}</span>
-                    {isActive && (
-                      <button
-                        type="button"
-                        className="btn btn-danger btn-sm"
-                        onClick={() => handleCancel(job.id)}
-                      >
-                        Cancelar
-                      </button>
-                    )}
-                  </div>
-                </div>
-
-                <div className="progress-track">
-                  <div
-                    className={`progress-fill ${job.status === "completed" ? "success" : job.status === "failed" ? "danger" : ""}`}
-                    style={{ width: `${Math.min(100, Math.max(0, job.progress.percent))}%` }}
-                  />
-                </div>
-
-                <div
-                  style={{
-                    display: "flex",
-                    flexWrap: "wrap",
-                    justifyContent: "space-between",
-                    fontSize: 12.5,
-                    color: "var(--text-secondary)",
-                    gap: 8,
-                  }}
-                >
-                  <span>
-                    {job.progress.percent.toFixed(1)}% · {job.progress.stage}
-                    {job.progress.message ? ` — ${job.progress.message}` : ""}
-                  </span>
-                  <span style={{ fontFamily: "var(--font-mono)" }}>
-                    {job.progress.downloaded_bytes ? formatBytes(job.progress.downloaded_bytes) : ""}
-                    {job.progress.total_bytes ? ` / ${formatBytes(job.progress.total_bytes)}` : ""}
-                    {job.progress.speed_bytes_per_sec ? ` · ${formatSpeed(job.progress.speed_bytes_per_sec)}` : ""}
-                    {job.progress.eta_seconds ? ` · ETA ${formatDuration(job.progress.eta_seconds)}` : ""}
-                  </span>
-                </div>
-
-                {job.error && (
-                  <div
-                    style={{
-                      padding: "8px 11px",
-                      borderRadius: "var(--radius-sm)",
-                      background: "var(--danger-soft)",
-                      color: "var(--danger)",
-                      fontSize: 12.5,
-                    }}
-                  >
-                    <strong>{job.error.code}:</strong> {job.error.message}
-                    {job.error.hint && <div style={{ marginTop: 3, opacity: 0.9 }}>Dica: {job.error.hint}</div>}
-                  </div>
-                )}
-
-                {job.logs.length > 0 && (
-                  <div>
-                    <button
-                      type="button"
-                      className="btn btn-ghost btn-sm"
-                      onClick={() => setExpandedLogs((p) => ({ ...p, [job.id]: !p[job.id] }))}
+        <div className="table-wrap">
+          <table className="table jobs-table">
+            <thead>
+              <tr>
+                <th className="col-fit" aria-label="Expandir" />
+                <th className="col-fit">status</th>
+                <th>tarefa</th>
+                <th className="col-fit">ator</th>
+                <th className="progress-col">progresso</th>
+                <th className="col-fit num c-xfer">transferido</th>
+                <th className="col-fit num c-speed">velocidade</th>
+                <th className="col-fit num">eta</th>
+                <th className="col-fit c-created">criada</th>
+                <th className="col-fit" aria-label="Ações" />
+              </tr>
+            </thead>
+            <tbody>
+              {visible.map((job) => {
+                const status = STATUS_META[job.status];
+                const open = Boolean(expandedLogs[job.id]);
+                const hasDetails = job.logs.length > 0;
+                const tone =
+                  job.status === "completed"
+                    ? "success"
+                    : job.status === "failed"
+                      ? "danger"
+                      : job.status === "cancelled"
+                        ? "warning"
+                        : "accent";
+                return (
+                  <Fragment key={job.id}>
+                    <tr
+                      data-clickable={hasDetails || undefined}
+                      aria-expanded={hasDetails ? open : undefined}
+                      onClick={() => hasDetails && toggleLogs(job.id)}
+                      onContextMenu={(e) => menu.open(e, jobMenu(job))}
                     >
-                      {showLogs ? "Ocultar logs" : `Ver logs (${job.logs.length})`}
-                    </button>
-                    {showLogs && (
-                      <pre className="code-block" style={{ marginTop: 8, maxHeight: 180 }}>
-                        {job.logs.join("\n")}
-                      </pre>
+                      <td className="col-fit">
+                        {hasDetails && (
+                          <ChevronRight size={14} className="expand-chevron" data-open={open || undefined} aria-hidden />
+                        )}
+                      </td>
+                      <td className="col-fit">
+                        <span className={`job-status ${status.className}`}>
+                          {job.status === "running" ? <Spinner size={13} /> : <status.icon size={13} aria-hidden />}
+                          {status.label}
+                        </span>
+                      </td>
+                      <td className="cell-title" title={job.title}>
+                        <div className="truncate">{job.title}</div>
+                        <div className="muted text-xs truncate">
+                          {job.kind} · {job.id.slice(0, 8)}
+                        </div>
+                      </td>
+                      <td className="col-fit">
+                        <span className={job.actor === "ai" ? "actor text-magenta" : "actor"}>
+                          {job.actor === "ai" ? <Bot size={12} aria-hidden /> : <User size={12} aria-hidden />}
+                          {job.actor === "ai" ? "ia" : "humano"}
+                        </span>
+                      </td>
+                      <td className="progress-col">
+                        <div className="job-progress">
+                          <ProgressBar
+                            value={job.progress.percent}
+                            tone={tone}
+                            active={job.status === "running"}
+                            size="sm"
+                            label={`Progresso de ${job.title}`}
+                          />
+                          <span className="job-percent">{job.progress.percent.toFixed(1)}%</span>
+                        </div>
+                        <div className="muted text-xs truncate" title={job.progress.message ?? job.progress.stage}>
+                          {job.progress.stage}
+                          {job.progress.message ? ` — ${job.progress.message}` : ""}
+                        </div>
+                      </td>
+                      <td className="col-fit num c-xfer">
+                        {job.progress.downloaded_bytes ? formatBytes(job.progress.downloaded_bytes) : "—"}
+                        {job.progress.total_bytes ? <span className="muted"> / {formatBytes(job.progress.total_bytes)}</span> : null}
+                      </td>
+                      <td className="col-fit num c-speed">
+                        {job.progress.speed_bytes_per_sec ? formatSpeed(job.progress.speed_bytes_per_sec) : "—"}
+                      </td>
+                      <td className="col-fit num">{job.progress.eta_seconds ? formatDuration(job.progress.eta_seconds) : "—"}</td>
+                      <td className="col-fit muted c-created">{formatRelativeDate(job.created_at)}</td>
+                      <td className="col-fit" onClick={(e) => e.stopPropagation()}>
+                        <span className="row gap-xs">
+                          {isActive(job) && (
+                            <button type="button" className="btn btn-danger btn-xs" onClick={() => handleCancel(job.id)}>
+                              Cancelar
+                            </button>
+                          )}
+                          <MoreButton items={() => jobMenu(job)} />
+                        </span>
+                      </td>
+                    </tr>
+                    {(job.error || (open && hasDetails)) && (
+                      <tr className="job-details">
+                        <td colSpan={10}>
+                          <div className="stack stack-sm">
+                            {job.error && (
+                              <Callout tone="danger" title={job.error.code}>
+                                {job.error.message}
+                                {job.error.hint && <div className="muted">dica: {job.error.hint}</div>}
+                              </Callout>
+                            )}
+                            {open && hasDetails && (
+                              <div className="term job-log">
+                                {job.logs.map((line, i) => (
+                                  <div key={i} className="term-line">
+                                    <span className="term-time">{String(i + 1).padStart(3, "0")}</span>
+                                    <span>{line}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
                     )}
-                  </div>
-                )}
-              </div>
-            );
-          })}
+                  </Fragment>
+                );
+              })}
+            </tbody>
+          </table>
         </div>
       )}
-    </div>
+    </>
   );
 };

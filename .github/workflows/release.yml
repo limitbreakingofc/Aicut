@@ -81,6 +81,15 @@ jobs:
           body: |
             ## Aicut ${{ steps.tag.outputs.name }} — Estúdio Modular AI-First para Windows 11
 
+            ### Novidades da v0.4.5 — Nova Interface Estilo Terminal Moderno
+            - **Visual de terminal moderno, em largura total**: tipografia mono (Cascadia Code / JetBrains Mono), painéis com bordas finas e cabeçalhos estilo TUI, tabelas densas no estilo `ls -la`, barra de progresso em blocos e barra de status inferior clicável (estado do core MCP, tarefas, mídias, ferramentas e GPU).
+            - **Menus de botão direito em todo o app**: mídias (abrir, transcrever, cortes, copiar caminho/ID, mover para a Lixeira), seleção múltipla em lote, tarefas (cancelar, logs, copiar erro), transcrições (exportar em qualquer formato), falas, cortes, modelos, ferramentas, módulos, atividade e caminhos do workspace — com navegação por teclado e botões `⋯` equivalentes.
+            - **Atalhos de teclado**: `Ctrl+K` paleta de comandos, `Alt+1…8` troca de tela, `Ctrl+B` recolhe o menu lateral, `?` mostra todos os atalhos; na Biblioteca `/` busca, `↑ ↓` navega, `Espaço`/`Ctrl+clique` seleciona, `Ctrl+A` seleciona tudo e `Del` move para a Lixeira.
+            - **Biblioteca reorganizada**: lista densa com miniaturas (ou grade), colunas que se adaptam à largura, inspetor encaixado e redimensionável, abas Biblioteca/Lixeira e barra de ações em lote — mantendo toda a Lixeira e a seleção múltipla da v0.4.4.
+            - **Telas reorganizadas**: Baixar & Importar com tabela de formatos estilo `yt-dlp -F` e painel "Comando" com o JSON exato enviado ao core; Transcrever em abas (nova transcrição · transcrições · modelos); Cortes Shorts com seletor visual de enquadramento 9:16 e medidores de pontuação; Fila de Tarefas estilo monitor de processos; feed de atividade das IAs estilo `tail -f`.
+            - **4 esquemas de cor**: Noite (padrão), Fósforo, Âmbar e Claro.
+            - **Correções**: indicador de conexão não fica mais preso em "Reconectando" após recarregar a interface; ícones de carregamento agora giram; painéis da tela de Cortes que apareciam sem fundo/borda.
+
             ### Novidades da v0.4.4 — Seleção Múltipla, "Selecionar Tudo" e Lixeira da Biblioteca
             - **Seleção Múltipla & "Selecionar Tudo" na Biblioteca**: marque vários arquivos (ou todos os filtrados com 1 clique) para **Mover para a Lixeira** ou **Apagar Permanentemente do Disco** em lote, exibindo exatamente quantos MB/GB foram liberados.
             - **Lixeira da Biblioteca (`media.trash_list`, `media.restore`, `media.trash_empty`, `media.bulk_delete`)**: arquivos removidos sem exclusão permanente do disco agora ficam salvos na aba **Lixeira** dentro da Biblioteca (com contador e espaço ocupado), permitindo **Restaurar** com 1 clique, **Excluir selecionados permanentemente** ou **Esvaziar Lixeira**.

@@ -1,22 +1,23 @@
 import React, { useEffect, useMemo, useState } from "react";
 import {
-  AlertTriangle,
   ArrowRight,
   Award,
+  Captions,
   Check,
-  CheckCircle2,
+  CircleCheck,
+  Copy,
   Cpu,
   Download,
   FileCode2,
   FileText,
-  Film,
   HardDrive,
-  Loader2,
+  Layers,
+  ListVideo,
   Mic,
-  Play,
+  Search,
   Sparkles,
-  Subtitles,
   Trash2,
+  TriangleAlert,
 } from "lucide-react";
 import { AicutActionError, runAction } from "../../lib/client";
 import { formatBytes, formatDuration, formatRelativeDate } from "../../lib/format";
@@ -25,11 +26,33 @@ import type {
   HardwareProfile,
   JobRecord,
   MediaAsset,
+  NotifyFn,
   RouteId,
   ToolStatus,
   TranscriptRecord,
+  TranscriptSegment,
   WhisperModelStatus,
 } from "../../lib/types";
+import { copyToClipboard, normalizeSearch, storage } from "../../lib/ui";
+import { pageMeta } from "../../app/navigation";
+import {
+  ActiveJobsPanel,
+  Badge,
+  BusyIcon,
+  Callout,
+  Checkbox,
+  ChoiceCards,
+  EmptyState,
+  Field,
+  MoreButton,
+  PageHeader,
+  Panel,
+  Switch,
+  Tabs,
+  useContextMenu,
+  type MenuItems,
+} from "../../components";
+import "./transcribe.css";
 
 interface TranscribeViewProps {
   media: MediaAsset[];
@@ -38,10 +61,12 @@ interface TranscribeViewProps {
   hardware: HardwareProfile | null;
   preselectedMediaId?: string | null;
   onNavigate: (route: RouteId) => void;
-  onNotify: (level: "info" | "success" | "warning" | "error", title: string, message: string) => void;
+  onNotify: NotifyFn;
   onRefreshTools: () => Promise<void>;
   onRefreshMedia: () => Promise<void>;
 }
+
+type TabId = "new" | "results" | "models";
 
 const LANGUAGES = [
   { code: "auto", label: "Detectar idioma automaticamente" },
@@ -54,6 +79,14 @@ const LANGUAGES = [
   { code: "ja", label: "Japonês (ja)" },
 ];
 
+const FORMAT_GROUPS = [
+  { category: "subtitle", label: "Legendas", icon: Captions },
+  { category: "timeline", label: "Timelines", icon: FileCode2 },
+  { category: "transcript", label: "Texto / IA", icon: FileText },
+] as const;
+
+const timecode = (seg: TranscriptSegment) => `${formatDuration(seg.start_ms / 1000)} → ${formatDuration(seg.end_ms / 1000)}`;
+
 export const TranscribeView: React.FC<TranscribeViewProps> = ({
   media,
   tools,
@@ -65,13 +98,11 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
   onRefreshTools,
   onRefreshMedia,
 }) => {
-  const playableMedia = media.filter(
-    (m) => m.kind === "video" || m.kind === "video_only" || m.kind === "audio",
-  );
+  const menu = useContextMenu();
+  const playableMedia = media.filter((m) => m.kind === "video" || m.kind === "video_only" || m.kind === "audio");
 
-  const [selectedMediaId, setSelectedMediaId] = useState<string>(
-    preselectedMediaId ?? playableMedia[0]?.id ?? "",
-  );
+  const [tab, setTab] = useState<TabId>("new");
+  const [selectedMediaId, setSelectedMediaId] = useState<string>(preselectedMediaId ?? playableMedia[0]?.id ?? "");
   const [models, setModels] = useState<WhisperModelStatus[]>([]);
   const [totalInstalledBytes, setTotalInstalledBytes] = useState<number>(0);
   const [showAllModels, setShowAllModels] = useState(false);
@@ -80,9 +111,7 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
   const [familySelection, setFamilySelection] = useState<Record<string, string>>({});
 
   // Globally active model version used for transcription
-  const [selectedModel, setSelectedModel] = useState<string>(() => {
-    return localStorage.getItem("aicut_whisper_model") ?? "";
-  });
+  const [selectedModel, setSelectedModel] = useState<string>(() => storage.get("aicut_whisper_model") ?? "");
 
   const [formats, setFormats] = useState<ExportFormatInfo[]>([]);
   const [transcripts, setTranscripts] = useState<TranscriptRecord[]>([]);
@@ -115,7 +144,7 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
 
   const chooseActiveModel = (modelId: string) => {
     setSelectedModel(modelId);
-    localStorage.setItem("aicut_whisper_model", modelId);
+    storage.set("aicut_whisper_model", modelId);
     void runAction("system.set_setting", {
       key: "default_whisper_model",
       value: modelId,
@@ -186,9 +215,7 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
       (j.kind === "transcribe.run" || j.kind === "transcribe.model_download") &&
       (j.status === "queued" || j.status === "running"),
   );
-  const completedTranscribeCount = jobs.filter(
-    (j) => j.kind === "transcribe.run" && j.status === "completed",
-  ).length;
+  const completedTranscribeCount = jobs.filter((j) => j.kind === "transcribe.run" && j.status === "completed").length;
 
   useEffect(() => {
     if (completedTranscribeCount > 0) {
@@ -199,9 +226,7 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
 
   // Group visible models by family (default: ONLY curated hardware-compatible best models + any already installed!)
   const visibleFamilies = useMemo(() => {
-    const visible = showAllModels
-      ? models
-      : models.filter((m) => m.curated_for_hardware || m.installed);
+    const visible = showAllModels ? models : models.filter((m) => m.curated_for_hardware || m.installed);
 
     const groups: Array<{
       familyId: string;
@@ -291,9 +316,7 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
   }
 
   function toggleFormat(fmtId: string) {
-    setSelectedFormats((prev) =>
-      prev.includes(fmtId) ? prev.filter((x) => x !== fmtId) : [...prev, fmtId],
-    );
+    setSelectedFormats((prev) => (prev.includes(fmtId) ? prev.filter((x) => x !== fmtId) : [...prev, fmtId]));
   }
 
   async function handleStartTranscription(e: React.FormEvent) {
@@ -321,10 +344,7 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
         `Job ${res.data.job_id.slice(0, 8)} usando ${chosenModelObj?.display_name ?? selectedModel}.`,
       );
     } catch (e) {
-      const msg =
-        e instanceof AicutActionError && e.detail.hint
-          ? `${e.message} — ${e.detail.hint}`
-          : (e as Error).message;
+      const msg = e instanceof AicutActionError && e.detail.hint ? `${e.message} — ${e.detail.hint}` : (e as Error).message;
       onNotify("error", "Não foi possível iniciar transcrição", msg);
     } finally {
       setStarting(false);
@@ -361,623 +381,401 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
   const activeTranscript = transcripts.find((t) => t.id === activeTranscriptId) ?? transcripts[0] ?? null;
   const chosenModelObj = models.find((m) => m.id === selectedModel);
 
-  const subtitleFormats = formats.filter((f) => f.category === "subtitle");
-  const timelineFormats = formats.filter((f) => f.category === "timeline");
-  const transcriptFormats = formats.filter((f) => f.category === "transcript");
-
   const gpuSummary = hardware
     ? hardware.gpus.length > 0
       ? `${hardware.gpus[0].name}${hardware.gpus[0].vram_mb ? ` (${(hardware.gpus[0].vram_mb / 1024).toFixed(1)} GB VRAM)` : ""}${hardware.cuda_version ? ` · CUDA ${hardware.cuda_version}` : ""}`
       : `CPU ${hardware.cpu_brand} (${(hardware.total_memory_mb / 1024).toFixed(1)} GB RAM)`
     : "Detectando hardware...";
 
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
-      <div className="page-header">
-        <div>
-          <h1 className="page-title">Transcrever com IA Local (Whisper)</h1>
-          <p className="page-subtitle">
-            Modelos filtrados automaticamente para sua GPU e hardware — troque versões/precisões comparando a qualidade final e desinstale modelos completamente quando quiser.
-          </p>
-        </div>
-        <button type="button" className="btn" onClick={() => onNavigate("library")}>
-          Ver Biblioteca <ArrowRight size={14} />
-        </button>
-      </div>
+  const visibleSegments = useMemo(() => {
+    if (!activeTranscript) return [];
+    const q = normalizeSearch(searchSeg.trim());
+    return q ? activeTranscript.segments.filter((s) => normalizeSearch(s.text).includes(q)) : activeTranscript.segments;
+  }, [activeTranscript, searchSeg]);
 
-      {/* Engine status banner if whisper.cpp or ffmpeg is missing */}
-      {(!whisperTool?.installed || !ffmpegTool?.installed) && tools.length > 0 && (
-        <div
-          className="panel"
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: 14,
-            background: "var(--warning-soft)",
-            borderColor: "rgba(251, 191, 36, 0.3)",
-            padding: "12px 16px",
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <AlertTriangle size={18} color="var(--warning)" />
-            <div>
-              <strong style={{ fontSize: 13.5 }}>Motor de IA Local pendente</strong>
-              <div style={{ fontSize: 12.5, color: "var(--text-secondary)" }}>
-                {!whisperTool?.installed
-                  ? `whisper.cpp não instalado. Build ideal detectada: ${whisperTool?.recommended_build ?? "auto"}.`
-                  : "FFmpeg necessário para extrair o áudio do vídeo."}
-              </div>
-            </div>
-          </div>
-          <div style={{ display: "flex", gap: 8 }}>
-            {!whisperTool?.installed && (
-              <button
-                type="button"
-                className="btn btn-primary btn-sm"
-                disabled={installingEngine}
-                onClick={handleInstallWhisperEngine}
-              >
-                {installingEngine ? <Loader2 size={14} /> : <Download size={14} />}
-                Instalar whisper.cpp Agora
+  /* ---------- Context menus ---------- */
+  const transcriptMenu = (t: TranscriptRecord): MenuItems => [
+    { type: "label", label: t.media_title },
+    { label: "Abrir transcrição", icon: FileText, onSelect: () => setActiveTranscriptId(t.id) },
+    {
+      label: "Copiar texto completo",
+      icon: Copy,
+      onSelect: () => void copyToClipboard(t.full_text || t.segments.map((s) => s.text).join(" "), onNotify, "Texto"),
+    },
+    { label: "Copiar ID", icon: Copy, onSelect: () => void copyToClipboard(t.id, onNotify, "ID da transcrição") },
+    { type: "separator" },
+    { type: "label", label: "Salvar na Biblioteca como" },
+    ...formats.map((f) => ({
+      label: f.name,
+      icon: f.category === "subtitle" ? Captions : f.category === "timeline" ? FileCode2 : FileText,
+      disabled: exportingFmt !== null,
+      onSelect: () => void handleQuickExport(t.id, f.id),
+    })),
+    { type: "separator" },
+    { label: "Excluir transcrição", icon: Trash2, danger: true, onSelect: () => void handleDeleteTranscript(t.id) },
+  ];
+
+  const segmentMenu = (seg: TranscriptSegment): MenuItems => [
+    { type: "label", label: timecode(seg) },
+    { label: "Copiar fala", icon: Copy, onSelect: () => void copyToClipboard(seg.text, onNotify, "Fala") },
+    {
+      label: "Copiar com timecode",
+      icon: Copy,
+      onSelect: () => void copyToClipboard(`[${timecode(seg)}] ${seg.text}`, onNotify, "Fala com timecode"),
+    },
+    {
+      label: "Copiar início (segundos)",
+      icon: Copy,
+      onSelect: () => void copyToClipboard((seg.start_ms / 1000).toFixed(2), onNotify, "Início"),
+    },
+  ];
+
+  const modelMenu = (m: WhisperModelStatus): MenuItems => [
+    { type: "label", label: m.display_name },
+    m.installed && {
+      label: selectedModel === m.id ? "Em uso para transcrever" : "Usar esta versão",
+      icon: CircleCheck,
+      disabled: selectedModel === m.id,
+      onSelect: () => chooseActiveModel(m.id),
+    },
+    !m.installed && {
+      label: `Baixar (${m.size_mb} MB)`,
+      icon: Download,
+      disabled: downloadingModel === m.id,
+      onSelect: () => void handleDownloadModel(m),
+    },
+    m.file_path && {
+      label: "Copiar caminho do modelo",
+      icon: Copy,
+      onSelect: () => void copyToClipboard(m.file_path ?? "", onNotify, "Caminho do modelo"),
+    },
+    m.installed && { type: "separator" },
+    m.installed && {
+      label: "Desinstalar completamente",
+      icon: Trash2,
+      danger: true,
+      disabled: uninstallingModel === m.id,
+      onSelect: () => void handleUninstallModel(m),
+    },
+  ];
+
+  const engineMissing = (!whisperTool?.installed || !ffmpegTool?.installed) && tools.length > 0;
+
+  return (
+    <>
+      <PageHeader
+        {...pageMeta("transcribe")}
+        actions={
+          <button type="button" className="btn btn-sm" onClick={() => onNavigate("library")}>
+            Biblioteca <ArrowRight aria-hidden />
+          </button>
+        }
+      />
+
+      {engineMissing && (
+        <Callout
+          tone="warning"
+          title="Motor de IA local pendente"
+          actions={
+            <>
+              {!whisperTool?.installed && (
+                <button
+                  type="button"
+                  className="btn btn-primary btn-sm"
+                  disabled={installingEngine}
+                  onClick={handleInstallWhisperEngine}
+                >
+                  <BusyIcon busy={installingEngine} icon={Download} size={13} />
+                  Instalar whisper.cpp
+                </button>
+              )}
+              <button type="button" className="btn btn-sm" onClick={() => onNavigate("settings")}>
+                Configurações
               </button>
-            )}
-            <button type="button" className="btn btn-sm" onClick={() => onNavigate("settings")}>
-              Configurações
-            </button>
-          </div>
-        </div>
+            </>
+          }
+        >
+          {!whisperTool?.installed
+            ? `whisper.cpp não instalado. Build ideal detectada: ${whisperTool?.recommended_build ?? "auto"}.`
+            : "FFmpeg necessário para extrair o áudio do vídeo."}
+        </Callout>
       )}
 
+      <Tabs
+        ariaLabel="Seções de transcrição"
+        value={tab}
+        onChange={setTab}
+        items={[
+          { id: "new", label: "Nova transcrição", icon: Mic },
+          { id: "results", label: "Transcrições", icon: ListVideo, count: transcripts.length },
+          { id: "models", label: "Modelos", icon: Layers, count: installedModels.length },
+        ]}
+      />
+
       {/* ================================================================ */}
-      {/* GPU-CURATED MODEL & VERSION MANAGER                              */}
+      {/* NEW TRANSCRIPTION                                                */}
       {/* ================================================================ */}
-      <div className="panel" style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-        <div
-          style={{
-            display: "flex",
-            flexWrap: "wrap",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: 10,
-          }}
-        >
-          <div>
-            <h2 className="panel-title">
-              <Cpu size={16} color="var(--accent)" /> Modelos Compatíveis com seu Hardware
-            </h2>
-            <div style={{ fontSize: 12.5, color: "var(--text-secondary)", marginTop: 3 }}>
-              {gpuSummary}
-            </div>
-          </div>
-
-          <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
-            <span className="pill">
-              <HardDrive size={11} /> Instalados: {installedModels.length} ({formatBytes(totalInstalledBytes)})
-            </span>
-            <label className="check-row" style={{ fontSize: 12.5 }}>
-              <input
-                type="checkbox"
-                checked={showAllModels}
-                onChange={(e) => setShowAllModels(e.target.checked)}
-              />
-              Mostrar todos (incl. incompatíveis)
-            </label>
-          </div>
-        </div>
-
-        {/* Active installed models quick-switcher strip */}
-        {installedModels.length > 0 && (
-          <div
-            style={{
-              display: "flex",
-              flexWrap: "wrap",
-              alignItems: "center",
-              gap: 8,
-              padding: "10px 12px",
-              borderRadius: "var(--radius-md)",
-              background: "var(--bg-elevated)",
-              border: "1px solid var(--border-subtle)",
-            }}
-          >
-            <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text-secondary)" }}>
-              Modelo ativo para transcrever:
-            </span>
-            {installedModels.map((m) => (
-              <button
-                key={m.id}
-                type="button"
-                className={`btn btn-sm ${selectedModel === m.id ? "btn-primary" : ""}`}
-                onClick={() => chooseActiveModel(m.id)}
-              >
-                {selectedModel === m.id && <Check size={12} />}
-                {m.display_name}
-              </button>
-            ))}
-          </div>
-        )}
-
-        {/* Family Cards with Interactive Version Switcher + Final Quality Comparison */}
-        <div className="grid-2">
-          {visibleFamilies.map((fam) => {
-            const viewedId = familySelection[fam.familyId] ?? fam.versions[0]?.id;
-            const current =
-              fam.versions.find((v) => v.id === viewedId) ?? fam.versions[0];
-            if (!current) return null;
-
-            const isActiveForUse = selectedModel === current.id && current.installed;
-            const isDownloading = downloadingModel === current.id;
-            const isUninstalling = uninstallingModel === current.id;
-
-            return (
-              <div
-                key={fam.familyId}
-                style={{
-                  padding: 15,
-                  borderRadius: "var(--radius-md)",
-                  background: isActiveForUse ? "var(--accent-soft)" : "var(--bg-elevated)",
-                  border: `1px solid ${isActiveForUse ? "var(--accent-border)" : "var(--border-subtle)"}`,
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: 11,
-                }}
-              >
-                {/* Family Header */}
-                <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8 }}>
-                  <div>
-                    <strong style={{ fontSize: 14.5 }}>{fam.familyName}</strong>
-                    <div style={{ fontSize: 12, color: "var(--text-secondary)", marginTop: 2 }}>
-                      {current.description}
-                    </div>
-                  </div>
-                  <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
-                    {current.best_quality_for_hardware && (
-                      <span className="pill success">
-                        <Award size={11} /> Maior Qualidade Final
-                      </span>
-                    )}
-                    {current.recommended && (
-                      <span className="pill accent">Recomendado p/ sua GPU</span>
-                    )}
-                  </div>
-                </div>
-
-                {/* Version / Quantization Switcher Pills */}
-                <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-                  <span style={{ fontSize: 11.5, color: "var(--text-muted)", fontWeight: 600 }}>
-                    Versão / Precisão ({fam.versions.length} disponível(is)):
+      {tab === "new" && (
+        <form onSubmit={handleStartTranscription} className="split">
+          <div className="split-main">
+            <Panel
+              title="Transcrever vídeo / áudio"
+              icon={Mic}
+              footer={
+                <>
+                  <span className="secondary text-sm">
+                    {chosenModelObj && !chosenModelObj.installed
+                      ? "Baixe uma versão de modelo compatível na aba Modelos antes de iniciar."
+                      : `${selectedFormats.length} formato(s) serão salvos automaticamente na Biblioteca.`}
                   </span>
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                    {fam.versions.map((ver) => {
-                      const activeTab = ver.id === current.id;
-                      return (
-                        <button
-                          key={ver.id}
-                          type="button"
-                          className={`btn btn-sm ${activeTab ? "btn-primary" : ""}`}
-                          style={{ fontSize: 12 }}
-                          onClick={() => {
-                            setFamilySelection((prev) => ({
-                              ...prev,
-                              [fam.familyId]: ver.id,
-                            }));
-                            if (ver.installed) {
-                              chooseActiveModel(ver.id);
-                            }
-                          }}
-                        >
-                          {ver.installed && (
-                            <span
-                              style={{
-                                width: 6,
-                                height: 6,
-                                borderRadius: "50%",
-                                background: activeTab ? "var(--accent-fg)" : "var(--success)",
-                              }}
-                            />
-                          )}
-                          {ver.version_tag}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                {/* Explicit Quality & Hardware Comparison Details */}
-                <div
-                  style={{
-                    padding: "10px 12px",
-                    borderRadius: "var(--radius-sm)",
-                    background: "var(--bg-surface)",
-                    border: "1px solid var(--border-subtle)",
-                    display: "flex",
-                    flexDirection: "column",
-                    gap: 6,
-                    fontSize: 12.5,
-                  }}
-                >
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                    <span className="pill accent">Qualidade: {current.quality_tier}</span>
-                    <span className="pill">{current.speed_tier}</span>
-                    <span className="pill">{current.size_mb} MB</span>
-                    <span className="pill">
-                      VRAM mín: {(current.min_vram_mb / 1024).toFixed(1)} GB
-                    </span>
-                  </div>
-                  <div style={{ color: "var(--text-primary)", lineHeight: 1.45 }}>
-                    <strong>Qualidade final:</strong> {current.quality_notes}
-                  </div>
-                  <div
-                    style={{
-                      fontSize: 12,
-                      color: current.compatible ? "var(--success)" : "var(--danger)",
-                    }}
-                  >
-                    {current.compatibility_reason}
-                  </div>
-                </div>
-
-                {/* Actions: Download / Select Active / Complete Uninstall */}
-                <div
-                  style={{
-                    display: "flex",
-                    flexWrap: "wrap",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    gap: 8,
-                    marginTop: "auto",
-                    paddingTop: 4,
-                  }}
-                >
-                  {current.installed ? (
-                    <>
-                      <button
-                        type="button"
-                        className={`btn btn-sm ${isActiveForUse ? "btn-primary" : ""}`}
-                        onClick={() => chooseActiveModel(current.id)}
-                      >
-                        {isActiveForUse ? (
-                          <>
-                            <CheckCircle2 size={13} /> Em uso para transcrever
-                          </>
-                        ) : (
-                          <>Usar esta Versão</>
-                        )}
-                      </button>
-
-                      <button
-                        type="button"
-                        className="btn btn-danger btn-sm"
-                        disabled={isUninstalling}
-                        onClick={() => handleUninstallModel(current)}
-                      >
-                        {isUninstalling ? <Loader2 size={13} /> : <Trash2 size={13} />}
-                        Desinstalar Completamente
-                      </button>
-                    </>
-                  ) : (
-                    <>
-                      <span style={{ fontSize: 12, color: "var(--text-muted)" }}>
-                        Não instalado no disco
-                      </span>
-                      <button
-                        type="button"
-                        className="btn btn-primary btn-sm"
-                        disabled={isDownloading}
-                        onClick={() => handleDownloadModel(current)}
-                      >
-                        {isDownloading ? <Loader2 size={13} /> : <Download size={13} />}
-                        Baixar {current.version_tag.split(" ")[0]} ({current.size_mb} MB)
-                      </button>
-                    </>
-                  )}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* ================================================================ */}
-      {/* TRANSCRIPTION EXECUTION FORM                                     */}
-      {/* ================================================================ */}
-      <form onSubmit={handleStartTranscription} style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-        <div className="panel" style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-          <div className="panel-header" style={{ marginBottom: 0 }}>
-            <h2 className="panel-title">
-              <Mic size={16} color="var(--accent)" /> Transcrever Vídeo / Áudio da Biblioteca
-            </h2>
-            {chosenModelObj && (
-              <span className={`pill ${chosenModelObj.installed ? "success" : "warning"}`}>
-                {chosenModelObj.installed ? <CheckCircle2 size={11} /> : <AlertTriangle size={11} />}
-                {chosenModelObj.display_name}
-              </span>
-            )}
-          </div>
-
-          <div className="grid-2">
-            <div className="field">
-              <label htmlFor="tr-media">Vídeo ou Áudio da Biblioteca</label>
-              <select
-                id="tr-media"
-                className="select"
-                value={selectedMediaId}
-                onChange={(e) => setSelectedMediaId(e.target.value)}
-              >
-                {playableMedia.length === 0 ? (
-                  <option value="">Nenhum vídeo ou áudio na Biblioteca ainda</option>
-                ) : (
-                  playableMedia.map((m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.title} ({m.extension.toUpperCase()}
-                      {m.metadata.duration_sec ? ` · ${formatDuration(m.metadata.duration_sec)}` : ""})
-                    </option>
-                  ))
-                )}
-              </select>
-            </div>
-
-            <div className="field">
-              <label htmlFor="tr-lang">Idioma do Áudio</label>
-              <select
-                id="tr-lang"
-                className="select"
-                value={language}
-                onChange={(e) => setLanguage(e.target.value)}
-              >
-                {LANGUAGES.map((l) => (
-                  <option key={l.code} value={l.code}>
-                    {l.label}
-                  </option>
-                ))}
-              </select>
-            </div>
-          </div>
-
-          {/* Options row */}
-          <div className="grid-3" style={{ alignItems: "end" }}>
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              <label className="check-row">
-                <input
-                  type="checkbox"
-                  checked={wordTimestamps}
-                  onChange={(e) => setWordTimestamps(e.target.checked)}
-                />
-                Timestamps por palavra (ideal para karaokê e cortes IA)
-              </label>
-              <label className="check-row">
-                <input
-                  type="checkbox"
-                  checked={translateToEnglish}
-                  onChange={(e) => setTranslateToEnglish(e.target.checked)}
-                />
-                Traduzir fala para Inglês
-              </label>
-            </div>
-            <div className="field">
-              <label>Máx. caracteres por bloco (opcional)</label>
-              <input
-                type="number"
-                className="input"
-                placeholder="ex: 42 (vazio = auto)"
-                value={maxSegmentChars}
-                onChange={(e) => setMaxSegmentChars(e.target.value)}
-              />
-            </div>
-            <div className="field">
-              <label>Prompt de contexto (nomes próprios / termos)</label>
-              <input
-                className="input"
-                placeholder="ex: Aicut, DaVinci Resolve, Rust..."
-                value={initialPrompt}
-                onChange={(e) => setInitialPrompt(e.target.value)}
-              />
-            </div>
-          </div>
-
-          {/* Auto-export formats into Library */}
-          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            <div style={{ fontSize: 12.5, fontWeight: 600, color: "var(--text-secondary)" }}>
-              Formatos para salvar automaticamente na Biblioteca ao terminar:
-            </div>
-
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
-                <span className="pill" style={{ minWidth: 84, justifyContent: "center" }}>
-                  <Subtitles size={11} /> Legendas
-                </span>
-                {subtitleFormats.map((f) => (
                   <button
-                    key={f.id}
-                    type="button"
-                    className={`btn btn-sm ${selectedFormats.includes(f.id) ? "btn-primary" : ""}`}
-                    title={f.description}
-                    onClick={() => toggleFormat(f.id)}
+                    type="submit"
+                    className="btn btn-primary"
+                    disabled={starting || !selectedMediaId || !whisperTool?.installed || !chosenModelObj?.installed}
                   >
-                    {selectedFormats.includes(f.id) && <Check size={12} />} {f.name}
+                    <BusyIcon busy={starting} icon={Sparkles} />
+                    Transcrever com IA local
                   </button>
-                ))}
-              </div>
-
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
-                <span className="pill" style={{ minWidth: 84, justifyContent: "center" }}>
-                  <FileCode2 size={11} /> Timelines
-                </span>
-                {timelineFormats.map((f) => (
-                  <button
-                    key={f.id}
-                    type="button"
-                    className={`btn btn-sm ${selectedFormats.includes(f.id) ? "btn-primary" : ""}`}
-                    title={f.description}
-                    onClick={() => toggleFormat(f.id)}
-                  >
-                    {selectedFormats.includes(f.id) && <Check size={12} />} {f.name}
-                  </button>
-                ))}
-              </div>
-
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
-                <span className="pill" style={{ minWidth: 84, justifyContent: "center" }}>
-                  <FileText size={11} /> Texto/IA
-                </span>
-                {transcriptFormats.map((f) => (
-                  <button
-                    key={f.id}
-                    type="button"
-                    className={`btn btn-sm ${selectedFormats.includes(f.id) ? "btn-primary" : ""}`}
-                    title={f.description}
-                    onClick={() => toggleFormat(f.id)}
-                  >
-                    {selectedFormats.includes(f.id) && <Check size={12} />} {f.name}
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              paddingTop: 12,
-              borderTop: "1px solid var(--border-subtle)",
-            }}
-          >
-            <div style={{ fontSize: 12.5, color: "var(--text-secondary)" }}>
-              {chosenModelObj && !chosenModelObj.installed
-                ? `Baixe uma versão de modelo compatível acima antes de iniciar.`
-                : `${selectedFormats.length} formato(s) serão salvos automaticamente na Biblioteca.`}
-            </div>
-            <button
-              type="submit"
-              className="btn btn-primary"
-              disabled={
-                starting ||
-                !selectedMediaId ||
-                !whisperTool?.installed ||
-                !chosenModelObj?.installed
+                </>
               }
             >
-              {starting ? <Loader2 size={15} /> : <Sparkles size={15} />}
-              Transcrever com IA Local
-            </button>
-          </div>
-        </div>
-      </form>
+              <div className="panel-section">
+                <div className="grid-2">
+                  <Field label="Vídeo ou áudio da Biblioteca" htmlFor="tr-media">
+                    <select
+                      id="tr-media"
+                      className="select"
+                      value={selectedMediaId}
+                      onChange={(e) => setSelectedMediaId(e.target.value)}
+                    >
+                      {playableMedia.length === 0 ? (
+                        <option value="">Nenhum vídeo ou áudio na Biblioteca ainda</option>
+                      ) : (
+                        playableMedia.map((m) => (
+                          <option key={m.id} value={m.id}>
+                            {m.title} ({m.extension.toUpperCase()}
+                            {m.metadata.duration_sec ? ` · ${formatDuration(m.metadata.duration_sec)}` : ""})
+                          </option>
+                        ))
+                      )}
+                    </select>
+                  </Field>
+                  <Field label="Idioma do áudio" htmlFor="tr-lang">
+                    <select id="tr-lang" className="select" value={language} onChange={(e) => setLanguage(e.target.value)}>
+                      {LANGUAGES.map((l) => (
+                        <option key={l.code} value={l.code}>
+                          {l.label}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+                </div>
+              </div>
 
-      {/* Active Transcription / Model Download Jobs */}
-      {activeTranscribeJobs.length > 0 && (
-        <div className="panel" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          <h3 className="panel-title">Em andamento ({activeTranscribeJobs.length})</h3>
-          {activeTranscribeJobs.map((j) => (
-            <div key={j.id} style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13 }}>
-                <span>{j.title}</span>
-                <span style={{ fontFamily: "var(--font-mono)", color: "var(--text-secondary)" }}>
-                  {j.progress.percent.toFixed(0)}% · {j.progress.message ?? j.progress.stage}
-                </span>
+              <div className="panel-section">
+                <div className="section-label">Opções</div>
+                <div className="grid-2">
+                  <Field label="Máx. caracteres por bloco (opcional)" htmlFor="tr-maxchars">
+                    <input
+                      id="tr-maxchars"
+                      type="number"
+                      className="input"
+                      placeholder="ex: 42 (vazio = auto)"
+                      value={maxSegmentChars}
+                      onChange={(e) => setMaxSegmentChars(e.target.value)}
+                    />
+                  </Field>
+                  <Field label="Prompt de contexto (nomes próprios / termos)" htmlFor="tr-prompt">
+                    <input
+                      id="tr-prompt"
+                      className="input"
+                      placeholder="ex: Aicut, DaVinci Resolve, Rust..."
+                      value={initialPrompt}
+                      onChange={(e) => setInitialPrompt(e.target.value)}
+                    />
+                  </Field>
+                </div>
+                <div className="row wrap gap-lg">
+                  <Checkbox
+                    checked={wordTimestamps}
+                    onChange={setWordTimestamps}
+                    label="Timestamps por palavra"
+                    description="Ideal para karaokê e cortes IA"
+                  />
+                  <Checkbox checked={translateToEnglish} onChange={setTranslateToEnglish} label="Traduzir fala para inglês" />
+                </div>
               </div>
-              <div className="progress-track">
-                <div className="progress-fill" style={{ width: `${Math.min(100, j.progress.percent)}%` }} />
+
+              <div className="panel-section">
+                <div className="section-label">Salvar automaticamente na Biblioteca ao terminar</div>
+                <div className="format-groups">
+                  {FORMAT_GROUPS.map((group) => {
+                    const list = formats.filter((f) => f.category === group.category);
+                    if (list.length === 0) return null;
+                    return (
+                      <div key={group.category} className="format-group">
+                        <span className="format-group-label">
+                          <group.icon size={13} aria-hidden /> {group.label}
+                        </span>
+                        <div className="row wrap gap-xs">
+                          {list.map((f) => {
+                            const on = selectedFormats.includes(f.id);
+                            return (
+                              <button
+                                key={f.id}
+                                type="button"
+                                className="chip"
+                                aria-pressed={on}
+                                title={f.description}
+                                onClick={() => toggleFormat(f.id)}
+                              >
+                                {on && <Check aria-hidden />}
+                                {f.name}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
-            </div>
-          ))}
-        </div>
+            </Panel>
+          </div>
+
+          <aside className="split-aside">
+            <Panel
+              title="Modelo ativo"
+              icon={Cpu}
+              actions={
+                <button type="button" className="btn btn-ghost btn-xs" onClick={() => setTab("models")}>
+                  gerenciar <ArrowRight aria-hidden />
+                </button>
+              }
+            >
+              <div className="muted text-xs">{gpuSummary}</div>
+              {installedModels.length === 0 ? (
+                <Callout
+                  tone="warning"
+                  title="Nenhum modelo instalado"
+                  actions={
+                    <button type="button" className="btn btn-primary btn-sm" onClick={() => setTab("models")}>
+                      Ver modelos
+                    </button>
+                  }
+                >
+                  Baixe um modelo recomendado para a sua GPU.
+                </Callout>
+              ) : (
+                <ChoiceCards
+                  ariaLabel="Modelo ativo"
+                  columns={1}
+                  value={selectedModel}
+                  onChange={chooseActiveModel}
+                  options={installedModels.map((m) => ({
+                    id: m.id,
+                    title: m.display_name,
+                    description: `${m.quality_tier} · ${m.speed_tier} · ${m.size_mb} MB`,
+                  }))}
+                />
+              )}
+            </Panel>
+
+            <ActiveJobsPanel jobs={activeTranscribeJobs} onViewAll={() => onNavigate("jobs")} />
+          </aside>
+        </form>
       )}
 
-      {/* Saved Transcriptions + On-Demand Universal Exporter */}
-      <div className="panel" style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-        <div className="panel-header" style={{ marginBottom: 0 }}>
-          <h2 className="panel-title">
-            <Film size={16} color="var(--accent)" /> Transcrições Geradas ({transcripts.length})
-          </h2>
-          {activeTranscript && (
-            <input
-              className="input"
-              style={{ maxWidth: 260 }}
-              placeholder="Buscar fala na transcrição..."
-              value={searchSeg}
-              onChange={(e) => setSearchSeg(e.target.value)}
+      {/* ================================================================ */}
+      {/* SAVED TRANSCRIPTIONS + UNIVERSAL EXPORTER                         */}
+      {/* ================================================================ */}
+      {tab === "results" &&
+        (transcripts.length === 0 ? (
+          <div className="panel">
+            <EmptyState
+              icon={FileText}
+              title="nenhuma transcrição ainda"
+              description="Escolha um vídeo na aba Nova transcrição para transcrever 100% offline."
+              actions={
+                <button type="button" className="btn btn-primary" onClick={() => setTab("new")}>
+                  Nova transcrição
+                </button>
+              }
             />
-          )}
-        </div>
-
-        {transcripts.length === 0 ? (
-          <div style={{ color: "var(--text-secondary)", fontSize: 13 }}>
-            Nenhuma transcrição gerada ainda. Selecione um vídeo acima para transcrever offline.
           </div>
         ) : (
-          <div style={{ display: "grid", gridTemplateColumns: "280px 1fr", gap: 16 }}>
-            <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 420, overflowY: "auto" }}>
-              {transcripts.map((t) => (
-                <div
-                  key={t.id}
-                  onClick={() => setActiveTranscriptId(t.id)}
-                  style={{
-                    padding: "10px 12px",
-                    borderRadius: "var(--radius-md)",
-                    background: activeTranscript?.id === t.id ? "var(--accent-soft)" : "var(--bg-elevated)",
-                    border: `1px solid ${activeTranscript?.id === t.id ? "var(--accent-border)" : "var(--border-subtle)"}`,
-                    cursor: "pointer",
-                    display: "flex",
-                    flexDirection: "column",
-                    gap: 4,
-                  }}
-                >
-                  <div style={{ display: "flex", justifyContent: "space-between", gap: 6 }}>
-                    <strong style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      {t.media_title}
-                    </strong>
-                    <button
-                      type="button"
-                      className="btn btn-ghost btn-sm"
-                      style={{ padding: 2 }}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        void handleDeleteTranscript(t.id);
-                      }}
-                    >
-                      <Trash2 size={12} />
-                    </button>
+          <div className="transcripts-layout">
+            <Panel title="Arquivos" icon={ListVideo} flush>
+              <div className="transcript-list" role="listbox" aria-label="Transcrições">
+                {transcripts.map((t) => (
+                  <div
+                    key={t.id}
+                    role="option"
+                    tabIndex={0}
+                    aria-selected={activeTranscript?.id === t.id}
+                    className="transcript-item hover-host"
+                    onClick={() => setActiveTranscriptId(t.id)}
+                    onKeyDown={(e) => e.key === "Enter" && setActiveTranscriptId(t.id)}
+                    onContextMenu={(e) => menu.open(e, transcriptMenu(t))}
+                  >
+                    <div className="row row-between">
+                      <span className="truncate strong text-sm">{t.media_title}</span>
+                      <span className="row-actions">
+                        <MoreButton items={() => transcriptMenu(t)} />
+                      </span>
+                    </div>
+                    <div className="muted text-xs">
+                      {t.model_id} · {t.language.toUpperCase()} · {t.segments.length} blocos
+                    </div>
+                    <div className="muted text-xs">{formatRelativeDate(t.created_at)}</div>
                   </div>
-                  <div style={{ fontSize: 11.5, color: "var(--text-muted)" }}>
-                    {t.model_id} · {t.language.toUpperCase()} · {t.segments.length} blocos
-                  </div>
-                  <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
-                    {formatRelativeDate(t.created_at)}
-                  </div>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+            </Panel>
 
             {activeTranscript && (
-              <div style={{ display: "flex", flexDirection: "column", gap: 12, minWidth: 0 }}>
-                <div
-                  style={{
-                    padding: 12,
-                    borderRadius: "var(--radius-md)",
-                    background: "var(--bg-elevated)",
-                    display: "flex",
-                    flexDirection: "column",
-                    gap: 8,
-                  }}
-                >
-                  <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text-secondary)" }}>
-                    Salvar outro formato de legenda ou timeline na Biblioteca (instantâneo):
-                  </div>
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              <Panel
+                title={activeTranscript.media_title}
+                icon={FileText}
+                actions={
+                  <>
+                    <div className="input-wrap seg-search">
+                      <Search aria-hidden />
+                      <input
+                        className="input input-sm"
+                        placeholder="buscar fala…"
+                        aria-label="Buscar fala na transcrição"
+                        value={searchSeg}
+                        onChange={(e) => setSearchSeg(e.target.value)}
+                      />
+                    </div>
+                    <MoreButton items={() => transcriptMenu(activeTranscript)} />
+                  </>
+                }
+              >
+                <div className="row wrap gap-xs">
+                  <Badge tone="accent">{activeTranscript.model_id}</Badge>
+                  <Badge>{activeTranscript.language.toUpperCase()}</Badge>
+                  <Badge>{activeTranscript.segments.length} blocos</Badge>
+                  {activeTranscript.duration_sec !== undefined && <Badge>{formatDuration(activeTranscript.duration_sec)}</Badge>}
+                  <Badge>{formatRelativeDate(activeTranscript.created_at)}</Badge>
+                </div>
+
+                <div className="stack stack-sm">
+                  <div className="section-label">Salvar outro formato na Biblioteca (instantâneo)</div>
+                  <div className="row wrap gap-xs">
                     {formats.map((f) => {
                       const key = `${activeTranscript.id}:${f.id}`;
                       return (
                         <button
                           key={f.id}
                           type="button"
-                          className="btn btn-sm"
+                          className="chip chip-sm"
+                          title={f.description}
                           disabled={exportingFmt === key}
                           onClick={() => handleQuickExport(activeTranscript.id, f.id)}
                         >
-                          {exportingFmt === key ? <Loader2 size={12} /> : <Download size={12} />}
+                          <BusyIcon busy={exportingFmt === key} icon={Download} size={12} />
                           {f.name}
                         </button>
                       );
@@ -985,56 +783,164 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
                   </div>
                 </div>
 
-                <div
-                  style={{
-                    maxHeight: 310,
-                    overflowY: "auto",
-                    display: "flex",
-                    flexDirection: "column",
-                    gap: 6,
-                  }}
-                >
-                  {activeTranscript.segments
-                    .filter(
-                      (s) =>
-                        !searchSeg.trim() ||
-                        s.text.toLowerCase().includes(searchSeg.toLowerCase()),
-                    )
-                    .map((seg) => (
-                      <div
-                        key={seg.index}
-                        style={{
-                          display: "grid",
-                          gridTemplateColumns: "110px 1fr",
-                          gap: 10,
-                          padding: "7px 10px",
-                          borderRadius: "var(--radius-sm)",
-                          background: "var(--bg-input)",
-                          fontSize: 13,
-                        }}
-                      >
-                        <span
-                          style={{
-                            fontFamily: "var(--font-mono)",
-                            fontSize: 11.5,
-                            color: "var(--accent)",
-                            display: "inline-flex",
-                            alignItems: "center",
-                            gap: 4,
-                          }}
-                        >
-                          <Play size={10} />
-                          {formatDuration(seg.start_ms / 1000)} → {formatDuration(seg.end_ms / 1000)}
-                        </span>
+                <div className="term segments" aria-label="Falas da transcrição">
+                  {visibleSegments.length === 0 ? (
+                    <div className="term-empty">nenhuma fala corresponde a “{searchSeg}”</div>
+                  ) : (
+                    visibleSegments.map((seg) => (
+                      <div key={seg.index} className="term-line" onContextMenu={(e) => menu.open(e, segmentMenu(seg))}>
+                        <span className="term-time">[{timecode(seg)}]</span>
                         <span>{seg.text}</span>
                       </div>
-                    ))}
+                    ))
+                  )}
                 </div>
-              </div>
+              </Panel>
             )}
           </div>
-        )}
-      </div>
-    </div>
+        ))}
+
+      {/* ================================================================ */}
+      {/* GPU-CURATED MODEL & VERSION MANAGER                              */}
+      {/* ================================================================ */}
+      {tab === "models" && (
+        <>
+          <div className="toolbar">
+            <span className="row text-sm">
+              <Cpu size={14} className="text-accent" aria-hidden /> {gpuSummary}
+            </span>
+            <span className="toolbar-sep" />
+            <Badge icon={HardDrive}>
+              Instalados: {installedModels.length} ({formatBytes(totalInstalledBytes)})
+            </Badge>
+            <label className="row ml-auto text-sm secondary">
+              <Switch checked={showAllModels} onChange={setShowAllModels} label="Mostrar todos os modelos" />
+              mostrar todos (incl. incompatíveis)
+            </label>
+          </div>
+
+          <div className="family-grid">
+            {visibleFamilies.map((fam) => {
+              const viewedId = familySelection[fam.familyId] ?? fam.versions[0]?.id;
+              const current = fam.versions.find((v) => v.id === viewedId) ?? fam.versions[0];
+              if (!current) return null;
+
+              const isActiveForUse = selectedModel === current.id && current.installed;
+              const isDownloading = downloadingModel === current.id;
+              const isUninstalling = uninstallingModel === current.id;
+
+              return (
+                <section
+                  key={fam.familyId}
+                  className="panel family-card"
+                  data-tone={isActiveForUse ? "accent" : undefined}
+                  onContextMenu={(e) => menu.open(e, modelMenu(current))}
+                >
+                  <header className="panel-header">
+                    <div className="panel-heading">
+                      <h2 className="panel-title">
+                        <Layers aria-hidden />
+                        {fam.familyName}
+                      </h2>
+                    </div>
+                    <div className="panel-actions">
+                      {current.best_quality_for_hardware && (
+                        <Badge tone="success" icon={Award}>
+                          maior qualidade
+                        </Badge>
+                      )}
+                      {current.recommended && <Badge tone="accent">recomendado</Badge>}
+                      <MoreButton items={() => modelMenu(current)} />
+                    </div>
+                  </header>
+
+                  <div className="panel-body">
+                    <p className="panel-description">{current.description}</p>
+
+                    <div className="stack stack-xs">
+                      <span className="section-label">Versão / precisão</span>
+                      <div className="row wrap gap-xs" role="group" aria-label={`Versões de ${fam.familyName}`}>
+                        {fam.versions.map((ver) => (
+                          <button
+                            key={ver.id}
+                            type="button"
+                            className="chip chip-sm"
+                            aria-pressed={ver.id === current.id}
+                            onClick={() => {
+                              setFamilySelection((prev) => ({ ...prev, [fam.familyId]: ver.id }));
+                              if (ver.installed) chooseActiveModel(ver.id);
+                            }}
+                            onContextMenu={(e) => menu.open(e, modelMenu(ver))}
+                          >
+                            {ver.installed && <span className="installed-dot" aria-label="instalado" />}
+                            {ver.version_tag}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="inset stack stack-sm">
+                      <div className="row wrap gap-xs">
+                        <Badge tone="accent">qualidade {current.quality_tier}</Badge>
+                        <Badge>{current.speed_tier}</Badge>
+                        <Badge>{current.size_mb} MB</Badge>
+                        <Badge>VRAM mín {(current.min_vram_mb / 1024).toFixed(1)} GB</Badge>
+                      </div>
+                      <p className="text-sm">{current.quality_notes}</p>
+                      <p className={`text-xs ${current.compatible ? "text-success" : "text-danger"}`}>
+                        {current.compatible ? <CircleCheck size={12} className="inline-icon" aria-hidden /> : <TriangleAlert size={12} className="inline-icon" aria-hidden />}{" "}
+                        {current.compatibility_reason}
+                      </p>
+                    </div>
+                  </div>
+
+                  <footer className="panel-footer">
+                    {current.installed ? (
+                      <>
+                        <button
+                          type="button"
+                          className={`btn btn-sm ${isActiveForUse ? "btn-primary" : ""}`}
+                          onClick={() => chooseActiveModel(current.id)}
+                        >
+                          {isActiveForUse ? (
+                            <>
+                              <CircleCheck aria-hidden /> Em uso para transcrever
+                            </>
+                          ) : (
+                            "Usar esta versão"
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-danger btn-sm"
+                          disabled={isUninstalling}
+                          onClick={() => handleUninstallModel(current)}
+                        >
+                          <BusyIcon busy={isUninstalling} icon={Trash2} size={13} />
+                          Desinstalar
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <span className="muted text-xs">não instalado</span>
+                        <button
+                          type="button"
+                          className="btn btn-primary btn-sm"
+                          disabled={isDownloading}
+                          onClick={() => handleDownloadModel(current)}
+                        >
+                          <BusyIcon busy={isDownloading} icon={Download} size={13} />
+                          Baixar {current.version_tag.split(" ")[0]} ({current.size_mb} MB)
+                        </button>
+                      </>
+                    )}
+                  </footer>
+                </section>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </>
   );
 };

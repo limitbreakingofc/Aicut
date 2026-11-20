@@ -1,22 +1,22 @@
 import React, { useEffect, useMemo, useState } from "react";
 import {
-  AlertTriangle,
   Award,
-  Check,
-  CheckCircle2,
+  CircleCheck,
   Cloud,
+  Copy,
   Cpu,
   Download,
   Eye,
   Film,
   HardDrive,
   KeyRound,
-  Loader2,
+  Lightbulb,
   Play,
   Scissors,
   Sparkles,
-  Subtitles,
+  Captions,
   Trash2,
+  Zap,
 } from "lucide-react";
 import { AicutActionError, runAction } from "../../lib/client";
 import { formatBytes, formatDuration, formatRelativeDate } from "../../lib/format";
@@ -26,11 +26,32 @@ import type {
   JobRecord,
   MediaAsset,
   MediaContextInfo,
+  NotifyFn,
   RouteId,
+  SmartClipPlan,
   SmartClipRun,
   ToolStatus,
   VisionModelStatus,
 } from "../../lib/types";
+import { copyToClipboard } from "../../lib/ui";
+import { pageMeta } from "../../app/navigation";
+import {
+  ActiveJobsPanel,
+  Badge,
+  BusyIcon,
+  Callout,
+  Checkbox,
+  ChoiceCards,
+  EmptyState,
+  Field,
+  Meter,
+  MoreButton,
+  PageHeader,
+  Panel,
+  useContextMenu,
+  type MenuItems,
+} from "../../components";
+import "./smart-clips.css";
 
 interface SmartClipsViewProps {
   media: MediaAsset[];
@@ -40,57 +61,78 @@ interface SmartClipsViewProps {
   preselectedMediaId?: string | null;
   onNavigate: (route: RouteId) => void;
   onSelectMedia: (mediaId: string) => void;
-  onNotify: (level: "info" | "success" | "warning" | "error", title: string, message: string) => void;
+  onNotify: NotifyFn;
   onRefreshTools: () => Promise<void>;
   onRefreshMedia: () => Promise<void>;
 }
 
 const DESCRIPTION_PRESETS = [
   {
-    label: "Melhores momentos (Geral)",
+    label: "Melhores momentos",
     text: "Encontre os momentos mais envolventes, visualmente marcantes e surpreendentes do vídeo ou live, com gancho forte nos primeiros 5 segundos e fechamento completo.",
   },
   {
-    label: "Jogadas / Clutches / Ação",
+    label: "Jogadas / clutches",
     text: "Procure jogadas épicas, clutches, viradas inesperadas, falhas engraçadas ou reações intensas na gameplay, mostrando a preparação, a jogada e a reação final.",
   },
   {
-    label: "Explicações & Dicas Completas",
+    label: "Explicações & dicas",
     text: "Encontre explicações didáticas, demonstrações na tela ou dicas valiosas que comecem com uma pergunta/problema claro e terminem com a solução completa.",
   },
   {
-    label: "Humor / Reações / Cortes Virais",
+    label: "Humor / reações",
     text: "Encontre momentos engraçados, piadas, sustos, rage divertido ou interações memoráveis com expressões faciais fortes e punchline fechada.",
   },
 ];
 
-const SHORTS_LAYOUTS = [
+type ShortsLayout = "template_split" | "gaming_split" | "fit_blur" | "center_crop" | "original";
+type WebcamCorner = "bottom_right" | "bottom_left" | "top_right" | "top_left" | "center";
+
+const SHORTS_LAYOUTS: Array<{ id: ShortsLayout; short: string; label: string; desc: string }> = [
   {
     id: "template_split",
-    label: "Moldura Shorts (SMOKING33) · Câmera em Cima + Conteúdo em Baixo",
+    short: "Moldura SMOKING33",
+    label: "Moldura Shorts (SMOKING33) · Câmera em cima + conteúdo em baixo",
     desc: "Aplica sua moldura 9:16 com borda dourada: webcam na janela superior e conteúdo/gameplay na janela inferior.",
   },
   {
     id: "gaming_split",
-    label: "Split 9:16 Sem Moldura · Câmera em Cima + Conteúdo em Baixo",
+    short: "Split sem moldura",
+    label: "Split 9:16 sem moldura · Câmera em cima + conteúdo em baixo",
     desc: "Webcam cheia na parte superior e gameplay/conteúdo na parte inferior, sem moldura.",
   },
   {
     id: "fit_blur",
-    label: "Shorts 9:16 · Tela Inteira + Blur",
+    short: "Tela inteira + blur",
+    label: "Shorts 9:16 · Tela inteira + blur",
     desc: "Mantém o vídeo 16:9 sem cortar bordas sobre fundo desfocado (ideal para tutoriais e tela única).",
   },
   {
     id: "center_crop",
-    label: "Shorts 9:16 · Foco Central",
+    short: "Foco central",
+    label: "Shorts 9:16 · Foco central",
     desc: "Enquadramento vertical cheio focado no centro (ideal para vlogs, podcasts e câmera principal).",
   },
   {
     id: "original",
-    label: "Original 16:9 (Horizontal)",
+    short: "Original 16:9",
+    label: "Original 16:9 (horizontal)",
     desc: "Mantém a proporção original do vídeo sem crop vertical.",
   },
-] as const;
+];
+
+/** Tiny CSS-drawn preview of each 9:16 framing. */
+function LayoutPreview({ id }: { id: ShortsLayout }) {
+  return (
+    <span className={`lp lp-${id}`} aria-hidden>
+      <i />
+      <i />
+    </span>
+  );
+}
+
+const clipTimecodes = (clip: SmartClipPlan) =>
+  clip.segments.map((s) => `${formatDuration(s.start_sec)} → ${formatDuration(s.end_sec)}`).join("  +  ");
 
 export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
   media,
@@ -104,14 +146,10 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
   onRefreshTools,
   onRefreshMedia,
 }) => {
-  const videoMedia = useMemo(
-    () => media.filter((m) => m.kind === "video" || m.kind === "video_only"),
-    [media],
-  );
+  const menu = useContextMenu();
+  const videoMedia = useMemo(() => media.filter((m) => m.kind === "video" || m.kind === "video_only"), [media]);
 
-  const [selectedMediaId, setSelectedMediaId] = useState<string>(
-    preselectedMediaId ?? videoMedia[0]?.id ?? "",
-  );
+  const [selectedMediaId, setSelectedMediaId] = useState<string>(preselectedMediaId ?? videoMedia[0]?.id ?? "");
   const [provider, setProvider] = useState<"gemini" | "local_free">("gemini");
   const [description, setDescription] = useState<string>(DESCRIPTION_PRESETS[0].text);
   const [maxDurationSec, setMaxDurationSec] = useState<number>(180);
@@ -138,12 +176,8 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
   const [mediaContext, setMediaContext] = useState<MediaContextInfo | null>(null);
 
   // Shorts rendering options
-  const [layout, setLayout] = useState<
-    "template_split" | "gaming_split" | "fit_blur" | "center_crop" | "original"
-  >("template_split");
-  const [webcamCorner, setWebcamCorner] = useState<
-    "bottom_right" | "bottom_left" | "top_right" | "top_left" | "center"
-  >("bottom_right");
+  const [layout, setLayout] = useState<ShortsLayout>("template_split");
+  const [webcamCorner, setWebcamCorner] = useState<WebcamCorner>("bottom_right");
   const [contentFit, setContentFit] = useState<"fill" | "fit_blur">("fill");
   const [customTemplatePath, setCustomTemplatePath] = useState<string>("");
   const [burnSubtitles, setBurnSubtitles] = useState<boolean>(true);
@@ -219,20 +253,13 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
     void loadAll();
   }, []);
 
+  const clipJobKinds = ["clips.analyze", "clips.render", "clips.model_download"];
   const activeClipJobs = jobs.filter(
-    (j) =>
-      (j.kind === "clips.analyze" ||
-        j.kind === "clips.render" ||
-        j.kind === "clips.model_download") &&
-      (j.status === "queued" || j.status === "running"),
+    (j) => clipJobKinds.includes(j.kind) && (j.status === "queued" || j.status === "running"),
   );
+  // Transcriptions also matter: a finished transcript instantly links to this video's context
   const completedRelatedJobsCount = jobs.filter(
-    (j) =>
-      (j.kind === "clips.analyze" ||
-        j.kind === "clips.render" ||
-        j.kind === "clips.model_download" ||
-        j.kind === "transcribe.run") &&
-      j.status === "completed",
+    (j) => (clipJobKinds.includes(j.kind) || j.kind === "transcribe.run") && j.status === "completed",
   ).length;
 
   useEffect(() => {
@@ -253,10 +280,7 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
   const resolvedTranscript = mediaContext?.resolved_transcript ?? null;
   const relatedCount = Math.max(0, (mediaContext?.related_assets?.length ?? 1) - 1);
 
-  const activeRun = useMemo(
-    () => runs.find((r) => r.id === activeRunId) ?? runs[0] ?? null,
-    [runs, activeRunId],
-  );
+  const activeRun = useMemo(() => runs.find((r) => r.id === activeRunId) ?? runs[0] ?? null, [runs, activeRunId]);
 
   const saveGeminiSettings = async () => {
     setSavingConfig(true);
@@ -273,11 +297,7 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
       setGeminiKeyInput("");
       onNotify("success", "Configuração salva", "Preferências da Gemini API atualizadas.");
     } catch (e) {
-      onNotify(
-        "error",
-        "Erro ao salvar",
-        e instanceof AicutActionError ? e.message : "Falha ao salvar configuração.",
-      );
+      onNotify("error", "Erro ao salvar", e instanceof AicutActionError ? e.message : "Falha ao salvar configuração.");
     } finally {
       setSavingConfig(false);
     }
@@ -288,17 +308,9 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
     try {
       await runAction("tools.install", { tool_id: "llama-server" });
       await onRefreshTools();
-      onNotify(
-        "success",
-        "llama.cpp instalado",
-        "Runtime visual local pronto na melhor build para sua GPU/hardware.",
-      );
+      onNotify("success", "llama.cpp instalado", "Runtime visual local pronto na melhor build para sua GPU/hardware.");
     } catch (e) {
-      onNotify(
-        "error",
-        "Erro ao instalar llama.cpp",
-        e instanceof AicutActionError ? e.message : "Falha na instalação.",
-      );
+      onNotify("error", "Erro ao instalar llama.cpp", e instanceof AicutActionError ? e.message : "Falha na instalação.");
     } finally {
       setInstallingLlama(false);
     }
@@ -313,11 +325,7 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
       await loadAll();
       onNotify("success", "Modelo visual pronto", `Modelo ${modelId} baixado com sucesso.`);
     } catch (e) {
-      onNotify(
-        "error",
-        "Erro no download",
-        e instanceof AicutActionError ? e.message : "Falha ao baixar modelo visual.",
-      );
+      onNotify("error", "Erro no download", e instanceof AicutActionError ? e.message : "Falha ao baixar modelo visual.");
     } finally {
       setDownloadingModel(null);
     }
@@ -326,21 +334,11 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
   const handleDeleteModel = async (modelId: string) => {
     setUninstallingModel(modelId);
     try {
-      const res = await runAction<{ freed_bytes: number }>("clips.model_delete", {
-        model_id: modelId,
-      });
+      const res = await runAction<{ freed_bytes: number }>("clips.model_delete", { model_id: modelId });
       await loadAll();
-      onNotify(
-        "info",
-        "Modelo desinstalado",
-        `Espaço liberado: ${formatBytes(res.data.freed_bytes ?? 0)}.`,
-      );
+      onNotify("info", "Modelo desinstalado", `Espaço liberado: ${formatBytes(res.data.freed_bytes ?? 0)}.`);
     } catch (e) {
-      onNotify(
-        "error",
-        "Erro ao desinstalar",
-        e instanceof AicutActionError ? e.message : "Falha ao remover modelo.",
-      );
+      onNotify("error", "Erro ao desinstalar", e instanceof AicutActionError ? e.message : "Falha ao remover modelo.");
     } finally {
       setUninstallingModel(null);
     }
@@ -352,11 +350,7 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
       return;
     }
     if (!description.trim()) {
-      onNotify(
-        "warning",
-        "Descreva o que procurar",
-        "Informe uma descrição editorial para guiar a IA visual.",
-      );
+      onNotify("warning", "Descreva o que procurar", "Informe uma descrição editorial para guiar a IA visual.");
       return;
     }
     setAnalyzing(true);
@@ -414,11 +408,7 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
         "Os cortes serão salvos automaticamente na Biblioteca assim que o FFmpeg concluir.",
       );
     } catch (e) {
-      onNotify(
-        "error",
-        "Erro ao renderizar",
-        e instanceof AicutActionError ? e.message : "Falha ao iniciar renderização.",
-      );
+      onNotify("error", "Erro ao renderizar", e instanceof AicutActionError ? e.message : "Falha ao iniciar renderização.");
     } finally {
       setRenderingKey(null);
     }
@@ -434,99 +424,136 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
     }
   };
 
+  const saveTemplatePath = () => {
+    void runAction("clips.config_set", {
+      template_path: customTemplatePath.trim(),
+    })
+      .then(() =>
+        onNotify(
+          "success",
+          "Moldura salva",
+          customTemplatePath.trim() ? "Moldura PNG personalizada salva como padrão." : "Moldura padrão SMOKING33 restaurada.",
+        ),
+      )
+      .catch(() => {});
+  };
+
   const primaryGpu = hardware?.gpus?.[0];
+  const currentLayout = SHORTS_LAYOUTS.find((l) => l.id === layout) ?? SHORTS_LAYOUTS[0];
+  const isSplit = layout === "template_split" || layout === "gaming_split";
+
+  /* ---------- Context menus ---------- */
+  const clipMenu = (run: SmartClipRun, clip: SmartClipPlan, index: number): MenuItems => [
+    { type: "label", label: `#${index + 1} · ${clip.title}` },
+    {
+      label: clip.rendered_media_id ? "Re-renderizar Short" : "Renderizar Short",
+      icon: Scissors,
+      disabled: renderingKey !== null,
+      onSelect: () => void handleRender(run.id, clip.id),
+    },
+    clip.rendered_media_id && {
+      label: "Abrir na Biblioteca",
+      icon: Play,
+      onSelect: () => onSelectMedia(clip.rendered_media_id!),
+    },
+    { type: "separator" },
+    { label: "Copiar título", icon: Copy, onSelect: () => void copyToClipboard(clip.title, onNotify, "Título") },
+    { label: "Copiar timecodes", icon: Copy, onSelect: () => void copyToClipboard(clipTimecodes(clip), onNotify, "Timecodes") },
+    clip.hook_first_5s && {
+      label: "Copiar gancho",
+      icon: Copy,
+      onSelect: () => void copyToClipboard(clip.hook_first_5s, onNotify, "Gancho"),
+    },
+  ];
+
+  const visionMenu = (m: VisionModelStatus): MenuItems => [
+    { type: "label", label: m.display_name },
+    m.installed && {
+      label: selectedLocalModel === m.id ? "Modelo ativo" : "Usar este modelo",
+      icon: CircleCheck,
+      disabled: selectedLocalModel === m.id,
+      onSelect: () => setSelectedLocalModel(m.id),
+    },
+    !m.installed && {
+      label: `Baixar (${(m.size_mb / 1024).toFixed(1)} GB)`,
+      icon: Download,
+      disabled: downloadingModel !== null,
+      onSelect: () => void handleDownloadModel(m.id),
+    },
+    m.model_path && {
+      label: "Copiar caminho do modelo",
+      icon: Copy,
+      onSelect: () => void copyToClipboard(m.model_path ?? "", onNotify, "Caminho do modelo"),
+    },
+    m.installed && { type: "separator" },
+    m.installed && {
+      label: "Desinstalar",
+      icon: Trash2,
+      danger: true,
+      disabled: uninstallingModel === m.id,
+      onSelect: () => void handleDeleteModel(m.id),
+    },
+  ];
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
-      <div className="page-header">
-        <div>
-          <h1 className="page-title" style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <Scissors size={20} style={{ color: "var(--accent)" }} />
-            Cortes Shorts IA (Visual + Narrativa até 3 min)
-          </h1>
-          <p className="page-subtitle">
-            IA visual que assiste vídeos e lives, segue sua descrição e cria cortes coerentes com{" "}
-            <strong>Início, Meio e Fim</strong> em até 3 minutos — via <strong>Gemini API</strong> ou{" "}
-            <strong>100% Local Grátis (Qwen2.5-VL)</strong> na sua GPU.
-          </p>
-        </div>
-
-        <button type="button" className="btn btn-sm" onClick={() => onNavigate("ingest")}>
-          <Download size={14} /> Baixar YouTube / Twitch / PC
-        </button>
-      </div>
-
-      {/* Hardware & Dependency banner */}
-      {!ffmpegTool?.installed && (
-        <div
-          className="card"
-          style={{
-            borderColor: "var(--warning)",
-            background: "var(--warning-soft)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: 12,
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <AlertTriangle size={18} style={{ color: "var(--warning)" }} />
-            <span>
-              O <strong>FFmpeg</strong> precisa estar instalado para extrair frames e renderizar Shorts.
-            </span>
-          </div>
-          <button type="button" className="btn btn-primary btn-sm" onClick={() => onNavigate("settings")}>
-            Instalar em Ferramentas
+    <>
+      <PageHeader
+        {...pageMeta("smart-clips")}
+        actions={
+          <button type="button" className="btn btn-sm" onClick={() => onNavigate("ingest")}>
+            <Download aria-hidden /> Baixar YouTube / Twitch / PC
           </button>
-        </div>
+        }
+      />
+
+      {!ffmpegTool?.installed && (
+        <Callout
+          tone="warning"
+          title="FFmpeg necessário"
+          actions={
+            <button type="button" className="btn btn-primary btn-sm" onClick={() => onNavigate("settings")}>
+              Instalar em Ferramentas
+            </button>
+          }
+        >
+          O FFmpeg precisa estar instalado para extrair frames e renderizar Shorts.
+        </Callout>
       )}
 
-      {/* Active Progress Jobs */}
-      {activeClipJobs.length > 0 && (
-        <div className="card" style={{ borderColor: "var(--accent-border)", background: "var(--accent-soft)" }}>
-          <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 8, display: "flex", alignItems: "center", gap: 8 }}>
-            <Loader2 size={15} className="spin" /> Tarefas de Cortes IA em andamento
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {activeClipJobs.map((j) => (
-              <div key={j.id} style={{ fontSize: 12.5 }}>
-                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-                  <span>{j.title}</span>
-                  <strong>{Math.round(j.progress.percent)}%</strong>
-                </div>
-                <div className="progress-track">
-                  <div className="progress-fill" style={{ width: `${Math.min(100, j.progress.percent)}%` }} />
-                </div>
-                {j.progress.message && (
-                  <div style={{ fontSize: 11.5, color: "var(--text-secondary)", marginTop: 3 }}>
-                    {j.progress.message}
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+      <ActiveJobsPanel jobs={activeClipJobs} title="Cortes IA em andamento" tone="accent" onViewAll={() => onNavigate("jobs")} />
 
-      {/* Main 2-column Studio Configuration */}
-      <div style={{ display: "grid", gridTemplateColumns: "1.15fr 1fr", gap: 16, alignItems: "start" }}>
-        {/* Left: Video + Editorial Description + Run Button */}
-        <div className="card" style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-          <div style={{ fontWeight: 600, fontSize: 14, display: "flex", alignItems: "center", gap: 8 }}>
-            <Film size={16} style={{ color: "var(--accent)" }} /> 1. Vídeo ou Live & Descrição Editorial
-          </div>
-
-          <div className="field">
-            <label>Vídeo / Live da Biblioteca</label>
+      <div className="clips-config">
+        {/* Step 1: video + editorial brief */}
+        <Panel
+          step={1}
+          title="Vídeo & briefing"
+          icon={Film}
+          footer={
+            <button
+              type="button"
+              className="btn btn-primary btn-block"
+              disabled={analyzing || !selectedMediaId}
+              onClick={handleStartAnalyze}
+            >
+              <BusyIcon busy={analyzing} icon={Sparkles} />
+              Analisar vídeo e gerar planos de cortes
+            </button>
+          }
+        >
+          <Field label="Vídeo / live da Biblioteca" htmlFor="sc-media">
             {videoMedia.length === 0 ? (
-              <div style={{ fontSize: 12.5, color: "var(--text-secondary)", padding: 10, background: "var(--bg-elevated)", borderRadius: "var(--radius-sm)" }}>
-                Nenhum vídeo na Biblioteca ainda. Baixe do YouTube/Twitch ou importe um arquivo local na aba{" "}
-                <button type="button" className="btn btn-ghost btn-sm" onClick={() => onNavigate("ingest")}>
-                  Baixar & Importar
-                </button>
-              </div>
+              <Callout
+                actions={
+                  <button type="button" className="btn btn-sm" onClick={() => onNavigate("ingest")}>
+                    Baixar & Importar
+                  </button>
+                }
+              >
+                Nenhum vídeo na Biblioteca ainda. Baixe do YouTube/Twitch ou importe um arquivo local.
+              </Callout>
             ) : (
               <select
+                id="sc-media"
                 className="select"
                 value={selectedMediaId}
                 onChange={(e) => setSelectedMediaId(e.target.value)}
@@ -539,52 +566,42 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
                 ))}
               </select>
             )}
-          </div>
+          </Field>
 
-          {/* Full Library lineage & Transcript anchor status */}
           {selectedMediaId && (
-            <div
-              style={{
-                display: "flex",
-                flexDirection: "column",
-                gap: 6,
-                padding: "9px 11px",
-                borderRadius: "var(--radius-sm)",
-                background: resolvedTranscript ? "var(--success-soft)" : "var(--bg-elevated)",
-                border: `1px solid ${resolvedTranscript ? "var(--success)" : "var(--border-subtle)"}`,
-                fontSize: 12,
-              }}
-            >
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
-                <span style={{ display: "flex", alignItems: "center", gap: 6, fontWeight: 500 }}>
-                  <Subtitles size={14} style={{ color: resolvedTranscript ? "var(--success)" : "var(--text-muted)" }} />
-                  {resolvedTranscript
-                    ? `Transcrição vinculada automaticamente (${resolvedTranscript.segment_count} falas · ${resolvedTranscript.language.toUpperCase()} · origem: ${resolvedTranscript.source})`
-                    : "Nenhuma transcrição encontrada na Biblioteca para este vídeo ainda."}
-                </span>
-                {!resolvedTranscript && (
+            <Callout
+              tone={resolvedTranscript ? "success" : "neutral"}
+              icon={Captions}
+              title={
+                resolvedTranscript
+                  ? `Transcrição vinculada automaticamente · ${resolvedTranscript.segment_count} falas · ${resolvedTranscript.language.toUpperCase()}`
+                  : "Nenhuma transcrição encontrada na Biblioteca para este vídeo ainda"
+              }
+              actions={
+                !resolvedTranscript && (
                   <button type="button" className="btn btn-sm" onClick={() => onNavigate("transcribe")}>
                     Transcrever
                   </button>
-                )}
-              </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", fontSize: 11, color: "var(--text-secondary)", fontFamily: "var(--font-mono)" }}>
+                )
+              }
+            >
+              <span className="lineage">
+                {resolvedTranscript && <span>origem: {resolvedTranscript.source}</span>}
                 <span>video_id: {selectedMediaId.slice(0, 12)}</span>
-                {mediaContext?.external_video_key && <span>· {mediaContext.external_video_key}</span>}
-                <span>· {relatedCount} arquivo(s) vinculado(s) na Biblioteca</span>
-              </div>
-            </div>
+                {mediaContext?.external_video_key && <span>{mediaContext.external_video_key}</span>}
+                <span>{relatedCount} arquivo(s) vinculado(s) na Biblioteca</span>
+              </span>
+            </Callout>
           )}
 
-          <div className="field">
-            <label>O que a IA visual deve procurar nos cortes?</label>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 6 }}>
+          <Field label="O que a IA visual deve procurar nos cortes?" htmlFor="sc-desc">
+            <div className="row wrap gap-xs">
               {DESCRIPTION_PRESETS.map((p) => (
                 <button
                   key={p.label}
                   type="button"
-                  className="btn btn-sm"
-                  style={{ fontSize: 11.5 }}
+                  className="chip chip-sm"
+                  aria-pressed={description === p.text}
                   onClick={() => setDescription(p.text)}
                 >
                   {p.label}
@@ -592,18 +609,19 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
               ))}
             </div>
             <textarea
+              id="sc-desc"
               className="textarea"
               rows={4}
               value={description}
               onChange={(e) => setDescription(e.target.value)}
               placeholder="Ex.: Ache os momentos mais engraçados da live, jogadas absurdas com reação na webcam ou explicações completas que façam sentido do início ao fim..."
             />
-          </div>
+          </Field>
 
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-            <div className="field">
-              <label>Duração máxima (Shorts até 3 min)</label>
+          <div className="grid-2">
+            <Field label="Duração máxima (Shorts até 3 min)" htmlFor="sc-maxdur">
               <select
+                id="sc-maxdur"
                 className="select"
                 value={maxDurationSec}
                 onChange={(e) => setMaxDurationSec(Number(e.target.value))}
@@ -613,10 +631,10 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
                 <option value={120}>Até 2 minutos (120s)</option>
                 <option value={180}>Até 3 minutos (180s · Recomendado)</option>
               </select>
-            </div>
-            <div className="field">
-              <label>Quantidade máxima de cortes</label>
+            </Field>
+            <Field label="Quantidade máxima de cortes" htmlFor="sc-maxclips">
               <select
+                id="sc-maxclips"
                 className="select"
                 value={maxClips}
                 onChange={(e) => setMaxClips(Number(e.target.value))}
@@ -626,104 +644,70 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
                 <option value={8}>Até 8 cortes</option>
                 <option value={10}>Até 10 cortes</option>
               </select>
-            </div>
+            </Field>
           </div>
 
-          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, cursor: "pointer" }}>
-            <input
-              type="checkbox"
-              checked={allowJumpCuts}
-              onChange={(e) => setAllowJumpCuts(e.target.checked)}
-            />
-            Permitir jump-cuts internos leves (pular pausas longas/tempos mortos mantendo início–meio–fim em até {maxDurationSec}s)
-          </label>
+          <Checkbox
+            checked={allowJumpCuts}
+            onChange={setAllowJumpCuts}
+            label="Permitir jump-cuts internos leves"
+            description={`Pula pausas longas e tempos mortos mantendo início–meio–fim em até ${maxDurationSec}s.`}
+          />
+        </Panel>
 
-          <button
-            type="button"
-            className="btn btn-primary"
-            disabled={analyzing || !selectedMediaId}
-            onClick={handleStartAnalyze}
-            style={{ justifyContent: "center", padding: "10px 16px" }}
-          >
-            {analyzing ? <Loader2 size={16} className="spin" /> : <Sparkles size={16} />}
-            Analisar Vídeo Visualmente e Gerar Planos de Cortes
-          </button>
-        </div>
-
-        {/* Right: Dual-Engine Visual AI Selector (Gemini Cloud vs Local Free) */}
-        <div className="card" style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-          <div style={{ fontWeight: 600, fontSize: 14, display: "flex", alignItems: "center", gap: 8 }}>
-            <Eye size={16} style={{ color: "var(--accent)" }} /> 2. Motor de IA Visual
-          </div>
-
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-            <button
-              type="button"
-              className={`btn ${provider === "gemini" ? "btn-primary" : ""}`}
-              style={{ justifyContent: "center" }}
-              onClick={() => setProvider("gemini")}
-            >
-              <Cloud size={15} /> Gemini API (Nativo Vídeo)
-            </button>
-            <button
-              type="button"
-              className={`btn ${provider === "local_free" ? "btn-primary" : ""}`}
-              style={{ justifyContent: "center" }}
-              onClick={() => setProvider("local_free")}
-            >
-              <Cpu size={15} /> Local Free (Offline GPU)
-            </button>
-          </div>
+        {/* Step 2: visual AI engine */}
+        <Panel step={2} title="Motor de IA visual" icon={Eye}>
+          <ChoiceCards
+            ariaLabel="Motor de IA visual"
+            value={provider}
+            onChange={setProvider}
+            options={[
+              { id: "gemini", title: "Gemini API", icon: Cloud, description: "Visão + áudio nativos de vídeo na nuvem." },
+              { id: "local_free", title: "Local grátis", icon: Cpu, description: "Qwen2.5-VL offline na sua GPU." },
+            ]}
+          />
 
           {provider === "gemini" ? (
-            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-              <div
-                style={{
-                  fontSize: 12.5,
-                  color: "var(--text-secondary)",
-                  background: "var(--bg-elevated)",
-                  padding: 10,
-                  borderRadius: "var(--radius-sm)",
-                }}
-              >
-                <strong>Visão + Áudio Nativos:</strong> o Gemini assiste diretamente aos blocos de vídeo (25 min com 3 min de sobreposição) usando <strong>Gemini 2.5 Flash</strong> na varredura e <strong>{geminiDirectorModel}</strong> na direção final. 0 MB de download local.
-              </div>
+            <>
+              <Callout tone="info" icon={Cloud}>
+                O Gemini assiste diretamente aos blocos de vídeo (25 min com 3 min de sobreposição) usando{" "}
+                <strong>Gemini 2.5 Flash</strong> na varredura e <strong>{geminiDirectorModel}</strong> na direção final. 0 MB de
+                download local.
+              </Callout>
 
-              <div className="field">
-                <label style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                  <span>Chave Gemini API</span>
-                  {config?.gemini_configured && (
-                    <span style={{ color: "var(--success)", fontSize: 11.5, display: "inline-flex", alignItems: "center", gap: 4 }}>
-                      <CheckCircle2 size={12} /> Configurada ({config.gemini_key_preview})
+              <Field
+                label="Chave Gemini API"
+                htmlFor="sc-key"
+                aside={
+                  config?.gemini_configured && (
+                    <span className="text-success text-xs row gap-xs">
+                      <CircleCheck size={12} aria-hidden /> configurada ({config.gemini_key_preview})
                     </span>
-                  )}
-                </label>
-                <div style={{ display: "flex", gap: 8 }}>
+                  )
+                }
+              >
+                <div className="row">
                   <input
+                    id="sc-key"
                     type="password"
                     className="input"
                     value={geminiKeyInput}
                     onChange={(e) => setGeminiKeyInput(e.target.value)}
                     placeholder={
                       config?.gemini_configured
-                        ? "Cole uma nova chave apenas se quiser trocar..."
-                        : "AIza... (obtenha grátis no Google AI Studio)"
+                        ? "cole uma nova chave apenas se quiser trocar…"
+                        : "AIza… (obtenha grátis no Google AI Studio)"
                     }
                   />
-                  <button
-                    type="button"
-                    className="btn btn-primary btn-sm"
-                    disabled={savingConfig}
-                    onClick={saveGeminiSettings}
-                  >
-                    <KeyRound size={14} /> Salvar
+                  <button type="button" className="btn btn-primary" disabled={savingConfig} onClick={saveGeminiSettings}>
+                    <BusyIcon busy={savingConfig} icon={KeyRound} /> Salvar
                   </button>
                 </div>
-              </div>
+              </Field>
 
-              <div className="field">
-                <label>Modelo Diretor (Passagem B — Coerência Início–Meio–Fim)</label>
+              <Field label="Modelo diretor (passagem B — coerência início–meio–fim)" htmlFor="sc-director">
                 <select
+                  id="sc-director"
                   className="select"
                   value={geminiDirectorModel}
                   onChange={(e) => setGeminiDirectorModel(e.target.value)}
@@ -731,106 +715,71 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
                   <option value="gemini-2.5-pro">Gemini 2.5 Pro (Máxima inteligência visual e narrativa)</option>
                   <option value="gemini-2.5-flash">Gemini 2.5 Flash (Mais rápido e econômico)</option>
                 </select>
-              </div>
-            </div>
+              </Field>
+            </>
           ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-              {/* Hardware summary */}
-              <div
-                style={{
-                  fontSize: 12,
-                  color: "var(--text-secondary)",
-                  background: "var(--bg-elevated)",
-                  padding: 10,
-                  borderRadius: "var(--radius-sm)",
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "center",
-                  gap: 8,
-                }}
-              >
-                <span>
-                  <strong>Hardware:</strong>{" "}
+            <>
+              <div className="row row-between wrap text-xs secondary">
+                <span className="row gap-xs">
+                  <Cpu size={13} className="text-accent" aria-hidden />
                   {primaryGpu
                     ? `${primaryGpu.name}${primaryGpu.vram_mb ? ` (${Math.round(primaryGpu.vram_mb / 1024)} GB VRAM)` : ""}`
                     : "Modo CPU"}
                   {hardware?.cuda_version ? ` · CUDA ${hardware.cuda_version}` : ""}
                 </span>
-                <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-                  <HardDrive size={12} /> {formatBytes(totalVisionBytes)} em disco
+                <span className="row gap-xs">
+                  <HardDrive size={13} aria-hidden /> {formatBytes(totalVisionBytes)} em disco
                 </span>
               </div>
 
-              {/* Embedded llama-server status */}
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: 10,
-                  padding: 10,
-                  borderRadius: "var(--radius-sm)",
-                  border: "1px solid var(--border-default)",
-                  background: llamaTool?.installed ? "var(--success-soft)" : "var(--bg-input)",
-                }}
+              <Callout
+                tone={llamaTool?.installed ? "success" : "warning"}
+                title={`Motor llama.cpp server · ${llamaTool?.installed ? "pronto" : "não instalado"}`}
+                actions={
+                  <button
+                    type="button"
+                    className={`btn btn-sm ${llamaTool?.installed ? "" : "btn-primary"}`}
+                    disabled={installingLlama}
+                    onClick={installLlamaServer}
+                  >
+                    <BusyIcon busy={installingLlama} icon={Download} size={13} />
+                    {llamaTool?.installed ? "Atualizar" : "Instalar auto"}
+                  </button>
+                }
               >
-                <div style={{ fontSize: 12 }}>
-                  <div style={{ fontWeight: 600 }}>
-                    Motor llama.cpp Server {llamaTool?.installed ? "· Pronto" : "· Não instalado"}
-                  </div>
-                  <div style={{ color: "var(--text-secondary)", marginTop: 2 }}>
-                    {llamaTool?.recommended_build ?? "Detecta automaticamente CUDA / Vulkan / CPU"}
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  className={`btn btn-sm ${llamaTool?.installed ? "" : "btn-primary"}`}
-                  disabled={installingLlama}
-                  onClick={installLlamaServer}
-                >
-                  {installingLlama ? <Loader2 size={13} className="spin" /> : <Download size={13} />}
-                  {llamaTool?.installed ? "Atualizar" : "Instalar Auto"}
-                </button>
-              </div>
+                {llamaTool?.recommended_build ?? "Detecta automaticamente CUDA / Vulkan / CPU"}
+              </Callout>
 
-              {/* Curated Local Vision Models */}
-              <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 280, overflowY: "auto" }}>
+              <div className="vision-list">
                 {visionModels.map((m) => {
                   const isActive = selectedLocalModel === m.id;
                   return (
                     <div
                       key={m.id}
-                      style={{
-                        padding: 10,
-                        borderRadius: "var(--radius-sm)",
-                        border: `1px solid ${isActive ? "var(--accent)" : "var(--border-subtle)"}`,
-                        background: isActive ? "var(--accent-soft)" : "var(--bg-elevated)",
-                        display: "flex",
-                        flexDirection: "column",
-                        gap: 6,
-                      }}
+                      className="vision-model hover-host"
+                      data-active={isActive || undefined}
+                      onContextMenu={(e) => menu.open(e, visionMenu(m))}
                     >
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
-                        <div style={{ fontWeight: 600, fontSize: 12.5, display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-                          <span>{m.display_name}</span>
+                      <div className="row row-between">
+                        <div className="row wrap gap-xs" style={{ minWidth: 0 }}>
+                          <span className="strong text-sm">{m.display_name}</span>
                           {m.recommended && (
-                            <span className="nav-badge accent" style={{ fontSize: 10.5 }}>
-                              <Award size={10} /> Recomendado p/ sua GPU
-                            </span>
+                            <Badge tone="accent" icon={Award}>
+                              recomendado
+                            </Badge>
                           )}
-                          <span className="nav-badge" style={{ fontSize: 10.5 }}>{m.quality_tier}</span>
+                          <Badge>{m.quality_tier}</Badge>
                         </div>
-                        <span style={{ fontSize: 11.5, color: "var(--text-muted)" }}>
-                          {(m.size_mb / 1024).toFixed(1)} GB
+                        <span className="row gap-xs">
+                          <span className="muted text-xs">{(m.size_mb / 1024).toFixed(1)} GB</span>
+                          <span className="row-actions">
+                            <MoreButton items={() => visionMenu(m)} />
+                          </span>
                         </span>
                       </div>
-
-                      <div style={{ fontSize: 11.5, color: "var(--text-secondary)" }}>{m.quality_notes}</div>
-                      <div style={{ fontSize: 11, color: m.compatible ? "var(--success)" : "var(--warning)" }}>
-                        {m.compatibility_reason}
-                      </div>
-
-                      <div style={{ display: "flex", gap: 6, marginTop: 2 }}>
+                      <div className="secondary text-xs">{m.quality_notes}</div>
+                      <div className={`text-xs ${m.compatible ? "text-success" : "text-warning"}`}>{m.compatibility_reason}</div>
+                      <div className="row gap-xs">
                         {m.installed ? (
                           <>
                             <button
@@ -838,7 +787,7 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
                               className={`btn btn-sm ${isActive ? "btn-primary" : ""}`}
                               onClick={() => setSelectedLocalModel(m.id)}
                             >
-                              {isActive ? <Check size={13} /> : <Play size={13} />}
+                              {isActive ? <CircleCheck aria-hidden /> : <Play aria-hidden />}
                               {isActive ? "Ativo" : "Usar este"}
                             </button>
                             <button
@@ -847,11 +796,7 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
                               disabled={uninstallingModel === m.id}
                               onClick={() => handleDeleteModel(m.id)}
                             >
-                              {uninstallingModel === m.id ? (
-                                <Loader2 size={13} className="spin" />
-                              ) : (
-                                <Trash2 size={13} />
-                              )}
+                              <BusyIcon busy={uninstallingModel === m.id} icon={Trash2} size={13} />
                               Desinstalar
                             </button>
                           </>
@@ -862,11 +807,7 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
                             disabled={downloadingModel !== null}
                             onClick={() => handleDownloadModel(m.id)}
                           >
-                            {downloadingModel === m.id ? (
-                              <Loader2 size={13} className="spin" />
-                            ) : (
-                              <Download size={13} />
-                            )}
+                            <BusyIcon busy={downloadingModel === m.id} icon={Download} size={13} />
                             Baixar ({(m.size_mb / 1024).toFixed(1)} GB)
                           </button>
                         )}
@@ -875,24 +816,22 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
                   );
                 })}
               </div>
-            </div>
+            </>
           )}
-        </div>
+        </Panel>
       </div>
 
-      {/* Results & Shorts 9:16 Render Panel */}
-      <div className="card" style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
-          <div style={{ fontWeight: 600, fontSize: 14, display: "flex", alignItems: "center", gap: 8 }}>
-            <Sparkles size={16} style={{ color: "var(--accent)" }} />
-            3. Cortes Coerentes Encontrados & Renderização Shorts (9:16)
-          </div>
-
-          {runs.length > 0 && (
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+      {/* Step 3: results & 9:16 rendering */}
+      <Panel
+        step={3}
+        title="Cortes encontrados & renderização"
+        icon={Scissors}
+        actions={
+          runs.length > 0 && (
+            <>
               <select
-                className="select"
-                style={{ width: "auto", minWidth: 260 }}
+                className="select select-sm select-auto run-select"
+                aria-label="Análise"
                 value={activeRun?.id ?? ""}
                 onChange={(e) => setActiveRunId(e.target.value)}
               >
@@ -905,167 +844,93 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
               {activeRun && (
                 <button
                   type="button"
-                  className="btn btn-sm"
+                  className="btn btn-ghost btn-icon btn-sm"
                   onClick={() => handleDeleteRun(activeRun.id)}
+                  aria-label="Excluir esta análise"
                   title="Excluir esta análise"
                 >
-                  <Trash2 size={14} />
+                  <Trash2 aria-hidden />
                 </button>
               )}
-            </div>
-          )}
-        </div>
-
-        {/* Shorts render controls */}
-        <div
-          style={{
-            display: "flex",
-            flexDirection: "column",
-            gap: 10,
-            padding: 12,
-            borderRadius: "var(--radius-md)",
-            background: "var(--bg-elevated)",
-          }}
-        >
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns:
-                layout === "template_split" || layout === "gaming_split"
-                  ? "1.4fr 1fr 1fr auto"
-                  : "1.6fr auto auto",
-              gap: 10,
-              alignItems: "end",
-            }}
-          >
-            <div className="field" style={{ margin: 0 }}>
-              <label>Enquadramento Shorts</label>
-              <select
-                className="select"
-                value={layout}
-                onChange={(e) =>
-                  setLayout(
-                    e.target.value as
-                      | "template_split"
-                      | "gaming_split"
-                      | "fit_blur"
-                      | "center_crop"
-                      | "original",
-                  )
-                }
-              >
-                {SHORTS_LAYOUTS.map((l) => (
-                  <option key={l.id} value={l.id}>
-                    {l.label}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            {(layout === "template_split" || layout === "gaming_split") && (
-              <>
-                <div className="field" style={{ margin: 0 }}>
-                  <label>Origem da Câmera (Janela de Cima)</label>
-                  <select
-                    className="select"
-                    value={webcamCorner}
-                    onChange={(e) =>
-                      setWebcamCorner(
-                        e.target.value as
-                          | "bottom_right"
-                          | "bottom_left"
-                          | "top_right"
-                          | "top_left"
-                          | "center",
-                      )
-                    }
-                  >
-                    <option value="bottom_right">Canto inferior direito</option>
-                    <option value="bottom_left">Canto inferior esquerdo</option>
-                    <option value="top_right">Canto superior direito</option>
-                    <option value="top_left">Canto superior esquerdo</option>
-                    <option value="center">Centro (vídeo sem webcam no canto)</option>
-                  </select>
-                </div>
-
-                <div className="field" style={{ margin: 0 }}>
-                  <label>Conteúdo (Janela de Baixo)</label>
-                  <select
-                    className="select"
-                    value={contentFit}
-                    onChange={(e) => setContentFit(e.target.value as "fill" | "fit_blur")}
-                  >
-                    <option value="fill">Preencher janela (sem bordas)</option>
-                    <option value="fit_blur">Tela 16:9 inteira + Blur</option>
-                  </select>
-                </div>
-              </>
-            )}
-
+            </>
+          )
+        }
+      >
+        <div className="inset stack">
+          <div className="row row-between wrap">
+            <span className="section-label">Formato do Short</span>
             {activeRun && activeRun.clips.length > 0 && (
               <button
                 type="button"
-                className="btn btn-primary"
+                className="btn btn-primary btn-sm"
                 disabled={renderingKey !== null}
                 onClick={() => handleRender(activeRun.id)}
               >
-                {renderingKey === `all:${activeRun.id}` ? (
-                  <Loader2 size={14} className="spin" />
-                ) : (
-                  <Scissors size={14} />
-                )}
-                Renderizar Todos ({activeRun.clips.length})
+                <BusyIcon busy={renderingKey === `all:${activeRun.id}`} icon={Scissors} size={13} />
+                Renderizar todos ({activeRun.clips.length})
               </button>
             )}
           </div>
 
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              flexWrap: "wrap",
-              gap: 10,
-            }}
-          >
-            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, cursor: "pointer" }}>
-              <input
-                type="checkbox"
-                checked={burnSubtitles}
-                onChange={(e) => setBurnSubtitles(e.target.checked)}
-              />
-              Queimar legendas Karaokê sincronizadas (se transcrito)
-            </label>
+          <ChoiceCards
+            ariaLabel="Enquadramento Shorts"
+            className="layout-picker"
+            columns={5}
+            value={layout}
+            onChange={setLayout}
+            options={SHORTS_LAYOUTS.map((l) => ({ id: l.id, title: l.short, preview: <LayoutPreview id={l.id} /> }))}
+          />
+          <p className="secondary text-xs">
+            <strong className="text-accent">{currentLayout.label}</strong> — {currentLayout.desc}
+          </p>
 
+          {isSplit && (
+            <div className="grid-2">
+              <Field label="Origem da câmera (janela de cima)" htmlFor="sc-cam">
+                <select
+                  id="sc-cam"
+                  className="select"
+                  value={webcamCorner}
+                  onChange={(e) => setWebcamCorner(e.target.value as WebcamCorner)}
+                >
+                  <option value="bottom_right">Canto inferior direito</option>
+                  <option value="bottom_left">Canto inferior esquerdo</option>
+                  <option value="top_right">Canto superior direito</option>
+                  <option value="top_left">Canto superior esquerdo</option>
+                  <option value="center">Centro (vídeo sem webcam no canto)</option>
+                </select>
+              </Field>
+              <Field label="Conteúdo (janela de baixo)" htmlFor="sc-fit">
+                <select
+                  id="sc-fit"
+                  className="select"
+                  value={contentFit}
+                  onChange={(e) => setContentFit(e.target.value as "fill" | "fit_blur")}
+                >
+                  <option value="fill">Preencher janela (sem bordas)</option>
+                  <option value="fit_blur">Tela 16:9 inteira + blur</option>
+                </select>
+              </Field>
+            </div>
+          )}
+
+          <div className="row wrap gap-md">
+            <Checkbox
+              checked={burnSubtitles}
+              onChange={setBurnSubtitles}
+              label="Queimar legendas karaokê sincronizadas (se transcrito)"
+            />
             {layout === "template_split" && (
-              <div style={{ display: "flex", alignItems: "center", gap: 6, flex: 1, minWidth: 280, maxWidth: 520 }}>
+              <div className="row grow template-row">
                 <input
                   type="text"
-                  className="input"
-                  style={{ fontSize: 12, padding: "5px 8px" }}
+                  className="input input-sm"
+                  aria-label="Caminho da moldura PNG"
                   value={customTemplatePath}
                   onChange={(e) => setCustomTemplatePath(e.target.value)}
-                  placeholder="Moldura padrão SMOKING33 ativa (ou cole caminho de outro PNG 9:16 transparente)"
+                  placeholder="moldura padrão SMOKING33 (ou cole o caminho de outro PNG 9:16 transparente)"
                 />
-                <button
-                  type="button"
-                  className="btn btn-sm"
-                  onClick={() => {
-                    void runAction("clips.config_set", {
-                      template_path: customTemplatePath.trim(),
-                    })
-                      .then(() =>
-                        onNotify(
-                          "success",
-                          "Moldura salva",
-                          customTemplatePath.trim()
-                            ? "Moldura PNG personalizada salva como padrão."
-                            : "Moldura padrão SMOKING33 restaurada.",
-                        ),
-                      )
-                      .catch(() => {});
-                  }}
-                >
+                <button type="button" className="btn btn-sm" onClick={saveTemplatePath}>
                   Salvar PNG
                 </button>
               </div>
@@ -1073,109 +938,98 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
           </div>
         </div>
 
-        {/* Clip Cards */}
         {!activeRun || activeRun.clips.length === 0 ? (
-          <div style={{ padding: 24, textAlign: "center", color: "var(--text-secondary)", fontSize: 13 }}>
-            Nenhuma análise concluída ainda. Selecione um vídeo acima, descreva o que procurar e clique em{" "}
-            <strong>Analisar Vídeo Visualmente</strong>.
-          </div>
+          <EmptyState
+            compact
+            icon={Scissors}
+            title="nenhuma análise concluída"
+            description="Selecione um vídeo, descreva o que procurar e clique em Analisar vídeo."
+          />
         ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <div className="stack">
             {activeRun.clips.map((clip, i) => (
-              <div
+              <article
                 key={clip.id}
-                style={{
-                  padding: 14,
-                  borderRadius: "var(--radius-md)",
-                  border: "1px solid var(--border-default)",
-                  background: "var(--bg-input)",
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: 10,
-                }}
+                className="clip-card hover-host"
+                onContextMenu={(e) => menu.open(e, clipMenu(activeRun, clip, i))}
               >
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12 }}>
-                  <div>
-                    <div style={{ fontWeight: 600, fontSize: 14.5, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                      <span>
-                        #{i + 1} · {clip.title}
-                      </span>
-                      <span className="nav-badge accent">{formatDuration(clip.total_duration_sec)}</span>
-                      <span className="nav-badge">Aderência {clip.scores.match_description}%</span>
-                      <span className="nav-badge">Visual {clip.scores.visual_interest}%</span>
-                      <span className="nav-badge">Coerência {clip.scores.narrative_coherence}%</span>
-                    </div>
-                    <div style={{ fontSize: 12, fontFamily: "var(--font-mono)", color: "var(--text-muted)", marginTop: 4 }}>
-                      {clip.segments
-                        .map((s) => `${formatDuration(s.start_sec)} → ${formatDuration(s.end_sec)}`)
-                        .join("  +  ")}
-                    </div>
+                <header className="clip-head">
+                  <span className="clip-index">#{String(i + 1).padStart(2, "0")}</span>
+                  <div className="grow">
+                    <div className="clip-title">{clip.title}</div>
+                    <div className="clip-times">{clipTimecodes(clip)}</div>
                   </div>
-
-                  <div style={{ display: "flex", gap: 8 }}>
-                    {clip.rendered_media_id && (
-                      <button
-                        type="button"
-                        className="btn btn-sm"
-                        onClick={() => onSelectMedia(clip.rendered_media_id!)}
-                      >
-                        <Play size={13} /> Abrir na Biblioteca
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      className="btn btn-primary btn-sm"
-                      disabled={renderingKey !== null}
-                      onClick={() => handleRender(activeRun.id, clip.id)}
-                    >
-                      {renderingKey === clip.id ? (
-                        <Loader2 size={13} className="spin" />
-                      ) : (
-                        <Scissors size={13} />
-                      )}
-                      {clip.rendered_media_id ? "Re-renderizar Short" : "Renderizar Short"}
+                  <Badge tone="accent">{formatDuration(clip.total_duration_sec)}</Badge>
+                  {clip.rendered_media_id && (
+                    <button type="button" className="btn btn-sm" onClick={() => onSelectMedia(clip.rendered_media_id!)}>
+                      <Play aria-hidden /> Abrir
                     </button>
-                  </div>
+                  )}
+                  <button
+                    type="button"
+                    className="btn btn-primary btn-sm"
+                    disabled={renderingKey !== null}
+                    onClick={() => handleRender(activeRun.id, clip.id)}
+                  >
+                    <BusyIcon busy={renderingKey === clip.id} icon={Scissors} size={13} />
+                    {clip.rendered_media_id ? "Re-renderizar" : "Renderizar"}
+                  </button>
+                  <MoreButton items={() => clipMenu(activeRun, clip, i)} />
+                </header>
+
+                <div className="grid-4 clip-scores">
+                  <Meter label="Aderência" value={clip.scores.match_description} />
+                  <Meter label="Visual" value={clip.scores.visual_interest} />
+                  <Meter label="Coerência" value={clip.scores.narrative_coherence} />
+                  <Meter label="Gancho" value={clip.scores.hook_strength} />
                 </div>
 
-                {clip.visual_evidence && (
-                  <div style={{ fontSize: 12.5, color: "var(--text-secondary)" }}>
-                    <strong>👁️ O que a IA viu na tela:</strong> {clip.visual_evidence}
-                  </div>
-                )}
+                <div className="clip-notes">
+                  {clip.visual_evidence && (
+                    <p>
+                      <Eye size={13} className="text-info" aria-hidden />
+                      <span>
+                        <span className="muted">O que a IA viu:</span> {clip.visual_evidence}
+                      </span>
+                    </p>
+                  )}
+                  {clip.hook_first_5s && (
+                    <p>
+                      <Zap size={13} className="text-warning" aria-hidden />
+                      <span>
+                        <span className="muted">Gancho (5s):</span> {clip.hook_first_5s}
+                      </span>
+                    </p>
+                  )}
+                  {clip.why_interesting && (
+                    <p>
+                      <Lightbulb size={13} className="text-magenta" aria-hidden />
+                      <span>
+                        <span className="muted">Por que funciona:</span> {clip.why_interesting}
+                      </span>
+                    </p>
+                  )}
+                </div>
 
-                {clip.hook_first_5s && (
-                  <div style={{ fontSize: 12.5, color: "var(--text-secondary)" }}>
-                    <strong>⚡ Gancho (5s):</strong> {clip.hook_first_5s}
+                <div className="arc">
+                  <div className="arc-step" data-step="1">
+                    <span className="arc-label">1 · início</span>
+                    {clip.narrative_arc.beginning || "—"}
                   </div>
-                )}
-
-                <div
-                  style={{
-                    display: "grid",
-                    gridTemplateColumns: "repeat(3, 1fr)",
-                    gap: 8,
-                    fontSize: 12,
-                  }}
-                >
-                  <div style={{ padding: 8, borderRadius: "var(--radius-sm)", background: "var(--bg-elevated)" }}>
-                    <div style={{ fontWeight: 600, color: "var(--success)", marginBottom: 3 }}>1. Início</div>
-                    <div style={{ color: "var(--text-secondary)" }}>{clip.narrative_arc.beginning || "—"}</div>
+                  <div className="arc-step" data-step="2">
+                    <span className="arc-label">2 · meio</span>
+                    {clip.narrative_arc.middle || "—"}
                   </div>
-                  <div style={{ padding: 8, borderRadius: "var(--radius-sm)", background: "var(--bg-elevated)" }}>
-                    <div style={{ fontWeight: 600, color: "var(--warning)", marginBottom: 3 }}>2. Meio</div>
-                    <div style={{ color: "var(--text-secondary)" }}>{clip.narrative_arc.middle || "—"}</div>
-                  </div>
-                  <div style={{ padding: 8, borderRadius: "var(--radius-sm)", background: "var(--bg-elevated)" }}>
-                    <div style={{ fontWeight: 600, color: "var(--accent)", marginBottom: 3 }}>3. Fim</div>
-                    <div style={{ color: "var(--text-secondary)" }}>{clip.narrative_arc.end || "—"}</div>
+                  <div className="arc-step" data-step="3">
+                    <span className="arc-label">3 · fim</span>
+                    {clip.narrative_arc.end || "—"}
                   </div>
                 </div>
-              </div>
+              </article>
             ))}
           </div>
         )}
-      </div>
-    </div>
+      </Panel>
+    </>
   );
 };

@@ -1,21 +1,27 @@
-import React from "react";
-import { Bot, Check, Copy, Cpu, Globe, Terminal, User } from "lucide-react";
+import React, { useState } from "react";
+import { Bot, CircleCheck, CircleX, Copy, Cpu, Globe, Radio, Terminal, User } from "lucide-react";
 import { getPublicServerUrl } from "../../lib/client";
-import { formatRelativeDate } from "../../lib/format";
-import type { ActivityEntry } from "../../lib/types";
+import { formatClock, formatRelativeDate } from "../../lib/format";
+import type { ActivityEntry, NotifyFn, RouteId } from "../../lib/types";
+import { copyToClipboard } from "../../lib/ui";
+import { pageMeta } from "../../app/navigation";
+import { Badge, CodeBlock, EmptyState, PageHeader, Panel, SegmentedControl, useContextMenu, type MenuItems } from "../../components";
+import "./core.css";
 
 interface AiConnectViewProps {
   activity: ActivityEntry[];
   actionCount: number;
-  onNotify: (level: "info" | "success" | "warning" | "error", title: string, message: string) => void;
+  connected: boolean;
+  onNavigate: (route: RouteId) => void;
+  onNotify: NotifyFn;
 }
 
-export const AiConnectView: React.FC<AiConnectViewProps> = ({
-  activity,
-  actionCount,
-  onNotify,
-}) => {
+type ActorFilter = "all" | "ai" | "human";
+
+export const AiConnectView: React.FC<AiConnectViewProps> = ({ activity, actionCount, connected, onNavigate, onNotify }) => {
+  const menu = useContextMenu();
   const baseUrl = getPublicServerUrl();
+  const [actorFilter, setActorFilter] = useState<ActorFilter>("all");
 
   const claudeConfig = JSON.stringify(
     {
@@ -42,159 +48,147 @@ export const AiConnectView: React.FC<AiConnectViewProps> = ({
     2,
   );
 
+  const openApiInfo = `OpenAPI 3.1:     ${baseUrl}/openapi.json\nOpenAI Tools:    ${baseUrl}/api/v1/tools/openai\nAnthropic Tools: ${baseUrl}/api/v1/tools/anthropic`;
+
   const cliExample = `aicut actions --schema\naicut run media.probe_url --json '{"url":"https://youtu.be/..."}'\naicut run media.download --json '{"url":"https://youtu.be/...","mode":"video_audio","quality":"1080p","container":"mp4","wait":true}'`;
 
-  async function copyText(label: string, text: string) {
-    try {
-      await navigator.clipboard.writeText(text);
-      onNotify("success", "Copiado!", `${label} copiado para a área de transferência.`);
-    } catch {
-      onNotify("warning", "Não foi possível copiar automaticamente", "Selecione o bloco de código manualmente.");
-    }
-  }
+  const copy = (label: string, text: string) => void copyToClipboard(text, onNotify, label);
+
+  const integrations = [
+    {
+      title: "Claude Desktop & clientes MCP (stdio)",
+      icon: Bot,
+      description: "Conecta automaticamente à janela aberta do Aicut (você vê a IA operando ao vivo!) ou roda em segundo plano se o app estiver fechado.",
+      code: claudeConfig,
+      label: "Configuração Claude Desktop",
+    },
+    {
+      title: "Cursor, VS Code, Windsurf & Antigravity (MCP HTTP)",
+      icon: Cpu,
+      description: `Streamable HTTP em ${baseUrl}/mcp e SSE legado em ${baseUrl}/mcp/sse.`,
+      code: cursorHttpConfig,
+      label: "Configuração MCP HTTP",
+    },
+    {
+      title: "ChatGPT, Open WebUI, n8n & LangChain (OpenAPI 3.1)",
+      icon: Globe,
+      description: "Importe o schema OpenAPI dinâmico ou exporte ferramentas prontas para os SDKs da OpenAI/Anthropic.",
+      code: openApiInfo,
+      label: "URL OpenAPI 3.1",
+      copyText: `${baseUrl}/openapi.json`,
+    },
+    {
+      title: "Agentes de terminal (Claude Code, Codex, Gemini CLI)",
+      icon: Terminal,
+      description: "Toda funcionalidade aceita entrada e saída JSON estruturada via binário aicut.",
+      code: cliExample,
+      label: "Comandos CLI",
+    },
+  ];
+
+  const visible = activity.filter((e) => actorFilter === "all" || (actorFilter === "ai" ? e.actor === "ai" : e.actor !== "ai"));
+
+  const entryMenu = (entry: ActivityEntry): MenuItems => [
+    { type: "label", label: `${entry.action_id} · ${formatRelativeDate(entry.timestamp)}` },
+    { label: "Copiar action id", icon: Copy, onSelect: () => copy("Action id", entry.action_id) },
+    { label: "Copiar resumo", icon: Copy, onSelect: () => copy("Resumo", entry.summary) },
+    {
+      label: "Copiar linha do log",
+      icon: Copy,
+      onSelect: () =>
+        copy(
+          "Linha do log",
+          `${entry.timestamp} ${entry.actor} ${entry.action_id} ${entry.ok ? "ok" : "erro"} ${entry.duration_ms}ms ${entry.summary}`,
+        ),
+    },
+    { type: "separator" },
+    { label: "Abrir Módulos & Actions", icon: Terminal, onSelect: () => onNavigate("modules") },
+  ];
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
-      <div className="page-header">
-        <div>
-          <h1 className="page-title">Conectar Qualquer Chat de IA</h1>
-          <p className="page-subtitle">
-            O Aicut expõe {actionCount} Actions com paridade total entre humanos e IAs via MCP (stdio + HTTP/SSE), OpenAPI 3.1 e CLI JSON.
-          </p>
-        </div>
-        <span className="pill success">
-          <Check size={12} /> Servidor Local Ativo: {baseUrl}
-        </span>
+    <>
+      <PageHeader
+        {...pageMeta("ai-connect")}
+        description={`O Aicut expõe ${actionCount} actions com paridade total entre humanos e IAs via MCP (stdio + HTTP/SSE), OpenAPI 3.1 e CLI JSON.`}
+        actions={
+          <Badge tone={connected ? "success" : "danger"} dot>
+            {connected ? `servidor local ativo · ${baseUrl}` : "core offline — reconectando"}
+          </Badge>
+        }
+      />
+
+      <div className="grid-2 integrations">
+        {integrations.map((it) => (
+          <Panel
+            key={it.title}
+            title={it.title}
+            icon={it.icon}
+            description={it.description}
+            onContextMenu={(e) =>
+              menu.open(e, [
+                { label: `Copiar: ${it.label}`, icon: Copy, onSelect: () => copy(it.label, it.copyText ?? it.code) },
+                it.copyText && { label: "Copiar bloco completo", icon: Copy, onSelect: () => copy("Bloco", it.code) },
+              ])
+            }
+          >
+            <CodeBlock code={it.code} onCopy={() => copy(it.label, it.copyText ?? it.code)} copyLabel="copiar" />
+          </Panel>
+        ))}
       </div>
 
-      <div className="grid-2">
-        {/* Claude Desktop / MCP stdio */}
-        <div className="panel" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          <div className="panel-header" style={{ marginBottom: 0 }}>
-            <h2 className="panel-title">
-              <Bot size={16} color="var(--accent)" /> Claude Desktop & Clientes MCP (stdio)
-            </h2>
-            <button
-              type="button"
-              className="btn btn-sm"
-              onClick={() => copyText("Configuração Claude Desktop", claudeConfig)}
-            >
-              <Copy size={13} /> Copiar
-            </button>
-          </div>
-          <p style={{ margin: 0, fontSize: 12.5, color: "var(--text-secondary)" }}>
-            Conecta automaticamente à janela aberta do Aicut (você vê a IA operando ao vivo!) ou roda em segundo plano se o app estiver fechado.
-          </p>
-          <pre className="code-block">{claudeConfig}</pre>
-        </div>
-
-        {/* Cursor / Windsurf / VS Code / Antigravity HTTP MCP */}
-        <div className="panel" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          <div className="panel-header" style={{ marginBottom: 0 }}>
-            <h2 className="panel-title">
-              <Cpu size={16} color="var(--accent)" /> Cursor, VS Code, Windsurf & Antigravity (MCP HTTP)
-            </h2>
-            <button
-              type="button"
-              className="btn btn-sm"
-              onClick={() => copyText("Configuração MCP HTTP", cursorHttpConfig)}
-            >
-              <Copy size={13} /> Copiar
-            </button>
-          </div>
-          <p style={{ margin: 0, fontSize: 12.5, color: "var(--text-secondary)" }}>
-            Streamable HTTP em <code>{baseUrl}/mcp</code> e SSE legado em <code>{baseUrl}/mcp/sse</code>.
-          </p>
-          <pre className="code-block">{cursorHttpConfig}</pre>
-        </div>
-
-        {/* OpenAPI / ChatGPT / Open WebUI / n8n */}
-        <div className="panel" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          <div className="panel-header" style={{ marginBottom: 0 }}>
-            <h2 className="panel-title">
-              <Globe size={16} color="var(--accent)" /> ChatGPT, Open WebUI, n8n & LangChain (OpenAPI 3.1)
-            </h2>
-            <button
-              type="button"
-              className="btn btn-sm"
-              onClick={() => copyText("URL OpenAPI 3.1", `${baseUrl}/openapi.json`)}
-            >
-              <Copy size={13} /> Copiar URL
-            </button>
-          </div>
-          <p style={{ margin: 0, fontSize: 12.5, color: "var(--text-secondary)" }}>
-            Importe o schema OpenAPI dinâmico ou exporte ferramentas prontas para OpenAI/Anthropic SDKs:
-          </p>
-          <pre className="code-block">
-            {`OpenAPI 3.1:     ${baseUrl}/openapi.json\nOpenAI Tools:    ${baseUrl}/api/v1/tools/openai\nAnthropic Tools: ${baseUrl}/api/v1/tools/anthropic`}
-          </pre>
-        </div>
-
-        {/* CLI / Terminal Agents */}
-        <div className="panel" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          <div className="panel-header" style={{ marginBottom: 0 }}>
-            <h2 className="panel-title">
-              <Terminal size={16} color="var(--accent)" /> Agentes de Terminal (Claude Code, Codex, Gemini CLI)
-            </h2>
-            <button
-              type="button"
-              className="btn btn-sm"
-              onClick={() => copyText("Comandos CLI", cliExample)}
-            >
-              <Copy size={13} /> Copiar
-            </button>
-          </div>
-          <p style={{ margin: 0, fontSize: 12.5, color: "var(--text-secondary)" }}>
-            Toda funcionalidade aceita entrada e saída JSON estruturada via binário <code>aicut</code>:
-          </p>
-          <pre className="code-block">{cliExample}</pre>
-        </div>
-      </div>
-
-      {/* Live AI & Human Activity Feed */}
-      <div className="panel" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-        <div className="panel-header" style={{ marginBottom: 0 }}>
-          <h2 className="panel-title">Feed de Atividade em Tempo Real (IA & Humano)</h2>
-          <span className="pill">{activity.length} evento(s)</span>
-        </div>
-        {activity.length === 0 ? (
-          <div style={{ color: "var(--text-secondary)", fontSize: 13 }}>
-            Assim que você ou uma IA executar qualquer ação no Aicut, ela aparecerá aqui ao vivo.
-          </div>
+      <Panel
+        title={
+          <>
+            Atividade em tempo real <Badge>{activity.length}</Badge>
+          </>
+        }
+        icon={Radio}
+        actions={
+          <SegmentedControl
+            ariaLabel="Filtrar por ator"
+            size="sm"
+            value={actorFilter}
+            onChange={setActorFilter}
+            options={[
+              { id: "all", label: "todos" },
+              { id: "ai", label: "ia", icon: Bot },
+              { id: "human", label: "humano", icon: User },
+            ]}
+          />
+        }
+        flush
+      >
+        {visible.length === 0 ? (
+          <EmptyState
+            compact
+            icon={Radio}
+            title="aguardando eventos"
+            description="Assim que você ou uma IA executar qualquer ação no Aicut, ela aparece aqui ao vivo."
+          />
         ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 280, overflowY: "auto" }}>
-            {activity.map((entry) => (
-              <div
-                key={entry.id}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: 10,
-                  padding: "8px 10px",
-                  borderRadius: "var(--radius-sm)",
-                  background: "var(--bg-elevated)",
-                  fontSize: 12.5,
-                }}
-              >
-                <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-                  <span className={`pill ${entry.actor === "ai" ? "accent" : ""}`}>
-                    {entry.actor === "ai" ? <Bot size={11} /> : <User size={11} />}
-                    {entry.actor === "ai" ? "IA" : "Humano"}
-                  </span>
-                  <code style={{ fontFamily: "var(--font-mono)", fontSize: 12 }}>{entry.action_id}</code>
-                  <span style={{ color: "var(--text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {entry.summary}
-                  </span>
-                </div>
-                <span style={{ color: "var(--text-muted)", fontFamily: "var(--font-mono)", fontSize: 11.5, whiteSpace: "nowrap" }}>
-                  {entry.duration_ms}ms · {formatRelativeDate(entry.timestamp)}
+          <div className="activity-log" role="log" aria-live="polite">
+            {visible.map((entry) => (
+              <div key={entry.id} className="activity-line" onContextMenu={(e) => menu.open(e, entryMenu(entry))}>
+                <span className="term-time" title={formatRelativeDate(entry.timestamp)}>
+                  {formatClock(entry.timestamp)}
                 </span>
+                <span className={entry.actor === "ai" ? "actor text-magenta" : "actor"}>
+                  {entry.actor === "ai" ? <Bot size={12} aria-hidden /> : <User size={12} aria-hidden />}
+                  {entry.actor === "ai" ? "ia" : entry.actor === "system" ? "sistema" : "humano"}
+                </span>
+                <span className={entry.ok ? "text-success" : "text-danger"} title={entry.ok ? "ok" : "erro"}>
+                  {entry.ok ? <CircleCheck size={13} aria-hidden /> : <CircleX size={13} aria-hidden />}
+                </span>
+                <code className="activity-action">{entry.action_id}</code>
+                <span className="activity-summary" title={entry.summary}>
+                  {entry.summary}
+                </span>
+                <span className="muted tabular activity-ms">{entry.duration_ms}ms</span>
               </div>
             ))}
           </div>
         )}
-      </div>
-    </div>
+      </Panel>
+    </>
   );
 };

@@ -1,0 +1,247 @@
+/* ==========================================================================
+   Aicut Design Tokens — modern terminal aesthetic
+   Mono-first typography, hairline borders, flat panes and ANSI-style status
+   colors. Color schemes only override color tokens:
+     dark (Noite, default) · phosphor (Fósforo) · amber (Âmbar) · light (Claro)
+   ========================================================================== */
+
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* Surfaces: canvas → chrome (top/status bars) → panes → elevated (menus) */
+  --bg-canvas: #0a0c10;
+  --bg-chrome: #0d1015;
+  --bg-sidebar: #0c0f14;
+  --bg-surface: #0f1218;
+  --bg-surface-2: #131720;
+  --bg-elevated: #161b25;
+  --bg-input: #080a0e;
+  --bg-hover: rgba(255, 255, 255, 0.045);
+  --bg-active: rgba(255, 255, 255, 0.08);
+  --bg-overlay: rgba(2, 3, 6, 0.6);
+  --control-bg: #12161f;
+  --control-bg-hover: #191e29;
+  --inset-bg: #07090c;
+  --raised-bg: #1d2330;
+
+  /* Hairlines */
+  --border-subtle: #191e27;
+  --border-default: #232a36;
+  --border-strong: #353e4e;
+
+  /* Text */
+  --text-primary: #d9dfea;
+  --text-secondary: #98a3b6;
+  --text-muted: #748095;
+  --text-on-media: #ffffff;
+
+  /* Accent (prompt cyan) */
+  --accent: #56d4dd;
+  --accent-strong: #56d4dd;
+  --accent-hover: #82e3ea;
+  --accent-fg: #04191b;
+  --accent-soft: rgba(86, 212, 221, 0.1);
+  --accent-border: rgba(86, 212, 221, 0.38);
+  --selection-bg: rgba(86, 212, 221, 0.1);
+
+  /* ANSI-style semantic colors */
+  --success: #7ee787;
+  --success-soft: rgba(126, 231, 135, 0.1);
+  --success-border: rgba(126, 231, 135, 0.32);
+  --warning: #f2cc60;
+  --warning-soft: rgba(242, 204, 96, 0.1);
+  --warning-border: rgba(242, 204, 96, 0.32);
+  --danger: #ff7b72;
+  --danger-soft: rgba(255, 123, 114, 0.1);
+  --danger-border: rgba(255, 123, 114, 0.35);
+  --info: #79c0ff;
+  --info-soft: rgba(121, 192, 255, 0.1);
+  --info-border: rgba(121, 192, 255, 0.32);
+  --magenta: #d2a8ff;
+  --magenta-soft: rgba(210, 168, 255, 0.1);
+  --magenta-border: rgba(210, 168, 255, 0.34);
+
+  --shadow-menu: 0 12px 32px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(0, 0, 0, 0.4);
+}
+
+[data-theme="phosphor"] {
+  color-scheme: dark;
+  --bg-canvas: #040805;
+  --bg-chrome: #060b07;
+  --bg-sidebar: #050a06;
+  --bg-surface: #071009;
+  --bg-surface-2: #0a160d;
+  --bg-elevated: #0d1d11;
+  --bg-input: #030604;
+  --bg-hover: rgba(57, 255, 136, 0.05);
+  --bg-active: rgba(57, 255, 136, 0.09);
+  --control-bg: #08130b;
+  --control-bg-hover: #0d1d11;
+  --inset-bg: #020503;
+  --raised-bg: #112616;
+  --border-subtle: #0f2216;
+  --border-default: #17321f;
+  --border-strong: #22472c;
+  --text-primary: #c6f5d2;
+  --text-secondary: #84c998;
+  --text-muted: #5f9e72;
+  --accent: #39ff88;
+  --accent-strong: #39ff88;
+  --accent-hover: #7dffb0;
+  --accent-fg: #021208;
+  --accent-soft: rgba(57, 255, 136, 0.1);
+  --accent-border: rgba(57, 255, 136, 0.36);
+  --selection-bg: rgba(57, 255, 136, 0.1);
+  --success: #a6e22e;
+  --success-soft: rgba(166, 226, 46, 0.1);
+  --success-border: rgba(166, 226, 46, 0.32);
+  --warning: #e6db74;
+  --warning-soft: rgba(230, 219, 116, 0.1);
+  --warning-border: rgba(230, 219, 116, 0.32);
+  --danger: #ff5f5f;
+  --danger-soft: rgba(255, 95, 95, 0.1);
+  --danger-border: rgba(255, 95, 95, 0.35);
+  --info: #66d9ef;
+  --info-soft: rgba(102, 217, 239, 0.1);
+  --info-border: rgba(102, 217, 239, 0.32);
+  --magenta: #c792ea;
+  --magenta-soft: rgba(199, 146, 234, 0.1);
+  --magenta-border: rgba(199, 146, 234, 0.34);
+}
+
+[data-theme="amber"] {
+  color-scheme: dark;
+  --bg-canvas: #0b0905;
+  --bg-chrome: #0e0b06;
+  --bg-sidebar: #0d0a05;
+  --bg-surface: #110d07;
+  --bg-surface-2: #17120a;
+  --bg-elevated: #1c160c;
+  --bg-input: #080603;
+  --bg-hover: rgba(255, 176, 0, 0.05);
+  --bg-active: rgba(255, 176, 0, 0.09);
+  --control-bg: #140f08;
+  --control-bg-hover: #1c160c;
+  --inset-bg: #060402;
+  --raised-bg: #261d10;
+  --border-subtle: #231b0e;
+  --border-default: #33281a;
+  --border-strong: #4b3b22;
+  --text-primary: #ffe3b3;
+  --text-secondary: #d8ad6a;
+  --text-muted: #a8834e;
+  --accent: #ffb000;
+  --accent-strong: #ffb000;
+  --accent-hover: #ffc74d;
+  --accent-fg: #1a1000;
+  --accent-soft: rgba(255, 176, 0, 0.1);
+  --accent-border: rgba(255, 176, 0, 0.38);
+  --selection-bg: rgba(255, 176, 0, 0.1);
+  --success: #b8d86b;
+  --success-soft: rgba(184, 216, 107, 0.1);
+  --success-border: rgba(184, 216, 107, 0.32);
+  --warning: #ffd479;
+  --warning-soft: rgba(255, 212, 121, 0.1);
+  --warning-border: rgba(255, 212, 121, 0.32);
+  --danger: #ff6e4a;
+  --danger-soft: rgba(255, 110, 74, 0.1);
+  --danger-border: rgba(255, 110, 74, 0.35);
+  --info: #8fc1ff;
+  --info-soft: rgba(143, 193, 255, 0.1);
+  --info-border: rgba(143, 193, 255, 0.32);
+  --magenta: #e7a6ff;
+  --magenta-soft: rgba(231, 166, 255, 0.1);
+  --magenta-border: rgba(231, 166, 255, 0.34);
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+  --bg-canvas: #f6f7f9;
+  --bg-chrome: #eceef2;
+  --bg-sidebar: #f0f2f5;
+  --bg-surface: #ffffff;
+  --bg-surface-2: #f5f6f8;
+  --bg-elevated: #ffffff;
+  --bg-input: #ffffff;
+  --bg-hover: rgba(15, 23, 42, 0.045);
+  --bg-active: rgba(15, 23, 42, 0.075);
+  --bg-overlay: rgba(15, 20, 32, 0.3);
+  --control-bg: #ffffff;
+  --control-bg-hover: #f2f4f7;
+  --inset-bg: #f0f2f5;
+  --raised-bg: #ffffff;
+  --border-subtle: #e7eaef;
+  --border-default: #d8dde5;
+  --border-strong: #c2c9d4;
+  --text-primary: #1b2230;
+  --text-secondary: #485265;
+  --text-muted: #667185;
+  --accent: #0a7b86;
+  --accent-strong: #0a7b86;
+  --accent-hover: #086570;
+  --accent-fg: #ffffff;
+  --accent-soft: rgba(10, 123, 134, 0.08);
+  --accent-border: rgba(10, 123, 134, 0.32);
+  --selection-bg: rgba(10, 123, 134, 0.09);
+  --success: #1a7f37;
+  --success-soft: rgba(26, 127, 55, 0.08);
+  --success-border: rgba(26, 127, 55, 0.3);
+  --warning: #9a6200;
+  --warning-soft: rgba(191, 135, 0, 0.1);
+  --warning-border: rgba(191, 135, 0, 0.34);
+  --danger: #cf222e;
+  --danger-soft: rgba(207, 34, 46, 0.07);
+  --danger-border: rgba(207, 34, 46, 0.3);
+  --info: #0969da;
+  --info-soft: rgba(9, 105, 218, 0.07);
+  --info-border: rgba(9, 105, 218, 0.28);
+  --magenta: #8250df;
+  --magenta-soft: rgba(130, 80, 223, 0.08);
+  --magenta-border: rgba(130, 80, 223, 0.3);
+  --shadow-menu: 0 12px 32px rgba(15, 23, 42, 0.16), 0 0 0 1px rgba(15, 23, 42, 0.05);
+}
+
+:root {
+  /* Typography — mono-first (Windows Terminal's Cascadia, then common coding fonts) */
+  --font-mono: "Cascadia Code", "Cascadia Mono", "JetBrains Mono", "Fira Code", Consolas, ui-monospace,
+    SFMono-Regular, Menlo, monospace;
+  --font-sans: var(--font-mono);
+
+  --text-2xs: 10.5px;
+  --text-xs: 11.5px;
+  --text-sm: 12.5px;
+  --text-md: 13px;
+  --text-lg: 14px;
+  --text-xl: 16px;
+  --text-2xl: 18px;
+
+  /* Radius — crisp, terminal-like */
+  --radius-xs: 2px;
+  --radius-sm: 4px;
+  --radius-md: 5px;
+  --radius-lg: 6px;
+  --radius-full: 999px;
+
+  /* Layout — no max width: the content uses the whole window */
+  --topbar-h: 38px;
+  --statusbar-h: 26px;
+  --sidebar-w: 236px;
+  --sidebar-w-collapsed: 50px;
+  --page-pad-x: 20px;
+  --page-pad-y: 16px;
+  --aside-w: 340px;
+
+  /* Motion — short and snappy */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --dur-fast: 90ms;
+  --dur-base: 140ms;
+  --dur-slow: 200ms;
+
+  /* Stacking */
+  --z-sticky: 10;
+  --z-overlay: 60;
+  --z-palette: 70;
+  --z-menu: 90;
+  --z-toast: 80;
+}

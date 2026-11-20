@@ -1,27 +1,45 @@
-import React, { useState } from "react";
-import { Blocks, CheckCircle2, Play, Terminal } from "lucide-react";
+import React, { useMemo, useRef, useState } from "react";
+import { Blocks, CircleCheck, Copy, Play, Terminal, TriangleAlert, Wrench } from "lucide-react";
 import { runAction } from "../../lib/client";
-import type { ActionSpec, ModuleInfo } from "../../lib/types";
+import type { ActionSpec, ModuleInfo, NotifyFn } from "../../lib/types";
+import { copyToClipboard } from "../../lib/ui";
+import { pageMeta } from "../../app/navigation";
+import {
+  Badge,
+  BusyIcon,
+  CodeBlock,
+  Field,
+  MoreButton,
+  PageHeader,
+  Panel,
+  Switch,
+  useContextMenu,
+  type MenuItems,
+} from "../../components";
+import "./core.css";
 
 interface ModulesViewProps {
   modules: ModuleInfo[];
   actions: ActionSpec[];
   onRefresh: () => void;
-  onNotify: (level: "info" | "success" | "warning" | "error", title: string, message: string) => void;
+  onNotify: NotifyFn;
 }
 
-export const ModulesView: React.FC<ModulesViewProps> = ({
-  modules,
-  actions,
-  onRefresh,
-  onNotify,
-}) => {
+export const ModulesView: React.FC<ModulesViewProps> = ({ modules, actions, onRefresh, onNotify }) => {
+  const menu = useContextMenu();
+  const playgroundRef = useRef<HTMLDivElement>(null);
   const [selectedActionId, setSelectedActionId] = useState<string>(actions[0]?.id ?? "system.info");
   const [jsonInput, setJsonInput] = useState<string>("{}");
   const [resultText, setResultText] = useState<string>("");
   const [running, setRunning] = useState(false);
 
   const selectedSpec = actions.find((a) => a.id === selectedActionId) ?? actions[0] ?? null;
+
+  const actionsByModule = useMemo(() => {
+    const map = new Map<string, ActionSpec[]>();
+    for (const a of actions) map.set(a.module_id, [...(map.get(a.module_id) ?? []), a]);
+    return map;
+  }, [actions]);
 
   async function toggleModule(mod: ModuleInfo) {
     try {
@@ -30,11 +48,7 @@ export const ModulesView: React.FC<ModulesViewProps> = ({
         enabled: !mod.enabled,
       });
       onRefresh();
-      onNotify(
-        "info",
-        mod.manifest.name,
-        !mod.enabled ? "Módulo ativado para UI e IAs." : "Módulo desativado.",
-      );
+      onNotify("info", mod.manifest.name, !mod.enabled ? "Módulo ativado para UI e IAs." : "Módulo desativado.");
     } catch (e) {
       onNotify("error", "Erro ao alterar módulo", (e as Error).message);
     }
@@ -55,70 +69,132 @@ export const ModulesView: React.FC<ModulesViewProps> = ({
     }
   }
 
+  const openInPlayground = (actionId: string) => {
+    setSelectedActionId(actionId);
+    setJsonInput("{}");
+    playgroundRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+
+  const moduleMenu = (mod: ModuleInfo): MenuItems => [
+    { type: "label", label: `${mod.manifest.name} · v${mod.manifest.version}` },
+    !mod.manifest.core && {
+      label: mod.enabled ? "Desativar módulo" : "Ativar módulo",
+      icon: mod.enabled ? TriangleAlert : CircleCheck,
+      danger: mod.enabled,
+      onSelect: () => void toggleModule(mod),
+    },
+    mod.action_ids.length > 0 && {
+      label: "Abrir no Action Playground",
+      icon: Terminal,
+      onSelect: () => openInPlayground(mod.action_ids[0]),
+    },
+    { type: "separator" },
+    { label: "Copiar ID do módulo", icon: Copy, onSelect: () => void copyToClipboard(mod.manifest.id, onNotify, "ID do módulo") },
+    {
+      label: "Copiar lista de actions",
+      icon: Copy,
+      onSelect: () => void copyToClipboard(mod.action_ids.join("\n"), onNotify, "Actions"),
+    },
+  ];
+
+  const ann = selectedSpec?.annotations;
+
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
-      <div className="page-header">
-        <div>
-          <h1 className="page-title">Módulos & Action Playground</h1>
-          <p className="page-subtitle">
-            Arquitetura plugável: cada módulo registra suas próprias Actions, ferramentas externas e JSON Schemas compartilhados entre você e as IAs.
-          </p>
-        </div>
+    <>
+      <PageHeader
+        {...pageMeta("modules")}
+        actions={
+          <span className="row gap-xs">
+            <Badge>{modules.length} módulos</Badge>
+            <Badge tone="accent">{actions.length} actions</Badge>
+          </span>
+        }
+      />
+
+      <div className="table-wrap">
+        <table className="table">
+          <thead>
+            <tr>
+              <th>módulo</th>
+              <th className="col-fit">versão</th>
+              <th className="col-fit">saúde</th>
+              <th className="col-fit num">actions</th>
+              <th className="col-fit c-opt">ferramentas</th>
+              <th className="col-fit">ativo</th>
+              <th className="col-fit" aria-label="Ações" />
+            </tr>
+          </thead>
+          <tbody>
+            {modules.map((mod) => (
+              <tr key={mod.manifest.id} onContextMenu={(e) => menu.open(e, moduleMenu(mod))}>
+                <td className="cell-title">
+                  <div className="row gap-xs">
+                    <Blocks size={14} className="text-accent" aria-hidden />
+                    <span className="strong">{mod.manifest.name}</span>
+                    <span className="muted text-xs">{mod.manifest.id}</span>
+                    {mod.manifest.core && <Badge tone="info">core</Badge>}
+                  </div>
+                  <div className="secondary text-xs truncate" title={mod.manifest.description}>
+                    {mod.manifest.description}
+                  </div>
+                </td>
+                <td className="col-fit muted">v{mod.manifest.version}</td>
+                <td className="col-fit">
+                  <Badge tone={mod.health.healthy ? "success" : "warning"} icon={mod.health.healthy ? CircleCheck : TriangleAlert}>
+                    {mod.health.message}
+                  </Badge>
+                </td>
+                <td className="col-fit num">
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-xs"
+                    disabled={mod.action_ids.length === 0}
+                    title="Abrir no Action Playground"
+                    onClick={() => mod.action_ids[0] && openInPlayground(mod.action_ids[0])}
+                  >
+                    {mod.action_ids.length}
+                  </button>
+                </td>
+                <td className="col-fit c-opt">
+                  {mod.tool_ids.length > 0 ? (
+                    <span className="row gap-xs muted text-xs">
+                      <Wrench size={12} aria-hidden /> {mod.tool_ids.join(", ")}
+                    </span>
+                  ) : (
+                    <span className="muted">—</span>
+                  )}
+                </td>
+                <td className="col-fit">
+                  {mod.manifest.core ? (
+                    <span className="muted text-xs">sempre</span>
+                  ) : (
+                    <Switch
+                      checked={mod.enabled}
+                      onChange={() => void toggleModule(mod)}
+                      label={mod.enabled ? `Desativar ${mod.manifest.name}` : `Ativar ${mod.manifest.name}`}
+                    />
+                  )}
+                </td>
+                <td className="col-fit">
+                  <MoreButton items={() => moduleMenu(mod)} />
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
 
-      {/* Installed Modules Grid */}
-      <div className="grid-2">
-        {modules.map((mod) => (
-          <div key={mod.manifest.id} className="panel" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 10 }}>
-              <div>
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <Blocks size={16} color="var(--accent)" />
-                  <strong>{mod.manifest.name}</strong>
-                  <span className="pill">v{mod.manifest.version}</span>
-                  {mod.manifest.core && <span className="pill accent">Core</span>}
-                </div>
-                <p style={{ margin: "6px 0 0", fontSize: 13, color: "var(--text-secondary)" }}>
-                  {mod.manifest.description}
-                </p>
-              </div>
-              {!mod.manifest.core && (
-                <button
-                  type="button"
-                  className={`btn btn-sm ${mod.enabled ? "" : "btn-primary"}`}
-                  onClick={() => toggleModule(mod)}
-                >
-                  {mod.enabled ? "Desativar" : "Ativar"}
-                </button>
-              )}
-            </div>
-
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
-              <span className={`pill ${mod.health.healthy ? "success" : "warning"}`}>
-                <CheckCircle2 size={11} /> {mod.health.message}
-              </span>
-              <span className="pill">{mod.action_ids.length} actions</span>
-              {mod.tool_ids.length > 0 && (
-                <span className="pill">Ferramentas: {mod.tool_ids.join(", ")}</span>
-              )}
-            </div>
-          </div>
-        ))}
-      </div>
-
-      {/* Dynamic Action Playground */}
-      <div className="panel" style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-        <div className="panel-header" style={{ marginBottom: 0 }}>
-          <h2 className="panel-title">
-            <Terminal size={16} /> Action Playground (Testar qualquer Action / Tool de IA)
-          </h2>
-        </div>
-
-        <div className="grid-2">
-          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-            <div className="field">
-              <label>Action registrada</label>
+      <div ref={playgroundRef} className="scroll-anchor">
+      <Panel
+        title="Action Playground"
+        icon={Terminal}
+        actions={<span className="muted text-xs">teste qualquer Action / Tool exposta às IAs</span>}
+      >
+        <div className="grid-2 playground">
+          <div className="stack">
+            <Field label="Action registrada" htmlFor="pg-action">
               <select
+                id="pg-action"
                 className="select"
                 value={selectedSpec?.id ?? ""}
                 onChange={(e) => {
@@ -126,29 +202,48 @@ export const ModulesView: React.FC<ModulesViewProps> = ({
                   setJsonInput("{}");
                 }}
               >
-                {actions.map((a) => (
-                  <option key={a.id} value={a.id}>
-                    {a.id} — {a.title}
-                  </option>
+                {Array.from(actionsByModule.entries()).map(([moduleId, list]) => (
+                  <optgroup key={moduleId} label={moduleId}>
+                    {list.map((a) => (
+                      <option key={a.id} value={a.id}>
+                        {a.id} — {a.title}
+                      </option>
+                    ))}
+                  </optgroup>
                 ))}
               </select>
-            </div>
+            </Field>
 
             {selectedSpec && (
-              <div style={{ fontSize: 12.5, color: "var(--text-secondary)" }}>
-                {selectedSpec.description}
+              <div className="stack stack-sm">
+                <p className="secondary text-sm">{selectedSpec.description}</p>
+                {ann && (
+                  <div className="row wrap gap-xs">
+                    {ann.read_only && <Badge tone="info">somente leitura</Badge>}
+                    {ann.destructive && <Badge tone="danger">destrutiva</Badge>}
+                    {ann.idempotent && <Badge>idempotente</Badge>}
+                    {ann.long_running && <Badge tone="warning">longa duração</Badge>}
+                  </div>
+                )}
               </div>
             )}
 
-            <div className="field">
-              <label>Parâmetros (JSON)</label>
+            <Field label="Parâmetros (JSON)" htmlFor="pg-json" hint="Ctrl+Enter executa">
               <textarea
+                id="pg-json"
                 className="textarea"
-                rows={7}
+                rows={8}
+                spellCheck={false}
                 value={jsonInput}
                 onChange={(e) => setJsonInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+                    e.preventDefault();
+                    void handleRunPlayground();
+                  }
+                }}
               />
-            </div>
+            </Field>
 
             <button
               type="button"
@@ -156,28 +251,34 @@ export const ModulesView: React.FC<ModulesViewProps> = ({
               disabled={running || !selectedSpec}
               onClick={handleRunPlayground}
             >
-              <Play size={14} /> Executar Action
+              <BusyIcon busy={running} icon={Play} /> Executar action
             </button>
           </div>
 
-          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-            <div className="field">
-              <label>Saída Estruturada</label>
-              <pre className="code-block" style={{ minHeight: 170, maxHeight: 260 }}>
-                {resultText || "// Execute uma Action para inspecionar o retorno JSON"}
-              </pre>
-            </div>
+          <div className="stack">
+            <Field label="Saída estruturada">
+              <CodeBlock
+                code={resultText || "// execute uma action para inspecionar o retorno JSON"}
+                minHeight={180}
+                maxHeight={300}
+                onCopy={resultText ? () => void copyToClipboard(resultText, onNotify, "Saída") : undefined}
+              />
+            </Field>
             {selectedSpec && (
-              <div className="field">
-                <label>Input JSON Schema (exposto automaticamente ao MCP & OpenAPI)</label>
-                <pre className="code-block" style={{ maxHeight: 160 }}>
-                  {JSON.stringify(selectedSpec.input_schema, null, 2)}
-                </pre>
-              </div>
+              <Field label="Input JSON Schema (exposto ao MCP & OpenAPI)">
+                <CodeBlock
+                  code={JSON.stringify(selectedSpec.input_schema, null, 2)}
+                  maxHeight={200}
+                  onCopy={() =>
+                    void copyToClipboard(JSON.stringify(selectedSpec.input_schema, null, 2), onNotify, "JSON Schema")
+                  }
+                />
+              </Field>
             )}
           </div>
         </div>
+      </Panel>
       </div>
-    </div>
+    </>
   );
 };

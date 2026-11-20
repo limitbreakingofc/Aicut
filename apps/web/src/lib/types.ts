@@ -1,4 +1,7 @@
 export type ActorKind = "human" | "ai" | "system";
+export type NotifyLevel = "info" | "success" | "warning" | "error";
+/** Shows a toast notification (shared by every module view). */
+export type NotifyFn = (level: NotifyLevel, title: string, message: string) => void;
 export type MediaKind = "video" | "video_only" | "audio" | "subtitle" | "timeline" | "transcript";
 export type MediaSourceType = "download" | "local" | "generated";
 export type JobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
