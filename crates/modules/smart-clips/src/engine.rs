@@ -109,6 +109,15 @@ pub struct RenderClipRequest {
     /// Optional custom 9:16 PNG template path (uses built-in SMOKING33 template if omitted).
     #[serde(default)]
     pub template_path: Option<String>,
+    /// Enable native AI face detection + zero-border webcam edge detection + smooth camera tracking.
+    #[serde(default = "default_true")]
+    pub face_tracking: bool,
+    /// Framing zoom factor on the face (0.85 = wider, 1.0 = natural cameraman, 1.2 = closer).
+    #[serde(default = "default_face_zoom")]
+    pub face_zoom: f32,
+    /// Inner border trim fraction to eliminate OBS borders/gameplay bleed (default 0.045 = 4.5%).
+    #[serde(default = "default_border_trim")]
+    pub border_trim_pct: f32,
     #[serde(default = "default_true")]
     pub burn_subtitles: bool,
     #[serde(default)]
@@ -117,6 +126,14 @@ pub struct RenderClipRequest {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_face_zoom() -> f32 {
+    1.0
+}
+
+fn default_border_trim() -> f32 {
+    0.045
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -496,6 +513,7 @@ pub async fn start_clip_render(
         .ok_or_else(|| AicutError::not_found(format!("Source media '{}' not found", run.media_id)))?;
 
     let ffmpeg_bin = kernel.tools.resolve_tool("ffmpeg")?;
+    let ffprobe_bin = kernel.tools.resolve_tool("ffprobe")?;
     let transcript = kernel
         .repo
         .find_best_transcript_for_media(&source.id)?
@@ -558,9 +576,13 @@ pub async fn start_clip_render(
                     &task_job_id,
                     JobProgress {
                         percent: pct,
-                        stage: "rendering_shorts".into(),
+                        stage: if req.face_tracking {
+                            "face_tracking_and_rendering".into()
+                        } else {
+                            "rendering_shorts".into()
+                        },
                         message: Some(format!(
-                            "Renderizando ({}/{total}): '{}' ({:.0}s)...",
+                            "Rastreando rosto com IA e renderizando ({}/{total}): '{}' ({:.0}s)...",
                             step + 1,
                             clip.title,
                             clip.total_duration_sec
@@ -572,6 +594,7 @@ pub async fn start_clip_render(
                 let asset = render_clip_to_library(
                     &task_kernel,
                     &ffmpeg_bin,
+                    &ffprobe_bin,
                     &source,
                     &clip,
                     transcript.as_ref(),
@@ -579,6 +602,9 @@ pub async fn start_clip_render(
                     req.webcam_corner,
                     req.content_fit,
                     effective_template_path.as_deref(),
+                    req.face_tracking,
+                    req.face_zoom,
+                    req.border_trim_pct,
                     req.burn_subtitles,
                 )
                 .await?;

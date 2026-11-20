@@ -1,4 +1,5 @@
 pub mod engine;
+pub mod face_track;
 pub mod frames;
 pub mod gemini;
 pub mod local_vlm;

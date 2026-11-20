@@ -10,6 +10,7 @@ use std::path::Path;
 use tokio::process::Command;
 use uuid::Uuid;
 
+use crate::face_track::{compute_camera_track, CameraTrackPlan};
 use crate::template::{detect_template_geometry_from_path, resolve_template_png, TemplateGeometry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -36,6 +37,8 @@ impl Default for ShortsLayout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WebcamCorner {
+    /// AI automatically detects the webcam/face anywhere on screen, removes OBS borders, and tracks smoothly.
+    AutoFace,
     BottomRight,
     BottomLeft,
     TopRight,
@@ -45,7 +48,7 @@ pub enum WebcamCorner {
 
 impl Default for WebcamCorner {
     fn default() -> Self {
-        Self::BottomRight
+        Self::AutoFace
     }
 }
 
@@ -68,6 +71,7 @@ impl Default for ContentFit {
 pub async fn render_clip_to_library(
     kernel: &AicutKernel,
     ffmpeg_bin: &Path,
+    ffprobe_bin: &Path,
     source: &MediaAsset,
     clip: &SmartClipPlan,
     transcript: Option<&TranscriptRecord>,
@@ -75,6 +79,9 @@ pub async fn render_clip_to_library(
     webcam_corner: WebcamCorner,
     content_fit: ContentFit,
     template_path: Option<&str>,
+    face_tracking: bool,
+    face_zoom: f32,
+    border_trim_pct: f32,
     burn_subtitles: bool,
 ) -> AicutResult<MediaAsset> {
     if clip.segments.is_empty() {
@@ -115,6 +122,56 @@ pub async fn render_clip_to_library(
         None
     };
 
+    // Run native Rust ONNX AI Face Tracking + Zero-Border Webcam Edge Detection
+    let needs_face_track = face_tracking
+        && matches!(
+            layout,
+            ShortsLayout::TemplateSplit | ShortsLayout::GamingSplit | ShortsLayout::CenterCrop
+        );
+    let mut tmp_cmd_path: Option<std::path::PathBuf> = None;
+    let camera_track_plan: Option<CameraTrackPlan> = if needs_face_track {
+        let (src_w, src_h) = resolve_video_dimensions(ffprobe_bin, source).await;
+        let (slot_w, slot_h) = match layout {
+            ShortsLayout::TemplateSplit => {
+                let tc = resolved_template
+                    .as_ref()
+                    .map(|(_, g)| g.top_camera)
+                    .unwrap_or_else(|| TemplateGeometry::default().top_camera);
+                (tc.w, tc.h)
+            }
+            ShortsLayout::GamingSplit => (1080, 730),
+            ShortsLayout::CenterCrop => (1080, 1920),
+            _ => (1080, 730),
+        };
+        if let Ok(Some(plan)) = compute_camera_track(
+            kernel,
+            ffmpeg_bin,
+            Path::new(&source.file_path),
+            src_w,
+            src_h,
+            &clip.segments,
+            slot_w,
+            slot_h,
+            webcam_corner,
+            face_zoom,
+            border_trim_pct,
+        )
+        .await
+        {
+            if plan.keyframes.len() > 1 {
+                let p = std::env::temp_dir().join(format!("aicut-camtrack-{short_id}.cmd"));
+                if plan.write_sendcmd_file(&p).is_ok() {
+                    tmp_cmd_path = Some(p);
+                }
+            }
+            Some(plan)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let hw_encoder = select_hw_h264_encoder(kernel.hardware.recommended_accel);
     let first_attempt = run_ffmpeg_render(
         ffmpeg_bin,
@@ -126,6 +183,9 @@ pub async fn render_clip_to_library(
         resolved_template
             .as_ref()
             .map(|(p, g)| (p.as_path(), *g)),
+        camera_track_plan
+            .as_ref()
+            .map(|p| (p, tmp_cmd_path.as_deref())),
         tmp_ass.as_deref(),
         hw_encoder,
         &out_path,
@@ -144,6 +204,9 @@ pub async fn render_clip_to_library(
             resolved_template
                 .as_ref()
                 .map(|(p, g)| (p.as_path(), *g)),
+            camera_track_plan
+                .as_ref()
+                .map(|p| (p, tmp_cmd_path.as_deref())),
             tmp_ass.as_deref(),
             "libx264",
             &out_path,
@@ -154,6 +217,9 @@ pub async fn render_clip_to_library(
     }
 
     if let Some(ref p) = tmp_ass {
+        let _ = std::fs::remove_file(p);
+    }
+    if let Some(ref p) = tmp_cmd_path {
         let _ = std::fs::remove_file(p);
     }
 
@@ -233,14 +299,80 @@ pub fn select_hw_h264_encoder(accel: AccelBackend) -> &'static str {
     }
 }
 
+async fn resolve_video_dimensions(ffprobe_bin: &Path, source: &MediaAsset) -> (u32, u32) {
+    if let (Some(w), Some(h)) = (source.metadata.width, source.metadata.height) {
+        if w >= 64 && h >= 64 {
+            return (w, h);
+        }
+    }
+    let mut cmd = Command::new(ffprobe_bin);
+    configure_tokio_command(&mut cmd);
+    if let Ok(out) = cmd
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=s=x:p=0",
+        ])
+        .arg(&source.file_path)
+        .output()
+        .await
+    {
+        if out.status.success() {
+            let txt = String::from_utf8_lossy(&out.stdout);
+            if let Some((ws, hs)) = txt.trim().split_once('x') {
+                if let (Ok(w), Ok(h)) = (ws.parse::<u32>(), hs.parse::<u32>()) {
+                    if w >= 64 && h >= 64 {
+                        return (w, h);
+                    }
+                }
+            }
+        }
+    }
+    (1920, 1080)
+}
+
 fn webcam_crop_expr(corner: WebcamCorner) -> &'static str {
     match corner {
-        WebcamCorner::BottomRight => "crop=iw*0.34:ih*0.38:iw*0.66:ih*0.62",
-        WebcamCorner::BottomLeft => "crop=iw*0.34:ih*0.38:0:ih*0.62",
-        WebcamCorner::TopRight => "crop=iw*0.34:ih*0.38:iw*0.66:0",
-        WebcamCorner::TopLeft => "crop=iw*0.34:ih*0.38:0:0",
+        WebcamCorner::AutoFace | WebcamCorner::BottomRight => {
+            "crop=iw*0.30:ih*0.34:iw*0.68:ih*0.64"
+        }
+        WebcamCorner::BottomLeft => "crop=iw*0.30:ih*0.34:iw*0.02:ih*0.64",
+        WebcamCorner::TopRight => "crop=iw*0.30:ih*0.34:iw*0.68:ih*0.02",
+        WebcamCorner::TopLeft => "crop=iw*0.30:ih*0.34:iw*0.02:ih*0.02",
         WebcamCorner::Center => "crop=iw*0.60:ih*0.75:iw*0.20:ih*0.08",
     }
+}
+
+fn build_camera_filter_chain(
+    input_label: &str,
+    output_label: &str,
+    target_w: u32,
+    target_h: u32,
+    webcam_corner: WebcamCorner,
+    camera_track: Option<(&CameraTrackPlan, Option<&Path>)>,
+) -> String {
+    if let Some((plan, cmd_path_opt)) = camera_track {
+        if let Some(cmd_path) = cmd_path_opt {
+            let escaped = escape_ffmpeg_filter_path(cmd_path);
+            return format!(
+                "{input_label}sendcmd=f='{escaped}',crop@cam=w={}:h={}:x={}:y={},scale={target_w}:{target_h}:flags=lanczos,setsar=1{output_label}",
+                plan.crop_w, plan.crop_h, plan.init_x, plan.init_y
+            );
+        }
+        return format!(
+            "{input_label}crop=w={}:h={}:x={}:y={},scale={target_w}:{target_h}:flags=lanczos,setsar=1{output_label}",
+            plan.crop_w, plan.crop_h, plan.init_x, plan.init_y
+        );
+    }
+    let cam_crop = webcam_crop_expr(webcam_corner);
+    format!(
+        "{input_label}{cam_crop},scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h},setsar=1{output_label}"
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -252,6 +384,7 @@ async fn run_ffmpeg_render(
     webcam_corner: WebcamCorner,
     content_fit: ContentFit,
     template: Option<(&Path, TemplateGeometry)>,
+    camera_track: Option<(&CameraTrackPlan, Option<&Path>)>,
     ass_path: Option<&Path>,
     encoder: &str,
     out_path: &Path,
@@ -308,17 +441,20 @@ async fn run_ffmpeg_render(
             let geom = template.map(|(_, g)| g).unwrap_or_default();
             let tc = geom.top_camera;
             let bc = geom.bottom_content;
-            let cam_crop = webcam_crop_expr(webcam_corner);
 
             filter_parts.push("[vbase]split=3[canvas_src][cam_src][content_src]".to_string());
             // Derive canvas from video stream so FPS & EOF always match source cleanly
             filter_parts.push(
                 "[canvas_src]scale=1080:1920,drawbox=t=fill:c=black,setsar=1[canvas]".to_string(),
             );
-            // Top box: CAMERA
-            filter_parts.push(format!(
-                "[cam_src]{cam_crop},scale={}:{}:force_original_aspect_ratio=increase,crop={}:{},setsar=1[cam_box]",
-                tc.w, tc.h, tc.w, tc.h
+            // Top box: CAMERA (AI Face Tracked + Zero-Border Safe Box when enabled)
+            filter_parts.push(build_camera_filter_chain(
+                "[cam_src]",
+                "[cam_box]",
+                tc.w,
+                tc.h,
+                webcam_corner,
+                camera_track,
             ));
             // Bottom box: CONTENT
             match content_fit {
@@ -353,10 +489,21 @@ async fn run_ffmpeg_render(
             filter_parts.push("[vbase]scale=trunc(iw/2)*2:trunc(ih/2)*2[vlayout]".to_string());
         }
         ShortsLayout::CenterCrop => {
-            filter_parts.push(
-                "[vbase]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1[vlayout]"
-                    .to_string(),
-            );
+            if let Some((plan, cmd_path_opt)) = camera_track {
+                filter_parts.push(build_camera_filter_chain(
+                    "[vbase]",
+                    "[vlayout]",
+                    1080,
+                    1920,
+                    webcam_corner,
+                    Some((plan, cmd_path_opt)),
+                ));
+            } else {
+                filter_parts.push(
+                    "[vbase]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1[vlayout]"
+                        .to_string(),
+                );
+            }
         }
         ShortsLayout::FitBlur => {
             filter_parts.push("[vbase]split=2[bg_in][fg_in]".to_string());
@@ -370,11 +517,15 @@ async fn run_ffmpeg_render(
             filter_parts.push("[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[vlayout]".to_string());
         }
         ShortsLayout::GamingSplit => {
-            // Camera on TOP (1080x730) + Content/Gameplay on BOTTOM (1080x1190)
-            let cam_crop = webcam_crop_expr(webcam_corner);
+            // Camera on TOP (1080x730, AI Face Tracked + Zero-Border) + Content on BOTTOM (1080x1190)
             filter_parts.push("[vbase]split=2[cam_in][bot_in]".to_string());
-            filter_parts.push(format!(
-                "[cam_in]{cam_crop},scale=1080:730:force_original_aspect_ratio=increase,crop=1080:730[cam]"
+            filter_parts.push(build_camera_filter_chain(
+                "[cam_in]",
+                "[cam]",
+                1080,
+                730,
+                webcam_corner,
+                camera_track,
             ));
             match content_fit {
                 ContentFit::Fill => {

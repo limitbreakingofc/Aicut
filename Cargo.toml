@@ -15,7 +15,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.4.6"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
 
@@ -37,6 +37,7 @@ dirs = "6.0"
 flate2 = "1.1"
 futures-util = "0.3"
 http-body-util = "0.1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 mime_guess = "2.0"
 png = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
@@ -56,6 +57,7 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tract-onnx = "0.21"
 uuid = { version = "1.12", features = ["v4", "serde"] }
 walkdir = "2.5"
 which = "7.0"

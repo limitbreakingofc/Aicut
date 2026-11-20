@@ -86,7 +86,7 @@ const DESCRIPTION_PRESETS = [
 ];
 
 type ShortsLayout = "template_split" | "gaming_split" | "fit_blur" | "center_crop" | "original";
-type WebcamCorner = "bottom_right" | "bottom_left" | "top_right" | "top_left" | "center";
+type WebcamCorner = "auto_face" | "bottom_right" | "bottom_left" | "top_right" | "top_left" | "center";
 
 const SHORTS_LAYOUTS: Array<{ id: ShortsLayout; short: string; label: string; desc: string }> = [
   {
@@ -177,8 +177,11 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
 
   // Shorts rendering options
   const [layout, setLayout] = useState<ShortsLayout>("template_split");
-  const [webcamCorner, setWebcamCorner] = useState<WebcamCorner>("bottom_right");
+  const [webcamCorner, setWebcamCorner] = useState<WebcamCorner>("auto_face");
   const [contentFit, setContentFit] = useState<"fill" | "fit_blur">("fill");
+  const [faceTracking, setFaceTracking] = useState<boolean>(true);
+  const [faceZoom, setFaceZoom] = useState<number>(1.0);
+  const [borderTrimPct, setBorderTrimPct] = useState<number>(0.045);
   const [customTemplatePath, setCustomTemplatePath] = useState<string>("");
   const [burnSubtitles, setBurnSubtitles] = useState<boolean>(true);
   const [analyzing, setAnalyzing] = useState<boolean>(false);
@@ -399,6 +402,9 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
         webcam_corner: webcamCorner,
         content_fit: contentFit,
         template_path: customTemplatePath.trim() ? customTemplatePath.trim() : undefined,
+        face_tracking: faceTracking,
+        face_zoom: faceZoom,
+        border_trim_pct: borderTrimPct,
         burn_subtitles: burnSubtitles,
         wait: false,
       });
@@ -894,11 +900,12 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
                   value={webcamCorner}
                   onChange={(e) => setWebcamCorner(e.target.value as WebcamCorner)}
                 >
-                  <option value="bottom_right">Canto inferior direito</option>
-                  <option value="bottom_left">Canto inferior esquerdo</option>
-                  <option value="top_right">Canto superior direito</option>
-                  <option value="top_left">Canto superior esquerdo</option>
-                  <option value="center">Centro (vídeo sem webcam no canto)</option>
+                  <option value="auto_face">Automático · IA detecta webcam, remove bordas e segue rosto</option>
+                  <option value="bottom_right">Canto inferior direito (com IA facial + anti-borda)</option>
+                  <option value="bottom_left">Canto inferior esquerdo (com IA facial + anti-borda)</option>
+                  <option value="top_right">Canto superior direito (com IA facial + anti-borda)</option>
+                  <option value="top_left">Canto superior esquerdo (com IA facial + anti-borda)</option>
+                  <option value="center">Centro / Tela cheia (sem webcam no canto)</option>
                 </select>
               </Field>
               <Field label="Conteúdo (janela de baixo)" htmlFor="sc-fit">
@@ -915,7 +922,45 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
             </div>
           )}
 
+          {(isSplit || layout === "center_crop") && (
+            <div className="grid-2">
+              <Field label="Enquadramento / Zoom do rosto (IA)" htmlFor="sc-zoom">
+                <select
+                  id="sc-zoom"
+                  className="select"
+                  value={faceZoom}
+                  onChange={(e) => setFaceZoom(Number(e.target.value))}
+                  disabled={!faceTracking}
+                >
+                  <option value={0.85}>Mais aberto (mostra mais ombros/ambiente)</option>
+                  <option value={1.0}>Natural de câmera · Recomendado</option>
+                  <option value={1.2}>Close no rosto (foco máximo nas expressões)</option>
+                </select>
+              </Field>
+              <Field label="Margem anti-borda da webcam" htmlFor="sc-trim">
+                <select
+                  id="sc-trim"
+                  className="select"
+                  value={borderTrimPct}
+                  onChange={(e) => setBorderTrimPct(Number(e.target.value))}
+                  disabled={!faceTracking}
+                >
+                  <option value={0.03}>Leve (3% — webcam sem moldura)</option>
+                  <option value={0.045}>Padrão (4.5% — remove bordas OBS)</option>
+                  <option value={0.08}>Forte (8% — remove molduras grossas / overlays)</option>
+                </select>
+              </Field>
+            </div>
+          )}
+
           <div className="row wrap gap-md">
+            {(isSplit || layout === "center_crop") && (
+              <Checkbox
+                checked={faceTracking}
+                onChange={setFaceTracking}
+                label="Rastreamento facial suave por IA (centralizar rosto e eliminar bordas durante o vídeo todo)"
+              />
+            )}
             <Checkbox
               checked={burnSubtitles}
               onChange={setBurnSubtitles}
