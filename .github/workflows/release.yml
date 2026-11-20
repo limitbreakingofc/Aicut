@@ -83,7 +83,7 @@ jobs:
           body: |
             ## Aicut ${{ steps.tag.outputs.name }} — Estúdio Modular AI-First para Windows 11
 
-            ### Novidades da v0.5.0 — IA Cameraman: Rastreamento Facial Suave & Webcam Sem Bordas
+            ### Novidades da v0.5.1 — IA Cameraman: Rastreamento Facial Suave & Webcam Sem Bordas
             - **IA Facial 100% Nativa em Rust (`tract-onnx` + `UltraFace RFB-320` ~1,2 MB, zero Python/DLL):** detecta o rosto do apresentador ao longo de todo o corte com **filtro anti-NPC** (não confunde o streamer com personagens do jogo).
             - **Eliminação Automática de Bordas da Webcam (Mediana Temporal + Inset Anti-Borda):** identifica as 4 paredes exatas da caixa da webcam do OBS e trava matematicamente o enquadramento dentro da área limpa — **zero bordas ou vazamento da gameplay na janela de cima**!
             - **Movimento Natural de Câmera Durante o Vídeo Todo (`FFmpeg sendcmd` + `crop@cam` dinâmico):** aplica composição na regra dos terços (olhos a 38% do topo) com física de tripé fluido (*deadzone*, velocidade máxima suave, *hold* em oclusão e corte seco em troca de cena), mantendo 100% da aceleração NVENC da GPU.
