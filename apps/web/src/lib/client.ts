@@ -39,6 +39,10 @@ export function mediaStreamUrl(id: string): string {
   return `${getPublicServerUrl()}/api/v1/media/${encodeURIComponent(id)}/stream`;
 }
 
+export function mediaPreviewUrl(id: string): string {
+  return `${getPublicServerUrl()}/api/v1/media/${encodeURIComponent(id)}/preview`;
+}
+
 export function mediaThumbnailUrl(id: string): string {
   return `${getPublicServerUrl()}/api/v1/media/${encodeURIComponent(id)}/thumbnail`;
 }

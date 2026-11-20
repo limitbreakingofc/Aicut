@@ -242,7 +242,9 @@ pub fn build_motion_filtergraph(
         let cam_crop = norm_rect_crop_expr(comp.webcam_rect);
         let content_crop = build_content_crop_expr(comp.content_rect, sc);
 
-        let fx_tail = build_scene_effects_suffix(&sc.effects);
+        let sc_dur = (sc.end_sec - sc.start_sec).max(0.2);
+        let allow_zoompan = sc.layout != SceneLayoutPreset::SplitBranded;
+        let fx_tail = build_scene_effects_suffix(&sc.effects, sc_dur, fps, allow_zoompan);
         match sc.layout {
             SceneLayoutPreset::SplitBranded => {
                 let tc = geom.top_camera;
@@ -358,8 +360,41 @@ pub fn build_motion_filtergraph(
     parts.join(";")
 }
 
-fn build_scene_effects_suffix(fx: &SceneEffects) -> String {
+fn build_scene_effects_suffix(
+    fx: &SceneEffects,
+    scene_dur: f64,
+    fps: u32,
+    allow_zoompan: bool,
+) -> String {
     let mut chain = String::new();
+    let zoom_end = fx.camera_zoom_end.clamp(1.0, 1.25);
+    let shake = fx.impact_shake.clamp(0.0, 1.0);
+    if allow_zoompan && (zoom_end > 1.015 || shake > 0.08) {
+        let total_f = ((scene_dur * fps as f64).round() as u32).max(6);
+        let shake_f = ((0.35 * fps as f64).round() as u32).max(4);
+        let base_zoom = if shake > 0.08 { 1.03 } else { 1.0 };
+        let z_delta = (zoom_end - base_zoom).max(0.0);
+        let z_expr = format!("{base_zoom:.3}+{z_delta:.3}*min(1\\,on/{total_f})");
+        let (x_expr, y_expr) = if shake > 0.08 {
+            let amp = (shake * 14.0).round();
+            (
+                format!(
+                    "max(0\\,min(iw-iw/zoom\\,iw/2-(iw/zoom/2)+if(lt(on\\,{shake_f})\\,sin(on*2.3)*{amp:.0}*(1-on/{shake_f})\\,0)))"
+                ),
+                format!(
+                    "max(0\\,min(ih-ih/zoom\\,ih/2-(ih/zoom/2)+if(lt(on\\,{shake_f})\\,cos(on*2.9)*{amp:.0}*(1-on/{shake_f})\\,0)))"
+                ),
+            )
+        } else {
+            (
+                "iw/2-(iw/zoom/2)".to_string(),
+                "ih/2-(ih/zoom/2)".to_string(),
+            )
+        };
+        chain.push_str(&format!(
+            ",zoompan=z='{z_expr}':d=1:x='{x_expr}':y='{y_expr}':s=1080x1920:fps={fps}"
+        ));
+    }
     match fx.color_mood.to_lowercase().as_str() {
         "vibrant" => chain.push_str(",eq=contrast=1.06:saturation=1.22"),
         "dramatic" => chain.push_str(",eq=contrast=1.12:brightness=-0.03:saturation=0.90"),
@@ -671,7 +706,12 @@ mod tests {
                         headline: Some("INACREDITÁVEL!".into()),
                         ..Default::default()
                     },
-                    effects: SceneEffects { vignette: true, color_mood: "vibrant".into(), ..Default::default() },
+                    effects: SceneEffects {
+                        camera_zoom_end: 1.12,
+                        impact_shake: 0.5,
+                        vignette: true,
+                        color_mood: "vibrant".into(),
+                    },
                     rationale: String::new(),
                     custom_code: None,
                 },
@@ -717,6 +757,7 @@ mod tests {
         assert!(fg.contains("concat=n=3:v=1:a=0[vlayout]"));
         assert!(fg.contains("[tpl0]overlay=0:0:format=auto"));
         assert!(fg.contains("[2:v]scale=1080:1920,format=rgba[hf_ovl]"));
+        assert!(fg.contains("zoompan=z="));
         assert!(fg.contains("vignette=PI/4.5"));
 
         let ass = build_motion_ass_track(&comp, None, true);

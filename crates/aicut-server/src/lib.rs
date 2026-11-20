@@ -1,4 +1,4 @@
-use aicut_core::{ActorKind, AicutKernel, UiState};
+use aicut_core::{configure_tokio_command, ActorKind, AicutKernel, UiState};
 use aicut_mcp::{action_id_to_mcp_name, handle_mcp_request, JsonRpcRequest};
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -58,6 +58,7 @@ pub struct ServerState {
     pub api_token: Option<String>,
     pub base_url: String,
     sse_sessions: Arc<RwLock<HashMap<String, mpsc::Sender<String>>>>,
+    preview_build_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ServerState {
@@ -67,6 +68,7 @@ impl ServerState {
             api_token: config.api_token.clone(),
             base_url: format!("http://{}:{}", config.host, config.port),
             sse_sessions: Arc::new(RwLock::new(HashMap::new())),
+            preview_build_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }
@@ -77,7 +79,8 @@ pub fn build_router(kernel: Arc<AicutKernel>, config: &ServerConfig) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
-        .allow_headers(Any);
+        .allow_headers(Any)
+        .expose_headers(Any);
 
     let mut router = Router::new()
         .route("/health", get(health_handler))
@@ -89,6 +92,7 @@ pub fn build_router(kernel: Arc<AicutKernel>, config: &ServerConfig) -> Router {
         .route("/api/v1/tools/anthropic", get(anthropic_tools_handler))
         .route("/api/v1/activity", get(activity_handler))
         .route("/api/v1/media/{id}/stream", get(stream_media_handler))
+        .route("/api/v1/media/{id}/preview", get(stream_preview_media_handler))
         .route("/api/v1/media/{id}/thumbnail", get(thumbnail_handler))
         .route("/api/v1/media/{id}/text", get(media_text_handler))
         .route("/api/v1/events", get(ws_events_handler))
@@ -353,17 +357,95 @@ async fn stream_media_handler(
     let Ok(Some(asset)) = state.kernel.repo.get_media(&id) else {
         return (StatusCode::NOT_FOUND, "Media not found").into_response();
     };
-    let path = PathBuf::from(&asset.file_path);
-    let Ok(mut file) = tokio::fs::File::open(&path).await else {
+    stream_file_with_ranges(&PathBuf::from(&asset.file_path), &headers, None).await
+}
+
+/// Streams a guaranteed WebView2/Chromium-playable H.264/AAC MP4 preview proxy on demand.
+/// Used automatically as fallback when the original video uses an unsupported container/codec
+/// (e.g. MKV, AV1, HEVC, ProRes) so Motion Studio preview NEVER breaks.
+async fn stream_preview_media_handler(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Ok(Some(asset)) = state.kernel.repo.get_media(&id) else {
+        return (StatusCode::NOT_FOUND, "Media not found").into_response();
+    };
+    let src_path = PathBuf::from(&asset.file_path);
+    if !src_path.is_file() {
+        return (StatusCode::NOT_FOUND, "Media file missing on disk").into_response();
+    }
+
+    let safe_id: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let cache_dir = std::env::temp_dir().join("aicut-preview-cache");
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let proxy_path = cache_dir.join(format!("{safe_id}.mp4"));
+
+    if !proxy_path.is_file() {
+        let _guard = state.preview_build_lock.lock().await;
+        if !proxy_path.is_file() {
+            let Ok(ffmpeg_bin) = state.kernel.tools.resolve_tool("ffmpeg") else {
+                return stream_file_with_ranges(&src_path, &headers, None).await;
+            };
+            let tmp_path = cache_dir.join(format!("{safe_id}.building.mp4"));
+            let mut cmd = tokio::process::Command::new(&ffmpeg_bin);
+            configure_tokio_command(&mut cmd);
+            let ok = cmd
+                .args(["-y", "-i"])
+                .arg(&src_path)
+                .args([
+                    "-vf",
+                    "scale='min(960,iw)':-2",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-crf",
+                    "26",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "128k",
+                    "-movflags",
+                    "+faststart",
+                ])
+                .arg(&tmp_path)
+                .output()
+                .await
+                .map(|o| o.status.success() && tmp_path.is_file())
+                .unwrap_or(false);
+            if ok {
+                let _ = std::fs::rename(&tmp_path, &proxy_path);
+            } else {
+                let _ = std::fs::remove_file(&tmp_path);
+                return stream_file_with_ranges(&src_path, &headers, None).await;
+            }
+        }
+    }
+
+    stream_file_with_ranges(&proxy_path, &headers, Some("video/mp4")).await
+}
+
+async fn stream_file_with_ranges(
+    path: &std::path::Path,
+    headers: &HeaderMap,
+    mime_override: Option<&str>,
+) -> Response {
+    let Ok(mut file) = tokio::fs::File::open(path).await else {
         return (StatusCode::NOT_FOUND, "Media file missing on disk").into_response();
     };
     let Ok(meta) = file.metadata().await else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     let file_size = meta.len();
-    let mime = mime_guess::from_path(&path)
-        .first_or_octet_stream()
-        .to_string();
+    let mime = mime_override
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| mime_guess::from_path(path).first_or_octet_stream().to_string());
 
     if let Some(range_val) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
         if let Some((start, end)) = parse_byte_range(range_val, file_size) {

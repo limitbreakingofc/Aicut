@@ -463,6 +463,44 @@ async fn delete_gemini_file(http: &reqwest::Client, api_key: &str, name: &str) -
     Ok(())
 }
 
+fn extract_candidate_text(val: &Value) -> Option<String> {
+    let parts = val
+        .get("candidates")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("content"))
+        .and_then(|c| c.get("parts"))
+        .and_then(|p| p.as_array())?;
+
+    // Prefer non-thought text parts (Gemini 2.5/3 thinking models emit thought parts first!)
+    let mut non_thought: Vec<&str> = Vec::new();
+    let mut fallback: Vec<&str> = Vec::new();
+    for part in parts {
+        let Some(txt) = part.get("text").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        if txt.trim().is_empty() {
+            continue;
+        }
+        let is_thought = part
+            .get("thought")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if is_thought {
+            fallback.push(txt);
+        } else {
+            non_thought.push(txt);
+        }
+    }
+    if !non_thought.is_empty() {
+        return Some(non_thought.join("\n"));
+    }
+    if !fallback.is_empty() {
+        return Some(fallback.join("\n"));
+    }
+    None
+}
+
 /// Sends an inline JPEG image + prompt to an active Gemini model and returns raw JSON text.
 pub async fn generate_with_inline_image(
     http: &reqwest::Client,
@@ -488,9 +526,9 @@ pub async fn generate_with_inline_image(
             ]
         }],
         "generationConfig": {
-            "temperature": 0.25,
+            "temperature": 0.3,
             "responseMimeType": "application/json",
-            "maxOutputTokens": 6144
+            "maxOutputTokens": 16384
         }
     });
 
@@ -499,7 +537,7 @@ pub async fn generate_with_inline_image(
         .json(&body)
         .send()
         .await
-        .map_err(|e| AicutError::internal(format!("Gemini framing review request failed: {e}")))?;
+        .map_err(|e| AicutError::internal(format!("Gemini multimodal request failed: {e}")))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -513,17 +551,9 @@ pub async fn generate_with_inline_image(
     let val: Value = resp
         .json()
         .await
-        .map_err(|e| AicutError::internal(format!("Failed parsing Gemini framing review JSON: {e}")))?;
-    let text = val
-        .get("candidates")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|c| c.get("content"))
-        .and_then(|c| c.get("parts"))
-        .and_then(|p| p.as_array())
-        .and_then(|arr| arr.iter().find_map(|part| part.get("text").and_then(|t| t.as_str())))
-        .ok_or_else(|| AicutError::internal("Gemini framing review returned empty text"))?;
-    Ok(text.to_string())
+        .map_err(|e| AicutError::internal(format!("Failed parsing Gemini response JSON: {e}")))?;
+    extract_candidate_text(&val)
+        .ok_or_else(|| AicutError::internal("Gemini returned empty response text"))
 }
 
 /// Sends a text prompt to an active Gemini model requesting strict JSON output.
@@ -542,9 +572,9 @@ pub async fn generate_json_text(
             "parts": [{ "text": prompt }]
         }],
         "generationConfig": {
-            "temperature": 0.25,
+            "temperature": 0.3,
             "responseMimeType": "application/json",
-            "maxOutputTokens": 4096
+            "maxOutputTokens": 16384
         }
     });
 
@@ -568,16 +598,8 @@ pub async fn generate_json_text(
         .json()
         .await
         .map_err(|e| AicutError::internal(format!("Failed parsing Gemini JSON response: {e}")))?;
-    let text = val
-        .get("candidates")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|c| c.get("content"))
-        .and_then(|c| c.get("parts"))
-        .and_then(|p| p.as_array())
-        .and_then(|arr| arr.iter().find_map(|part| part.get("text").and_then(|t| t.as_str())))
-        .ok_or_else(|| AicutError::internal("Gemini returned empty response text"))?;
-    Ok(text.to_string())
+    extract_candidate_text(&val)
+        .ok_or_else(|| AicutError::internal("Gemini returned empty response text"))
 }
 
 /// Queries the user's Gemini API key for currently available `generateContent` models so deprecated

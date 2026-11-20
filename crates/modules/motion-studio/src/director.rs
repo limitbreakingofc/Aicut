@@ -11,7 +11,7 @@ use aicut_module_smart_clips::gemini::{
 use aicut_module_smart_clips::prompts::extract_json_object;
 use base64::Engine as _;
 use chrono::Utc;
-use serde::Deserialize;
+use serde_json::Value;
 use std::path::Path;
 use tokio::process::Command;
 use uuid::Uuid;
@@ -21,28 +21,17 @@ use crate::schema::{
     PipConfig, PipCorner, SceneEffects, SceneLayoutPreset, SceneOverlay, SceneTransition,
 };
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 struct AiDirectorResponse {
     /// "apply" (update scenes & motion_html) | "discuss" (brainstorm / plan with user without overwriting edit)
-    #[serde(default = "default_apply_mode")]
     mode: String,
-    #[serde(default)]
     title: Option<String>,
-    #[serde(default)]
     creative_direction: Option<String>,
-    #[serde(default)]
     assistant_reply: Option<String>,
-    #[serde(default)]
     scenes: Vec<MotionScene>,
     /// Bespoke HyperFrames HTML/CSS/SVG/JS motion graphics written specifically for THIS video!
-    #[serde(default)]
     motion_html: Option<String>,
-    #[serde(default)]
     burn_subtitles: Option<bool>,
-}
-
-fn default_apply_mode() -> String {
-    "apply".to_string()
 }
 
 /// Extracts a crisp 4x2 (8-frame) visual storyboard JPEG of the exact clip so the AI
@@ -190,6 +179,7 @@ pub async fn plan_composition_with_ai(
 
     let mut reply = String::new();
     let mut used_ai = false;
+    let mut ai_error_note: Option<String> = None;
 
     if let Some(api_key) = resolve_gemini_api_key(kernel, None) {
         let http = kernel.tools.http_client();
@@ -200,7 +190,6 @@ pub async fn plan_composition_with_ai(
             &read_setting_str(kernel, SETTING_GEMINI_DIRECTOR_MODEL, "auto"),
         )
         .await;
-        let model = if dir_m.is_empty() { scan_m } else { dir_m };
         let prompt = build_context_aware_plan_prompt(
             &comp.title,
             duration_sec,
@@ -208,34 +197,44 @@ pub async fn plan_composition_with_ai(
             &transcript_excerpt,
             storyboard_b64.is_some(),
         );
-        let raw_res = if let Some(ref b64) = storyboard_b64 {
-            generate_with_inline_image(http, &api_key, &model, b64, &prompt).await
-        } else {
-            generate_json_text(http, &api_key, &model, &prompt).await
-        };
-        if let Ok(raw) = raw_res {
-            if let Some(parsed) = parse_ai_director_response(&raw) {
-                if !parsed.scenes.is_empty() {
-                    if let Some(t) = parsed.title.filter(|s| !s.trim().is_empty()) {
-                        if title_override.is_none() {
-                            comp.title = t;
-                        }
+        match call_gemini_director(
+            http,
+            &api_key,
+            &dir_m,
+            &scan_m,
+            storyboard_b64.as_deref(),
+            &prompt,
+        )
+        .await
+        {
+            Ok((parsed, model_used)) if !parsed.scenes.is_empty() => {
+                if let Some(t) = parsed.title.filter(|s| !s.trim().is_empty()) {
+                    if title_override.is_none() {
+                        comp.title = t;
                     }
-                    comp.scenes = parsed.scenes;
-                    if let Some(html) = parsed.motion_html.filter(|s| !s.trim().is_empty()) {
-                        comp.motion_html = Some(html);
-                    }
-                    if let Some(cd) = parsed.creative_direction {
-                        comp.creative_direction = cd;
-                    }
-                    reply = parsed.assistant_reply.unwrap_or_else(|| {
-                        format!(
-                            "Assisti ao vídeo e montei uma edição personalizada com {} momentos + motion graphics HyperFrames sob medida! Dá play ao lado e me diz no chat o que você quer ajustar ou planejar.",
-                            comp.scenes.len()
-                        )
-                    });
-                    used_ai = true;
                 }
+                comp.scenes = parsed.scenes;
+                if let Some(html) = parsed.motion_html.filter(|s| !s.trim().is_empty()) {
+                    comp.motion_html = Some(html);
+                }
+                if let Some(cd) = parsed.creative_direction.filter(|s| !s.trim().is_empty()) {
+                    comp.creative_direction = cd;
+                } else {
+                    comp.creative_direction = format!("Edição IA ({model_used}) · HyperFrames");
+                }
+                reply = parsed.assistant_reply.unwrap_or_else(|| {
+                    format!(
+                        "Assisti ao vídeo ({model_used}) e montei uma edição personalizada com {} momentos + motion graphics HyperFrames sob medida! Dá play ao lado e me diz no chat o que você quer ajustar ou planejar.",
+                        comp.scenes.len()
+                    )
+                });
+                used_ai = true;
+            }
+            Ok(_) => {
+                ai_error_note = Some("A IA respondeu sem cenas válidas para o clipe.".to_string());
+            }
+            Err(err) => {
+                ai_error_note = Some(err);
             }
         }
     }
@@ -243,7 +242,14 @@ pub async fn plan_composition_with_ai(
     if !used_ai {
         comp.scenes = build_smart_default_scenes(duration_sec);
         comp.motion_html = Some(build_default_hyperframes_motion(duration_sec, &comp.title));
-        reply = "Montei uma primeira edição dinâmica com abertura chamativa, SMOKING33 e destaque em tela cheia! Conecte sua Gemini API Key em Cortes IA para eu assistir visualmente aos frames e criar animações HyperFrames 100% sob medida — e já pode conversar comigo aqui no chat para ajustar o que quiser!".to_string();
+        comp.creative_direction = "Edição base local (fallback)".to_string();
+        reply = if let Some(err) = ai_error_note {
+            format!(
+                "Não consegui concluir a análise com o Gemini agora ({err}). Apliquei uma edição base dinâmica para você já testar o preview — tente novamente no chat ou verifique sua chave/cota do Gemini em Configurações."
+            )
+        } else {
+            "Montei uma primeira edição dinâmica com abertura chamativa, SMOKING33 e destaque em tela cheia! Conecte sua Gemini API Key em Cortes IA / Configurações para eu assistir visualmente aos frames e criar animações HyperFrames 100% sob medida.".to_string()
+        };
     }
 
     comp.normalize();
@@ -302,6 +308,7 @@ pub async fn edit_composition_via_chat(
         format_relative_transcript(transcript.as_ref(), comp.clip_start_sec, comp.clip_end_sec);
 
     let mut assistant_reply: Option<String> = None;
+    let mut ai_err_note: Option<String> = None;
 
     if let Some(api_key) = resolve_gemini_api_key(kernel, None) {
         let http = kernel.tools.http_client();
@@ -312,21 +319,23 @@ pub async fn edit_composition_via_chat(
             &read_setting_str(kernel, SETTING_GEMINI_DIRECTOR_MODEL, "auto"),
         )
         .await;
-        let model = if dir_m.is_empty() { scan_m } else { dir_m };
         let prompt = build_conversational_editor_prompt(
             &comp,
             &transcript_excerpt,
             trimmed,
             storyboard_b64.is_some(),
         );
-        let raw_res = if let Some(ref b64) = storyboard_b64 {
-            generate_with_inline_image(http, &api_key, &model, b64, &prompt).await
-        } else {
-            generate_json_text(http, &api_key, &model, &prompt).await
-        };
-
-        if let Ok(raw) = raw_res {
-            if let Some(parsed) = parse_ai_director_response(&raw) {
+        match call_gemini_director(
+            http,
+            &api_key,
+            &dir_m,
+            &scan_m,
+            storyboard_b64.as_deref(),
+            &prompt,
+        )
+        .await
+        {
+            Ok((parsed, _model_used)) => {
                 let is_discuss = parsed.mode.eq_ignore_ascii_case("discuss");
                 if !is_discuss {
                     if !parsed.scenes.is_empty() {
@@ -355,12 +364,22 @@ pub async fn edit_composition_via_chat(
                     }
                 }));
             }
+            Err(err) => {
+                ai_err_note = Some(err);
+            }
         }
     }
 
     let final_reply = match assistant_reply {
         Some(r) => r,
-        None => apply_local_ptbr_chat_edit(&mut comp, trimmed),
+        None => {
+            let local_reply = apply_local_ptbr_chat_edit(&mut comp, trimmed);
+            if let Some(err) = ai_err_note {
+                format!("(Aviso: Gemini indisponível agora — {err})\n\n{local_reply}")
+            } else {
+                local_reply
+            }
+        }
     };
 
     comp.normalize();
@@ -615,9 +634,262 @@ fn build_smart_default_scenes(dur: f64) -> Vec<MotionScene> {
     ]
 }
 
+async fn call_gemini_director(
+    http: &reqwest::Client,
+    api_key: &str,
+    director_model: &str,
+    scan_model: &str,
+    storyboard_b64: Option<&str>,
+    prompt: &str,
+) -> Result<(AiDirectorResponse, String), String> {
+    let mut candidates: Vec<&str> = Vec::new();
+    if !director_model.trim().is_empty() {
+        candidates.push(director_model.trim());
+    }
+    if !scan_model.trim().is_empty() && !candidates.contains(&scan_model.trim()) {
+        candidates.push(scan_model.trim());
+    }
+    if candidates.is_empty() {
+        candidates.push("gemini-3.8-flash");
+    }
+
+    let mut last_err = String::from("nenhum modelo Gemini respondeu");
+    for model in candidates {
+        let raw_res = if let Some(b64) = storyboard_b64 {
+            generate_with_inline_image(http, api_key, model, b64, prompt).await
+        } else {
+            generate_json_text(http, api_key, model, prompt).await
+        };
+        match raw_res {
+            Ok(raw) => {
+                if let Some(parsed) = parse_ai_director_response(&raw) {
+                    return Ok((parsed, model.to_string()));
+                }
+                last_err = format!("resposta JSON inválida do modelo {model}");
+            }
+            Err(e) => {
+                last_err = format!("{model}: {}", e.message);
+            }
+        }
+    }
+    Err(last_err)
+}
+
+/// Resilient parser for Gemini JSON outputs: tolerates explicit `null` nested objects,
+/// numeric strings, and creative enum aliases so real AI responses NEVER silently get dropped.
 fn parse_ai_director_response(raw: &str) -> Option<AiDirectorResponse> {
     let json_str = extract_json_object(raw).unwrap_or(raw);
-    serde_json::from_str::<AiDirectorResponse>(json_str).ok()
+    let val: Value = serde_json::from_str(json_str).ok()?;
+    let obj = val.as_object()?;
+
+    let mode = obj
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("apply")
+        .to_string();
+    let title = obj
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let creative_direction = obj
+        .get("creative_direction")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let assistant_reply = obj
+        .get("assistant_reply")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let motion_html = obj
+        .get("motion_html")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let burn_subtitles = obj.get("burn_subtitles").and_then(|v| v.as_bool());
+
+    let mut scenes = Vec::new();
+    if let Some(arr) = obj.get("scenes").and_then(|v| v.as_array()) {
+        for (idx, item) in arr.iter().enumerate() {
+            if let Some(sc) = parse_lenient_scene(item, idx) {
+                scenes.push(sc);
+            }
+        }
+    }
+
+    Some(AiDirectorResponse {
+        mode,
+        title,
+        creative_direction,
+        assistant_reply,
+        scenes,
+        motion_html,
+        burn_subtitles,
+    })
+}
+
+fn val_f64(v: Option<&Value>) -> Option<f64> {
+    let v = v?;
+    v.as_f64()
+        .or_else(|| v.as_i64().map(|n| n as f64))
+        .or_else(|| v.as_str().and_then(|s| s.trim().trim_end_matches('s').parse::<f64>().ok()))
+}
+
+fn parse_lenient_scene(v: &Value, idx: usize) -> Option<MotionScene> {
+    let obj = v.as_object()?;
+    let start_sec = val_f64(obj.get("start_sec")).unwrap_or(0.0).max(0.0);
+    let end_sec = val_f64(obj.get("end_sec")).unwrap_or(start_sec + 4.0);
+    if end_sec <= start_sec + 0.05 {
+        return None;
+    }
+
+    let id = obj
+        .get("id")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("sc-{}", idx + 1));
+    let title = obj
+        .get("title")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("Cena {}", idx + 1));
+
+    let layout = match obj
+        .get("layout")
+        .and_then(|x| x.as_str())
+        .unwrap_or("split_branded")
+        .to_lowercase()
+        .as_str()
+    {
+        "split_clean" => SceneLayoutPreset::SplitClean,
+        "content_hero_pip" | "pip" | "content_pip" => SceneLayoutPreset::ContentHeroPip,
+        "content_fullscreen" | "fullscreen" | "full_content" => SceneLayoutPreset::ContentFullscreen,
+        "camera_focus" | "camera" | "webcam" | "webcam_focus" => SceneLayoutPreset::CameraFocus,
+        "camera_hero_pip" | "camera_hero" => SceneLayoutPreset::CameraHeroPip,
+        "callout_zoom" | "zoom" | "callout" => SceneLayoutPreset::CalloutZoom,
+        _ => SceneLayoutPreset::SplitBranded,
+    };
+
+    let transition_in = match obj
+        .get("transition_in")
+        .and_then(|x| x.as_str())
+        .unwrap_or("cut")
+        .to_lowercase()
+        .as_str()
+    {
+        "fade" | "dissolve" | "crossfade" => SceneTransition::Fade,
+        "slide_up" | "slide" => SceneTransition::SlideUp,
+        "wipe_left" | "wipe" => SceneTransition::WipeLeft,
+        _ => SceneTransition::Cut,
+    };
+
+    let mut pip = PipConfig::default();
+    if let Some(po) = obj.get("pip").and_then(|x| x.as_object()) {
+        pip.corner = match po
+            .get("corner")
+            .and_then(|x| x.as_str())
+            .unwrap_or("top_right")
+            .to_lowercase()
+            .as_str()
+        {
+            "top_left" => PipCorner::TopLeft,
+            "bottom_right" => PipCorner::BottomRight,
+            "bottom_left" => PipCorner::BottomLeft,
+            _ => PipCorner::TopRight,
+        };
+        if let Some(w) = val_f64(po.get("width_pct")) {
+            pip.width_pct = w.clamp(0.24, 0.48);
+        }
+        if let Some(hex) = po.get("border_hex").and_then(|x| x.as_str()) {
+            if !hex.trim().is_empty() {
+                pip.border_hex = hex.trim().to_string();
+            }
+        }
+        if let Some(vis) = po.get("visible").and_then(|x| x.as_bool()) {
+            pip.visible = vis;
+        }
+    }
+
+    let mut content_focus = ContentFocusConfig::default();
+    if let Some(cf) = obj.get("content_focus").and_then(|x| x.as_object()) {
+        if let Some(fx) = val_f64(cf.get("focus_x")) {
+            content_focus.focus_x = fx.clamp(0.05, 0.95);
+        }
+        if let Some(fy) = val_f64(cf.get("focus_y")) {
+            content_focus.focus_y = fy.clamp(0.05, 0.95);
+        }
+        if let Some(z) = val_f64(cf.get("zoom")) {
+            content_focus.zoom = z.clamp(1.0, 3.0);
+        }
+        if let Some(fb) = cf.get("fit_blur").and_then(|x| x.as_bool()) {
+            content_focus.fit_blur = fb;
+        }
+    }
+
+    let mut overlay = SceneOverlay::default();
+    if let Some(ov) = obj.get("overlay").and_then(|x| x.as_object()) {
+        overlay.headline = ov
+            .get("headline")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        overlay.badge = ov
+            .get("badge")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        overlay.callout_text = ov
+            .get("callout_text")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        if let Some(hex) = ov.get("accent_hex").and_then(|x| x.as_str()) {
+            if !hex.trim().is_empty() {
+                overlay.accent_hex = hex.trim().to_string();
+            }
+        }
+    }
+
+    let mut effects = SceneEffects::default();
+    if let Some(ef) = obj.get("effects").and_then(|x| x.as_object()) {
+        if let Some(ze) = val_f64(ef.get("camera_zoom_end")) {
+            effects.camera_zoom_end = ze.clamp(1.0, 1.3);
+        }
+        if let Some(sh) = val_f64(ef.get("impact_shake")) {
+            effects.impact_shake = sh.clamp(0.0, 1.0);
+        }
+        if let Some(vg) = ef.get("vignette").and_then(|x| x.as_bool()) {
+            effects.vignette = vg;
+        }
+        if let Some(m) = ef.get("color_mood").and_then(|x| x.as_str()) {
+            if !m.trim().is_empty() {
+                effects.color_mood = m.trim().to_lowercase();
+            }
+        }
+    }
+
+    let rationale = obj
+        .get("rationale")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    Some(MotionScene {
+        id,
+        title,
+        start_sec,
+        end_sec,
+        layout,
+        transition_in,
+        pip,
+        content_focus,
+        overlay,
+        effects,
+        rationale,
+        custom_code: None,
+    })
 }
 
 fn build_context_aware_plan_prompt(
@@ -878,5 +1150,40 @@ mod tests {
         comp.normalize();
         assert!(reply.contains("10.0s"));
         assert!(comp.motion_html.as_deref().unwrap_or("").contains("OLHA O PLACAR!"));
+    }
+
+    #[test]
+    fn lenient_parser_handles_nulls_and_creative_enum_aliases_from_gemini() {
+        let messy = r##"{
+            "mode": "apply",
+            "title": "Jogada Insana",
+            "creative_direction": "Ritmo rápido",
+            "assistant_reply": "Editei tudo sob medida!",
+            "motion_html": "<div class=\"hf-pill\" data-start=\"0\" data-end=\"3\">AO VIVO</div>",
+            "scenes": [
+                {
+                    "id": "s1",
+                    "start_sec": 0,
+                    "end_sec": 4.5,
+                    "layout": "camera",
+                    "transition_in": "flash",
+                    "pip": null,
+                    "overlay": null,
+                    "effects": { "camera_zoom_end": 1.12, "impact_shake": 0.4, "vignette": true, "color_mood": "dramatic" }
+                },
+                {
+                    "start_sec": "4.5",
+                    "end_sec": "12",
+                    "layout": "fullscreen",
+                    "effects": null
+                }
+            ]
+        }"##;
+        let parsed = parse_ai_director_response(messy).expect("lenient parser must succeed");
+        assert_eq!(parsed.scenes.len(), 2);
+        assert_eq!(parsed.scenes[0].layout, SceneLayoutPreset::CameraFocus);
+        assert_eq!(parsed.scenes[1].layout, SceneLayoutPreset::ContentFullscreen);
+        assert!(parsed.scenes[0].effects.vignette);
+        assert!(parsed.motion_html.unwrap().contains("AO VIVO"));
     }
 }

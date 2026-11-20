@@ -69,13 +69,16 @@ pub fn build_live_hyperframes_document(comp: &AicutComposition) -> String {
 <html lang="pt-BR">
 <head>
   <meta charset="UTF-8" />
+  <meta name="color-scheme" content="dark" />
   <style>
+    :root {{ color-scheme: dark; }}
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     html, body {{
       width: {w}px;
       height: {h}px;
       overflow: hidden;
       background: transparent !important;
+      background-color: rgba(0, 0, 0, 0) !important;
       font-family: 'Segoe UI', Inter, system-ui, -apple-system, sans-serif;
       color: #ffffff;
       -webkit-font-smoothing: antialiased;
@@ -342,6 +345,10 @@ pub async fn capture_hyperframes_rgba_sequence(
         "--hide-scrollbars",
         "--mute-audio",
         "--disable-extensions",
+        "--allow-file-access-from-files",
+        "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
+        "--remote-allow-origins=*",
         "--default-background-color=00000000",
         &format!("--window-size={},{}", comp.width, comp.height),
         &format!("--remote-debugging-port={port}"),
@@ -416,6 +423,29 @@ pub async fn capture_hyperframes_rgba_sequence(
     ] {
         let (id, payload) = send_cdp(&mut msg_id, method, params);
         let _ = cdp_roundtrip(&mut ws, id, payload).await?;
+    }
+
+    // Wait until the HyperFrames HTML document finished loading & registered window.__aicutSeek
+    for _ in 0..25 {
+        let (rid, ready_payload) = send_cdp(
+            &mut msg_id,
+            "Runtime.evaluate",
+            json!({
+                "expression": "document.readyState === 'complete' && typeof window.__aicutSeek === 'function'",
+                "returnByValue": true
+            }),
+        );
+        if let Ok(r) = cdp_roundtrip(&mut ws, rid, ready_payload).await {
+            if r.get("result")
+                .and_then(|x| x.get("result"))
+                .and_then(|x| x.get("value"))
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
     }
 
     let capture_fps = fps.clamp(10, 30);

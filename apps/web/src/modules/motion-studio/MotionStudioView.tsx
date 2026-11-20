@@ -5,16 +5,18 @@ import {
   Copy,
   Download,
   Film,
+  Loader2,
   Pause,
   Play,
   Send,
   Sparkles,
   Wand2,
 } from "lucide-react";
-import { AicutActionError, mediaStreamUrl, runAction } from "../../lib/client";
+import { AicutActionError, mediaPreviewUrl, mediaStreamUrl, runAction } from "../../lib/client";
 import { formatDuration } from "../../lib/format";
 import type {
   AicutComposition,
+  FramingGetOutput,
   JobRecord,
   MediaAsset,
   MotionExportCodeOutput,
@@ -45,6 +47,18 @@ interface MotionStudioViewProps {
   onNotify: NotifyFn;
   onRefreshMedia: () => Promise<void>;
 }
+
+const DEFAULT_WEBCAM_RECT: NormalizedRect = { x: 0.7, y: 0.64, w: 0.28, h: 0.33 };
+
+const LAYOUT_SHORT_LABELS: Record<string, string> = {
+  split_branded: "SMOKING33",
+  split_clean: "Split Limpo",
+  content_hero_pip: "Conteúdo + PiP",
+  content_fullscreen: "Tela Cheia",
+  camera_focus: "Foco Câmera",
+  camera_hero_pip: "Câmera Destaque",
+  callout_zoom: "Zoom Detalhe",
+};
 
 function drawRoundedRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
   ctx.beginPath();
@@ -121,6 +135,8 @@ function computeZoomedContentRect(base: NormalizedRect | null | undefined, sc: M
   };
 }
 
+type VideoStatus = "loading" | "proxy" | "ready" | "error";
+
 export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
   media,
   tools,
@@ -139,6 +155,10 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
   const [clipEnd, setClipEnd] = useState<number>(seed?.endSec ?? 45);
 
   const [comp, setComp] = useState<AicutComposition | null>(null);
+  const [savedFraming, setSavedFraming] = useState<{ webcam: NormalizedRect; content: NormalizedRect | null }>({
+    webcam: DEFAULT_WEBCAM_RECT,
+    content: null,
+  });
   const [liveHtmlDoc, setLiveHtmlDoc] = useState<string>("");
   const [showCode, setShowCode] = useState<boolean>(false);
 
@@ -147,13 +167,37 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
   const [chatSending, setChatSending] = useState<boolean>(false);
   const [rendering, setRendering] = useState<boolean>(false);
 
+  const [useProxyVideo, setUseProxyVideo] = useState<boolean>(false);
+  const [videoStatus, setVideoStatus] = useState<VideoStatus>("loading");
+  const [playing, setPlaying] = useState<boolean>(false);
+  const [relTime, setRelTime] = useState<number>(0);
+
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
-  const [playing, setPlaying] = useState<boolean>(false);
-  const [relTime, setRelTime] = useState<number>(0);
+  // Live refs used by 60fps requestAnimationFrame loop (prevents tearing down RAF on every frame!)
+  const compRef = useRef<AicutComposition | null>(null);
+  const framingRef = useRef(savedFraming);
+  const rangeRef = useRef({ start: clipStart, end: clipEnd });
+  const relTimeRef = useRef<number>(0);
+  const lastUiSyncRef = useRef<number>(-1);
+  const lastIframeSeekRef = useRef<number>(-1);
+
+  compRef.current = comp;
+  framingRef.current = savedFraming;
+  rangeRef.current = { start: clipStart, end: clipEnd };
+
+  const activeMediaId = comp?.media_id ?? selectedMediaId;
+  const activeAsset = useMemo(
+    () => videoMedia.find((m) => m.id === activeMediaId) ?? null,
+    [videoMedia, activeMediaId],
+  );
+  const effectiveStart = comp ? comp.clip_start_sec : clipStart;
+  const effectiveDuration = comp
+    ? comp.duration_sec
+    : Math.max(1, (clipEnd > clipStart ? clipEnd : activeAsset?.metadata.duration_sec ?? 45) - clipStart);
 
   const activeMotionJobs = jobs.filter(
     (j) => j.kind === "motion.render" && (j.status === "queued" || j.status === "running"),
@@ -178,9 +222,25 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
     }
   }, [selectedMediaId, videoMedia]);
 
-  // Load most recent composition for the selected video if one exists
+  // Reset proxy fallback & load saved framing + latest composition whenever media changes
   useEffect(() => {
     if (!selectedMediaId) return;
+    setUseProxyVideo(false);
+    setVideoStatus("loading");
+    setPlaying(false);
+    relTimeRef.current = 0;
+    setRelTime(0);
+
+    void runAction<FramingGetOutput>("clips.framing_get", { media_id: selectedMediaId })
+      .then((res) => {
+        const p = res.data.active_profile;
+        setSavedFraming({
+          webcam: p.webcam_rect ?? DEFAULT_WEBCAM_RECT,
+          content: p.content_rect ?? null,
+        });
+      })
+      .catch(() => {});
+
     void runAction<{ compositions: AicutComposition[] }>("motion.list", { media_id: selectedMediaId })
       .then((res) => {
         const list = res.data.compositions ?? [];
@@ -188,6 +248,7 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
           setComp(list[0]);
           setClipStart(Math.floor(list[0].clip_start_sec));
           setClipEnd(Math.ceil(list[0].clip_end_sec));
+          relTimeRef.current = 0;
           setRelTime(0);
         } else {
           setComp(null);
@@ -216,35 +277,59 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [comp?.chat_history.length, chatSending]);
 
-  const postSeekToHyperframes = useCallback((t: number) => {
+  const postSeekToHyperframes = useCallback((t: number, force = false) => {
+    if (!force && Math.abs(t - lastIframeSeekRef.current) < 0.012) return;
+    lastIframeSeekRef.current = t;
     iframeRef.current?.contentWindow?.postMessage({ type: "aicut_seek", time: t }, "*");
   }, []);
 
-  // 60fps Live Video Choreography + Synchronized HyperFrames Overlay loop
+  // Seek video cleanly whenever clip start changes on loaded video
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v || v.readyState < 1) return;
+    if (v.paused) {
+      try {
+        v.currentTime = effectiveStart + relTimeRef.current;
+      } catch {
+        // ignore seek before metadata
+      }
+    }
+  }, [effectiveStart]);
+
+  // Single stable 60fps Live Video Choreography + Synchronized HyperFrames Overlay loop
   useEffect(() => {
     let raf = 0;
     const tick = () => {
       const canvas = canvasRef.current;
       const video = videoRef.current;
-      if (canvas && comp) {
+      const curComp = compRef.current;
+      if (canvas) {
         const ctx = canvas.getContext("2d");
         if (ctx) {
-          const curRel = video
-            ? Math.max(0, Math.min(comp.duration_sec, video.currentTime - comp.clip_start_sec))
-            : relTime;
-          if (video && !video.paused) {
-            if (video.currentTime >= comp.clip_end_sec) {
-              video.currentTime = comp.clip_start_sec;
+          const startSec = curComp ? curComp.clip_start_sec : rangeRef.current.start;
+          const durSec = curComp
+            ? curComp.duration_sec
+            : Math.max(1, (rangeRef.current.end > rangeRef.current.start ? rangeRef.current.end : 45) - rangeRef.current.start);
+          const endSec = startSec + durSec;
+
+          let curRel = relTimeRef.current;
+          if (video && video.readyState >= 1) {
+            if (!video.paused) {
+              if (video.currentTime < startSec || video.currentTime >= endSec) {
+                video.currentTime = startSec;
+              }
+              curRel = Math.max(0, Math.min(durSec, video.currentTime - startSec));
+              relTimeRef.current = curRel;
+              if (Math.abs(curRel - lastUiSyncRef.current) >= 0.06) {
+                lastUiSyncRef.current = curRel;
+                setRelTime(curRel);
+              }
             }
-            setRelTime(curRel);
           }
 
-          // Synchronize bespoke HyperFrames HTML/CSS/SVG motion iframe to exact video time
-          postSeekToHyperframes(curRel);
-
-          const sc =
-            comp.scenes.find((s) => curRel >= s.start_sec && curRel < s.end_sec) ??
-            comp.scenes[comp.scenes.length - 1];
+          if (curComp) {
+            postSeekToHyperframes(curRel, false);
+          }
 
           const W = canvas.width;
           const H = canvas.height;
@@ -252,30 +337,108 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
           ctx.fillStyle = "#06070a";
           ctx.fillRect(0, 0, W, H);
 
-          if (sc && video && video.readyState >= 2) {
-            const scDur = Math.max(0.2, sc.end_sec - sc.start_sec);
-            const scProg = Math.max(0, Math.min(1, (curRel - sc.start_sec) / scDur));
-            const fx = sc.effects;
-            const dynZoom = fx && fx.camera_zoom_end > 1.0 ? 1 + (fx.camera_zoom_end - 1) * scProg : 1.0;
-
-            // Optional brief impact shake at scene start
-            if (fx && fx.impact_shake > 0.05 && curRel - sc.start_sec < 0.35) {
-              const decay = 1 - (curRel - sc.start_sec) / 0.35;
-              const amp = fx.impact_shake * 6 * decay;
-              ctx.translate(Math.sin(curRel * 70) * amp, Math.cos(curRel * 85) * amp);
-            }
-
-            // Color mood filter
-            if (fx?.color_mood === "vibrant") ctx.filter = "contrast(1.06) saturate(1.22)";
-            else if (fx?.color_mood === "dramatic") ctx.filter = "contrast(1.12) brightness(0.95) saturate(0.88)";
-            else if (fx?.color_mood === "cyber") ctx.filter = "contrast(1.08) saturate(1.25)";
-
-            const camR = comp.webcam_rect;
-            const cntR = computeZoomedContentRect(comp.content_rect, sc);
+          const hasVideoFrame = Boolean(video && video.readyState >= 2 && video.videoWidth > 0);
+          if (hasVideoFrame && video) {
             const sx = W / 1080;
             const sy = H / 1920;
 
-            if (sc.layout === "split_branded") {
+            if (curComp && curComp.scenes.length > 0) {
+              const sc =
+                curComp.scenes.find((s) => curRel >= s.start_sec && curRel < s.end_sec) ??
+                curComp.scenes[curComp.scenes.length - 1];
+              const scDur = Math.max(0.2, sc.end_sec - sc.start_sec);
+              const scProg = Math.max(0, Math.min(1, (curRel - sc.start_sec) / scDur));
+              const fx = sc.effects;
+              const dynZoom = fx && fx.camera_zoom_end > 1.0 ? 1 + (fx.camera_zoom_end - 1) * scProg : 1.0;
+
+              if (fx && fx.impact_shake > 0.05 && curRel - sc.start_sec < 0.35) {
+                const decay = 1 - (curRel - sc.start_sec) / 0.35;
+                const amp = fx.impact_shake * 6 * decay;
+                ctx.translate(Math.sin(curRel * 70) * amp, Math.cos(curRel * 85) * amp);
+              }
+
+              if (fx?.color_mood === "vibrant") ctx.filter = "contrast(1.06) saturate(1.22)";
+              else if (fx?.color_mood === "dramatic") ctx.filter = "contrast(1.12) brightness(0.95) saturate(0.88)";
+              else if (fx?.color_mood === "cyber") ctx.filter = "contrast(1.08) saturate(1.25)";
+
+              const camR = curComp.webcam_rect;
+              const cntR = computeZoomedContentRect(curComp.content_rect, sc);
+
+              if (sc.layout === "split_branded") {
+                const bg = ctx.createLinearGradient(0, 0, 0, H);
+                bg.addColorStop(0, "#1d0f2e");
+                bg.addColorStop(1, "#181022");
+                ctx.fillStyle = bg;
+                ctx.fillRect(0, 0, W, H);
+                ctx.fillStyle = "#e8bd52";
+                ctx.font = "700 11px monospace";
+                ctx.textAlign = "center";
+                ctx.fillText("SMOKING33", W / 2, 24);
+
+                const tx = 30 * sx, ty = 150 * sy, tw = 1020 * sx, th = 582 * sy;
+                const bx = 30 * sx, by = 765 * sy, bw = 1020 * sx, bh = 889 * sy;
+
+                ctx.save();
+                drawRoundedRect(ctx, tx, ty, tw, th, 8);
+                ctx.clip();
+                drawVideoCrop(ctx, video, camR, tx, ty, tw, th, false, 1.0);
+                ctx.restore();
+                drawRoundedRect(ctx, tx, ty, tw, th, 8);
+                ctx.strokeStyle = "#eab308";
+                ctx.lineWidth = 2;
+                ctx.stroke();
+
+                ctx.save();
+                drawRoundedRect(ctx, bx, by, bw, bh, 8);
+                ctx.clip();
+                drawVideoCrop(ctx, video, cntR, bx, by, bw, bh, sc.content_focus.fit_blur, dynZoom);
+                ctx.restore();
+                drawRoundedRect(ctx, bx, by, bw, bh, 8);
+                ctx.strokeStyle = "#eab308";
+                ctx.lineWidth = 2;
+                ctx.stroke();
+              } else if (sc.layout === "split_clean") {
+                const th = Math.round(H * (730 / 1920));
+                drawVideoCrop(ctx, video, camR, 0, 0, W, th, false, 1.0);
+                drawVideoCrop(ctx, video, cntR, 0, th, W, H - th, sc.content_focus.fit_blur, dynZoom);
+              } else if (sc.layout === "camera_hero_pip") {
+                const th = Math.round(H * (1260 / 1920));
+                drawVideoCrop(ctx, video, camR, 0, 0, W, th, false, dynZoom);
+                drawVideoCrop(ctx, video, cntR, 0, th, W, H - th, sc.content_focus.fit_blur, 1.0);
+              } else if (sc.layout === "camera_focus") {
+                drawVideoCrop(ctx, video, camR, 0, 0, W, H, false, dynZoom);
+              } else if (sc.layout === "content_fullscreen") {
+                drawVideoCrop(ctx, video, cntR, 0, 0, W, H, sc.content_focus.fit_blur, dynZoom);
+              } else {
+                drawVideoCrop(ctx, video, cntR, 0, 0, W, H, sc.content_focus.fit_blur, dynZoom);
+                if (sc.pip.visible) {
+                  const pw = W * Math.max(0.24, Math.min(0.46, sc.pip.width_pct));
+                  const ph = pw / 1.75;
+                  const pad = 10;
+                  const px = sc.pip.corner.includes("right") ? W - pw - pad : pad;
+                  const py = sc.pip.corner.includes("bottom") ? H - ph - 72 : 30;
+                  ctx.save();
+                  drawRoundedRect(ctx, px, py, pw, ph, 9);
+                  ctx.clip();
+                  drawVideoCrop(ctx, video, camR, px, py, pw, ph, false, 1.0);
+                  ctx.restore();
+                  drawRoundedRect(ctx, px, py, pw, ph, 9);
+                  ctx.strokeStyle = sc.pip.border_hex || "#eab308";
+                  ctx.lineWidth = 2.5;
+                  ctx.stroke();
+                }
+              }
+
+              if (fx?.vignette) {
+                ctx.filter = "none";
+                const vig = ctx.createRadialGradient(W / 2, H / 2, W * 0.3, W / 2, H / 2, H * 0.65);
+                vig.addColorStop(0, "rgba(0,0,0,0)");
+                vig.addColorStop(1, "rgba(0,0,0,0.52)");
+                ctx.fillStyle = vig;
+                ctx.fillRect(0, 0, W, H);
+              }
+            } else {
+              // Live instant preview BEFORE AI edits: show the selected video in SMOKING33 framing!
               const bg = ctx.createLinearGradient(0, 0, 0, H);
               bg.addColorStop(0, "#1d0f2e");
               bg.addColorStop(1, "#181022");
@@ -284,10 +447,12 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
               ctx.fillStyle = "#e8bd52";
               ctx.font = "700 11px monospace";
               ctx.textAlign = "center";
-              ctx.fillText("SMOKING33", W / 2, 24);
+              ctx.fillText("PREVIEW ORIGINAL", W / 2, 24);
 
               const tx = 30 * sx, ty = 150 * sy, tw = 1020 * sx, th = 582 * sy;
               const bx = 30 * sx, by = 765 * sy, bw = 1020 * sx, bh = 889 * sy;
+              const camR = framingRef.current.webcam;
+              const cntR = framingRef.current.content ?? { x: 0, y: 0, w: 1, h: 1 };
 
               ctx.save();
               drawRoundedRect(ctx, tx, ty, tw, th, 8);
@@ -302,52 +467,12 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
               ctx.save();
               drawRoundedRect(ctx, bx, by, bw, bh, 8);
               ctx.clip();
-              drawVideoCrop(ctx, video, cntR, bx, by, bw, bh, sc.content_focus.fit_blur, dynZoom);
+              drawVideoCrop(ctx, video, cntR, bx, by, bw, bh, false, 1.0);
               ctx.restore();
               drawRoundedRect(ctx, bx, by, bw, bh, 8);
               ctx.strokeStyle = "#eab308";
               ctx.lineWidth = 2;
               ctx.stroke();
-            } else if (sc.layout === "split_clean") {
-              const th = Math.round(H * (730 / 1920));
-              drawVideoCrop(ctx, video, camR, 0, 0, W, th, false, 1.0);
-              drawVideoCrop(ctx, video, cntR, 0, th, W, H - th, sc.content_focus.fit_blur, dynZoom);
-            } else if (sc.layout === "camera_hero_pip") {
-              const th = Math.round(H * (1260 / 1920));
-              drawVideoCrop(ctx, video, camR, 0, 0, W, th, false, dynZoom);
-              drawVideoCrop(ctx, video, cntR, 0, th, W, H - th, sc.content_focus.fit_blur, 1.0);
-            } else if (sc.layout === "camera_focus") {
-              drawVideoCrop(ctx, video, camR, 0, 0, W, H, false, dynZoom);
-            } else if (sc.layout === "content_fullscreen") {
-              drawVideoCrop(ctx, video, cntR, 0, 0, W, H, sc.content_focus.fit_blur, dynZoom);
-            } else {
-              drawVideoCrop(ctx, video, cntR, 0, 0, W, H, sc.content_focus.fit_blur, dynZoom);
-              if (sc.pip.visible) {
-                const pw = W * Math.max(0.24, Math.min(0.46, sc.pip.width_pct));
-                const ph = pw / 1.75;
-                const pad = 10;
-                const px = sc.pip.corner.includes("right") ? W - pw - pad : pad;
-                const py = sc.pip.corner.includes("bottom") ? H - ph - 72 : 30;
-                ctx.save();
-                drawRoundedRect(ctx, px, py, pw, ph, 9);
-                ctx.clip();
-                drawVideoCrop(ctx, video, camR, px, py, pw, ph, false, 1.0);
-                ctx.restore();
-                drawRoundedRect(ctx, px, py, pw, ph, 9);
-                ctx.strokeStyle = sc.pip.border_hex || "#eab308";
-                ctx.lineWidth = 2.5;
-                ctx.stroke();
-              }
-            }
-
-            // Optional cinematic vignette
-            if (fx?.vignette) {
-              ctx.filter = "none";
-              const vig = ctx.createRadialGradient(W / 2, H / 2, W * 0.3, W / 2, H / 2, H * 0.65);
-              vig.addColorStop(0, "rgba(0,0,0,0)");
-              vig.addColorStop(1, "rgba(0,0,0,0.52)");
-              ctx.fillStyle = vig;
-              ctx.fillRect(0, 0, W, H);
             }
           }
           ctx.restore();
@@ -357,27 +482,52 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [comp, relTime, postSeekToHyperframes]);
+  }, [postSeekToHyperframes]);
 
   const seekTo = (nextRel: number) => {
-    if (!comp) return;
-    const clamped = Math.max(0, Math.min(comp.duration_sec, nextRel));
+    const clamped = Math.max(0, Math.min(effectiveDuration, nextRel));
+    relTimeRef.current = clamped;
+    lastUiSyncRef.current = clamped;
     setRelTime(clamped);
-    if (videoRef.current) videoRef.current.currentTime = comp.clip_start_sec + clamped;
-    postSeekToHyperframes(clamped);
+    if (videoRef.current && videoRef.current.readyState >= 1) {
+      videoRef.current.currentTime = effectiveStart + clamped;
+    }
+    if (comp) {
+      postSeekToHyperframes(clamped, true);
+    }
   };
 
   const togglePlay = () => {
     const v = videoRef.current;
-    if (!v || !comp) return;
+    if (!v) return;
     if (v.paused) {
-      if (v.currentTime < comp.clip_start_sec || v.currentTime >= comp.clip_end_sec) {
-        v.currentTime = comp.clip_start_sec;
+      const endSec = effectiveStart + effectiveDuration;
+      if (v.currentTime < effectiveStart || v.currentTime >= endSec - 0.05) {
+        v.currentTime = effectiveStart;
+        relTimeRef.current = 0;
+        setRelTime(0);
       }
-      void v.play().then(() => setPlaying(true)).catch(() => {});
+      void v
+        .play()
+        .then(() => setPlaying(true))
+        .catch(() => {
+          // If autoplay with audio was blocked, retry muted
+          v.muted = true;
+          void v.play().then(() => setPlaying(true)).catch(() => {});
+        });
     } else {
       v.pause();
       setPlaying(false);
+    }
+  };
+
+  const handleVideoError = () => {
+    if (!useProxyVideo && activeMediaId) {
+      // Source format (e.g. MKV/HEVC/AV1) isn't natively playable in WebView2 -> auto-switch to H.264 preview proxy!
+      setUseProxyVideo(true);
+      setVideoStatus("proxy");
+    } else {
+      setVideoStatus("error");
     }
   };
 
@@ -393,7 +543,11 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
         goal: customGoal,
       });
       setComp(res.data.composition);
+      relTimeRef.current = 0;
       setRelTime(0);
+      if (videoRef.current && videoRef.current.readyState >= 1) {
+        videoRef.current.currentTime = res.data.composition.clip_start_sec;
+      }
     } catch (e) {
       const msg = e instanceof AicutActionError ? e.message : (e as Error).message;
       onNotify("error", "Erro ao analisar vídeo", msg);
@@ -408,7 +562,6 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
     if (!msg) return;
     setChatInput("");
 
-    // If user starts chatting directly before generating an initial edit, let AI analyze & plan with their prompt!
     if (!comp) {
       await handleAutoEditWithAi(msg);
       return;
@@ -448,13 +601,13 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
     }
   };
 
-  const activeScene = useMemo(() => {
-    if (!comp || comp.scenes.length === 0) return null;
-    return (
-      comp.scenes.find((s) => relTime >= s.start_sec && relTime < s.end_sec) ??
-      comp.scenes[comp.scenes.length - 1]
-    );
+  const activeSceneIndex = useMemo(() => {
+    if (!comp || comp.scenes.length === 0) return -1;
+    const idx = comp.scenes.findIndex((s) => relTime >= s.start_sec && relTime < s.end_sec);
+    return idx >= 0 ? idx : comp.scenes.length - 1;
   }, [comp, relTime]);
+
+  const activeScene = activeSceneIndex >= 0 && comp ? comp.scenes[activeSceneIndex] : null;
 
   if (videoMedia.length === 0) {
     return (
@@ -470,6 +623,12 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
       />
     );
   }
+
+  const videoSrc = activeMediaId
+    ? useProxyVideo
+      ? mediaPreviewUrl(activeMediaId)
+      : mediaStreamUrl(activeMediaId)
+    : "";
 
   return (
     <div className="ms-shell">
@@ -572,77 +731,116 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
       <div className="ms-grid">
         {/* LEFT: Clean 9:16 Live Preview (Video Choreography + Live HyperFrames HTML/CSS/SVG Overlay) */}
         <section className="ms-stage-col" aria-label="Preview ao vivo">
-          {comp && (
+          {videoSrc && (
             <video
+              key={`${activeMediaId}-${useProxyVideo ? "proxy" : "direct"}`}
               ref={videoRef}
-              src={mediaStreamUrl(comp.media_id)}
-              crossOrigin="anonymous"
+              src={videoSrc}
               playsInline
               preload="auto"
-              style={{ display: "none" }}
+              className="ms-hidden-video"
               onLoadedMetadata={() => {
-                if (videoRef.current) videoRef.current.currentTime = comp.clip_start_sec;
+                if (videoRef.current) {
+                  try {
+                    videoRef.current.currentTime = effectiveStart + relTimeRef.current;
+                  } catch {
+                    // ignore
+                  }
+                }
               }}
+              onLoadedData={() => setVideoStatus("ready")}
+              onCanPlay={() => setVideoStatus("ready")}
+              onError={handleVideoError}
               onPause={() => setPlaying(false)}
               onPlay={() => setPlaying(true)}
             />
           )}
 
-          <div className="ms-phone-frame">
+          <div className="ms-phone-frame" onClick={togglePlay} role="button" tabIndex={0} aria-label={playing ? "Pausar preview" : "Reproduzir preview"}>
             <canvas ref={canvasRef} width={288} height={512} className="ms-video-canvas" />
-            {liveHtmlDoc && (
+            {comp && liveHtmlDoc && (
               <iframe
                 ref={iframeRef}
                 title="HyperFrames Motion Layer"
                 srcDoc={liveHtmlDoc}
                 sandbox="allow-scripts"
                 className="ms-hyperframes-iframe"
-                onLoad={() => postSeekToHyperframes(relTime)}
+                onLoad={() => postSeekToHyperframes(relTimeRef.current, true)}
               />
             )}
-            {!comp && (
-              <div className="ms-empty-stage">
-                <Wand2 size={28} className="text-accent" aria-hidden />
-                <span>Converse com a IA ao lado ou peça para ela assistir e editar este vídeo.</span>
+            {(videoStatus === "loading" || videoStatus === "proxy") && (
+              <div className="ms-stage-status">
+                <Loader2 size={22} className="spin text-accent" aria-hidden />
+                <span>
+                  {videoStatus === "proxy"
+                    ? "Convertendo preview compatível (MKV/HEVC)…"
+                    : "Carregando vídeo…"}
+                </span>
+              </div>
+            )}
+            {videoStatus === "error" && (
+              <div className="ms-stage-status">
+                <Film size={22} className="text-warning" aria-hidden />
+                <span>Não foi possível decodificar este vídeo no preview.</span>
               </div>
             )}
           </div>
 
-          {comp && (
-            <div className="ms-player-controls">
-              <div className="ms-scrubber-row">
-                <button type="button" className="btn btn-sm btn-primary" onClick={togglePlay} aria-label={playing ? "Pausar" : "Reproduzir"}>
-                  {playing ? <Pause size={13} aria-hidden /> : <Play size={13} aria-hidden />}
-                </button>
-                <input
-                  type="range"
-                  min={0}
-                  max={comp.duration_sec}
-                  step={0.05}
-                  value={relTime}
-                  onChange={(e) => seekTo(Number(e.target.value))}
-                  className="grow"
-                />
-                <span className="ms-time">
-                  {formatDuration(relTime)} / {formatDuration(comp.duration_sec)}
-                </span>
-              </div>
-
-              <div className="ms-scene-bar" title="Momentos da edição">
-                {comp.scenes.map((sc) => (
-                  <button
-                    key={sc.id}
-                    type="button"
-                    className="ms-scene-seg"
-                    style={{ flex: Math.max(0.5, sc.end_sec - sc.start_sec) }}
-                    data-active={activeScene?.id === sc.id}
-                    title={`${sc.title} (${formatDuration(sc.start_sec)}–${formatDuration(sc.end_sec)})`}
-                    onClick={() => seekTo(sc.start_sec + 0.05)}
-                  />
-                ))}
-              </div>
+          <div className="ms-player-controls">
+            <div className="ms-scrubber-row">
+              <button
+                type="button"
+                className="btn btn-sm btn-primary"
+                onClick={togglePlay}
+                disabled={videoStatus !== "ready"}
+                aria-label={playing ? "Pausar" : "Reproduzir"}
+              >
+                {playing ? <Pause size={13} aria-hidden /> : <Play size={13} aria-hidden />}
+              </button>
+              <input
+                type="range"
+                min={0}
+                max={effectiveDuration}
+                step={0.05}
+                value={Math.min(effectiveDuration, relTime)}
+                onChange={(e) => seekTo(Number(e.target.value))}
+                className="grow"
+              />
+              <span className="ms-time">
+                {formatDuration(relTime)} / {formatDuration(effectiveDuration)}
+              </span>
             </div>
-          )}
+
+            {comp && comp.scenes.length > 0 && (
+              <>
+                <div className="ms-scene-bar" title="Momentos da edição">
+                  {comp.scenes.map((sc) => (
+                    <button
+                      key={sc.id}
+                      type="button"
+                      className="ms-scene-seg"
+                      style={{ flex: Math.max(0.5, sc.end_sec - sc.start_sec) }}
+                      data-active={activeScene?.id === sc.id}
+                      title={`${sc.title} (${formatDuration(sc.start_sec)}–${formatDuration(sc.end_sec)})`}
+                      onClick={() => seekTo(sc.start_sec + 0.05)}
+                    />
+                  ))}
+                </div>
+                {activeScene && (
+                  <div className="ms-active-scene-caption">
+                    <span>
+                      Cena {activeSceneIndex + 1}/{comp.scenes.length} ·{" "}
+                      {LAYOUT_SHORT_LABELS[activeScene.layout] ?? activeScene.layout}
+                      {activeScene.effects?.camera_zoom_end > 1.02
+                        ? ` · Zoom ${activeScene.effects.camera_zoom_end.toFixed(2)}x`
+                        : ""}
+                    </span>
+                    {comp.motion_html && <span className="ms-hf-dot">HyperFrames</span>}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
         </section>
 
         {/* RIGHT: Pure Conversational AI Editor Chat */}

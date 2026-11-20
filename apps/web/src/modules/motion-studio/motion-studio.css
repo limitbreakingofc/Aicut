@@ -84,6 +84,17 @@
   background: var(--bg-surface);
 }
 
+/* Offscreen decoded video (NEVER display:none — Chromium/WebView2 suspends frame decoding when display:none!) */
+.ms-hidden-video {
+  position: fixed;
+  left: -10000px;
+  top: 0;
+  width: 320px;
+  height: 180px;
+  opacity: 0.001;
+  pointer-events: none;
+}
+
 .ms-phone-frame {
   position: relative;
   width: 288px;
@@ -94,6 +105,7 @@
   background: #06070a;
   box-shadow: 0 22px 54px rgba(0, 0, 0, 0.55);
   flex-shrink: 0;
+  cursor: pointer;
 }
 
 .ms-video-canvas {
@@ -104,7 +116,8 @@
   display: block;
 }
 
-/* Exact 1080x1920 HyperFrames layer scaled cleanly into 288x512 (288/1080 = 0.2666667) */
+/* Exact 1080x1920 HyperFrames layer scaled cleanly into 288x512 (288/1080 = 0.2666667)
+   IMPORTANT: color-scheme: dark MUST match the parent document so Chromium/WebView2 keeps the iframe truly transparent! */
 .ms-hyperframes-iframe {
   position: absolute;
   top: 0;
@@ -112,16 +125,18 @@
   width: 1080px;
   height: 1920px;
   border: 0;
-  background: transparent;
+  color-scheme: dark;
+  background: transparent !important;
   transform: scale(0.2666667);
   transform-origin: top left;
   pointer-events: none;
   z-index: 4;
 }
 
-.ms-empty-stage {
+.ms-stage-status {
   position: absolute;
   inset: 0;
+  z-index: 6;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -129,8 +144,36 @@
   gap: 10px;
   padding: 24px;
   text-align: center;
-  color: var(--text-muted);
+  background: rgba(6, 7, 10, 0.72);
+  color: var(--text-secondary);
   font-size: var(--text-xs);
+  pointer-events: none;
+}
+
+.ms-active-scene-caption {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+  padding-top: 2px;
+}
+
+.ms-hf-dot {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.ms-hf-dot::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
 }
 
 .ms-player-controls {

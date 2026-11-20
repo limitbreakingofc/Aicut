@@ -83,6 +83,18 @@ jobs:
           body: |
             ## Aicut ${{ steps.tag.outputs.name }} — Estúdio Modular AI-First para Windows 11
 
+            ### Correções da v0.8.1 — Preview 100% Funcional + Motor IA/HyperFrames Confiável
+            - **Corrigido Preview Quebrado no Motion Studio (WebView2 / Windows 11):**
+              - Resolvida a tela branca/opaca do `<iframe>` HyperFrames causada por divergência de `color-scheme` (`dark` vs `light`) no Edge WebView2.
+              - Removidos `display: none` e `crossOrigin="anonymous"` do `<video>` (que suspendiam a decodificação de frames e bloqueavam HTTP Range sem `expose_headers`), além de expor headers CORS no servidor local.
+              - Adicionado **fallback automático para proxy H.264 compatível** (`/api/v1/media/{id}/preview`) caso o vídeo original seja MKV/HEVC/AV1, e preview instantâneo do vídeo selecionado já ao abrir a aba.
+              - Corrigido o loop `requestAnimationFrame` para rodar a 60fps estáveis sem reiniciar a cada frame.
+            - **Corrigido Motor de Edição IA (Gemini Vision) & Renderização HyperFrames/FFmpeg:**
+              - Modelos *thinking* do Gemini agora filtram partes `thought: true` e usam `maxOutputTokens: 16384`, evitando corte do JSON/HTML.
+              - Parser tolerante de JSON (`serde_json::Value`) + fallback automático `director_model → scan_model` (Flash) + diagnóstico claro no chat se a API falhar — nunca mais descarta silenciosamente a edição da IA!
+              - Adicionado `--remote-allow-origins=*` e espera de carregamento no Edge/Chrome headless CDP para que a captura RGBA transparente do HyperFrames funcione sempre no Windows 11.
+              - Efeitos de câmera dinâmica (`camera_zoom_end` + `impact_shake`) agora também são renderizados de verdade no MP4 final via `zoompan` no FFmpeg!
+
             ### Novidades da v0.8.0 — Editora IA Contextual + Motor HyperFrames Real (Preview Ao Vivo & Render RGBA em NVENC)
             - **A IA agora ASSISTE ao vídeo de verdade antes de editar:** extrai um storyboard visual (grade 4×2 de frames reais do trecho) + transcrição com timestamps e cria **técnicas de edição e motion graphics HyperFrames (HTML + CSS + SVG + contadores + setas desenhadas + flashes + cards) sob medida para o contexto específico de cada vídeo**!
             - **Interface Ultra-Minimalista (Zero poluição de botões e formulários):**
