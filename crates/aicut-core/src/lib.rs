@@ -1,4 +1,5 @@
 pub mod action;
+pub mod audio_mastering;
 pub mod error;
 pub mod events;
 pub mod hardware;
@@ -14,6 +15,12 @@ pub mod workspace;
 pub use action::{
     ActionAnnotations, ActionContext, ActionHandler, ActionOutput, ActionSpec, EmptyInput,
     TypedAction,
+};
+pub use audio_mastering::{
+    build_mastered_audio_filter_chain, download_rnnoise_model, enhance_media_audio_to_library,
+    installed_rnnoise_model, load_audio_master_config, measure_audio_loudness_pass1,
+    prepare_clip_audio_master_chain, rnnoise_model_path, save_audio_master_config,
+    AudioEnhanceResult, AudioMasterConfig, LoudnormStats, SETTING_AUDIO_MASTER_CONFIG,
 };
 pub use error::{AicutError, AicutResult};
 pub use events::{ActivityEntry, ActorKind, AicutEvent, EventBus, EventEnvelope, NotificationLevel};

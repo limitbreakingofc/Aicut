@@ -361,7 +361,7 @@ impl AicutModule for MotionStudioModule {
                                 kernel.jobs.mark_cancelled(&task_job_id);
                                 return Err(AicutError::cancelled("Render cancelado."));
                             }
-                            match render_composition_to_library(&kernel, &comp_for_task).await {
+                            match render_composition_to_library(&kernel, &comp_for_task, Some(&task_job_id)).await {
                                 Ok(asset) => {
                                     comp_for_task.rendered_media_id = Some(asset.id.clone());
                                     let _ = save_composition(&kernel, &comp_for_task);

@@ -58,6 +58,7 @@ import { LibraryView } from "./modules/media-ingest/LibraryView";
 import { TranscribeView } from "./modules/transcribe/TranscribeView";
 import { SmartClipsView } from "./modules/smart-clips/SmartClipsView";
 import { MotionStudioView, type MotionSeed } from "./modules/motion-studio/MotionStudioView";
+import { AudioMasterView } from "./modules/audio-master/AudioMasterView";
 import { SettingsView } from "./modules/core/SettingsView";
 
 /** True when a keystroke belongs to a text field (shortcuts must not hijack typing). */
@@ -644,6 +645,21 @@ function AicutApp() {
               tools={tools}
               jobs={jobs}
               seed={motionSeed}
+              onNavigate={navigate}
+              onSelectMedia={(mediaId) => {
+                setSelectedMediaId(mediaId);
+                navigate("library");
+              }}
+              onNotify={pushToast}
+              onRefreshMedia={refreshMedia}
+            />
+          )}
+
+          {route === "audio-master" && (
+            <AudioMasterView
+              media={media}
+              tools={tools}
+              jobs={jobs}
               onNavigate={navigate}
               onSelectMedia={(mediaId) => {
                 setSelectedMediaId(mediaId);

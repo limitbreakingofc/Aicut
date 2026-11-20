@@ -18,6 +18,7 @@ import {
 import { AicutActionError, runAction } from "../../lib/client";
 import { formatDuration, formatRelativeDate } from "../../lib/format";
 import type {
+  AicutComposition,
   ClipsConfig,
   JobRecord,
   MediaAsset,
@@ -165,6 +166,7 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
   // Saved global AI config (edited exclusively in Configurações → IA & Chaves)
   const [config, setConfig] = useState<ClipsConfig | null>(null);
   const [runs, setRuns] = useState<SmartClipRun[]>([]);
+  const [motionComps, setMotionComps] = useState<AicutComposition[]>([]);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [mediaContext, setMediaContext] = useState<MediaContextInfo | null>(null);
 
@@ -206,14 +208,16 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
 
   const loadAll = useCallback(async () => {
     try {
-      const [cfgRes, runsRes] = await Promise.all([
+      const [cfgRes, runsRes, motionRes] = await Promise.all([
         runAction<ClipsConfig>("clips.config_get"),
         runAction<{ runs: SmartClipRun[] }>("clips.runs_list"),
+        runAction<{ compositions: AicutComposition[] }>("motion.list").catch(() => null),
       ]);
       setConfig(cfgRes.data);
       setCustomTemplatePath(cfgRes.data.template_path ?? "");
       const rList = runsRes.data.runs ?? [];
       setRuns(rList);
+      setMotionComps(motionRes?.data.compositions ?? []);
       setActiveRunId((curr) => (curr && rList.some((r) => r.id === curr) ? curr : (rList[0]?.id ?? null)));
     } catch {
       // ignore if offline
@@ -229,10 +233,14 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
   }, [selectedMediaId, media.length, loadMediaContext]);
 
   const activeClipJobs = jobs.filter(
-    (j) => (j.kind === "clips.analyze" || j.kind === "clips.render") && (j.status === "queued" || j.status === "running"),
+    (j) =>
+      (j.kind === "clips.analyze" || j.kind === "clips.render" || j.kind === "motion.render") &&
+      (j.status === "queued" || j.status === "running"),
   );
   const finishedCount = jobs.filter(
-    (j) => (j.kind === "clips.analyze" || j.kind === "clips.render") && j.status === "completed",
+    (j) =>
+      (j.kind === "clips.analyze" || j.kind === "clips.render" || j.kind === "motion.render") &&
+      j.status === "completed",
   ).length;
 
   useEffect(() => {
@@ -300,6 +308,42 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
     }
   }
 
+  const findMotionForClip = useCallback(
+    (run: SmartClipRun, clip: SmartClipPlan): AicutComposition | null => {
+      if (!clip.segments || clip.segments.length === 0) return null;
+      const s0 = clip.segments[0].start_sec;
+      const e0 = clip.segments[clip.segments.length - 1].end_sec;
+      const matches = motionComps.filter(
+        (c) =>
+          c.media_id === run.media_id &&
+          Math.abs(c.clip_start_sec - s0) <= 1.5 &&
+          Math.abs(c.clip_end_sec - e0) <= 1.5 &&
+          Boolean(c.motion_html?.trim() || c.scenes.length > 1),
+      );
+      if (matches.length === 0) return null;
+      matches.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+      return matches[0];
+    },
+    [motionComps],
+  );
+
+  async function handleRenderMotion(comp: AicutComposition, clipId: string) {
+    setRenderingKey(`motion:${clipId}`);
+    try {
+      const res = await runAction<{ job_id: string }>("motion.render", { id: comp.id, wait: false });
+      onNotify(
+        "success",
+        "Renderização com Motion iniciada",
+        `Exportando animações Motion Studio + áudio YouTube (-14 LUFS) (${res.data.job_id.slice(0, 8)}).`,
+      );
+    } catch (e) {
+      const msg = e instanceof AicutActionError ? e.message : (e as Error).message;
+      onNotify("error", "Erro ao renderizar Motion", msg);
+    } finally {
+      setRenderingKey(null);
+    }
+  }
+
   async function handleRender(runId: string, clipId?: string) {
     const key = clipId ?? `all:${runId}`;
     setRenderingKey(key);
@@ -317,7 +361,11 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
         burn_subtitles: burnSubtitles,
         wait: false,
       });
-      onNotify("success", "Renderização iniciada", `Shorts serão salvos na Biblioteca (${res.data.job_id.slice(0, 8)}).`);
+      onNotify(
+        "success",
+        "Renderização padrão iniciada",
+        `Short no layout padrão + áudio YouTube (-14 LUFS) será salvo na Biblioteca (${res.data.job_id.slice(0, 8)}).`,
+      );
     } catch (e) {
       const msg = e instanceof AicutActionError ? e.message : (e as Error).message;
       onNotify("error", "Erro ao renderizar", msg);
@@ -634,7 +682,9 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
             />
           ) : (
             <div className="stack">
-              {activeRun.clips.map((clip, i) => (
+              {activeRun.clips.map((clip, i) => {
+                const motionComp = findMotionForClip(activeRun, clip);
+                return (
                 <article
                   key={clip.id}
                   className="clip-card hover-host"
@@ -647,6 +697,7 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
                       <div className="clip-times">{clipTimecodes(clip)}</div>
                     </div>
                     <Badge tone="accent">{formatDuration(clip.total_duration_sec)}</Badge>
+                    {motionComp && <Badge tone="success">Motion editado</Badge>}
                     {onOpenInMotionStudio && clip.segments.length > 0 && (
                       <button
                         type="button"
@@ -666,19 +717,41 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
                         <Layers size={13} aria-hidden /> Motion IA
                       </button>
                     )}
+                    {motionComp?.rendered_media_id && (
+                      <button
+                        type="button"
+                        className="btn btn-sm"
+                        onClick={() => onSelectMedia(motionComp.rendered_media_id!)}
+                      >
+                        <Play aria-hidden /> Abrir Motion
+                      </button>
+                    )}
                     {clip.rendered_media_id && (
                       <button type="button" className="btn btn-sm" onClick={() => onSelectMedia(clip.rendered_media_id!)}>
-                        <Play aria-hidden /> Abrir
+                        <Play aria-hidden /> Abrir padrão
+                      </button>
+                    )}
+                    {motionComp && (
+                      <button
+                        type="button"
+                        className="btn btn-primary btn-sm"
+                        disabled={renderingKey !== null}
+                        title="Exportar a versão editada com animações do Motion Studio"
+                        onClick={() => void handleRenderMotion(motionComp, clip.id)}
+                      >
+                        <BusyIcon busy={renderingKey === `motion:${clip.id}`} icon={Sparkles} size={13} />
+                        Renderizar Motion
                       </button>
                     )}
                     <button
                       type="button"
-                      className="btn btn-primary btn-sm"
+                      className={motionComp ? "btn btn-sm" : "btn btn-primary btn-sm"}
                       disabled={renderingKey !== null}
+                      title="Exportar no layout padrão salvo (sem animações do Motion Studio)"
                       onClick={() => handleRender(activeRun.id, clip.id)}
                     >
                       <BusyIcon busy={renderingKey === clip.id} icon={Scissors} size={13} />
-                      {clip.rendered_media_id ? "Re-renderizar" : "Renderizar"}
+                      {clip.rendered_media_id ? "Re-renderizar padrão" : "Renderizar padrão"}
                     </button>
                     <MoreButton items={() => clipMenu(activeRun, clip, i)} />
                   </header>
@@ -732,7 +805,8 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
                     </div>
                   </div>
                 </article>
-              ))}
+                );
+              })}
             </div>
           )}
         </Panel>

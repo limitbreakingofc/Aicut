@@ -377,15 +377,23 @@ impl Drop for ChildKillGuard {
 }
 
 /// Captures deterministic 1080x1920 transparent RGBA PNG frames (`hf_%05d.png`) from the
-/// HyperFrames HTML/CSS/SVG motion document using built-in headless Edge/Chrome via CDP.
-/// Returns `Ok(None)` cleanly if no Chromium browser is available (caller falls back to ASS).
-pub async fn capture_hyperframes_rgba_sequence(
+/// HyperFrames HTML/CSS/SVG motion document using system Chromium/Chrome/Brave/Vivaldi via CDP.
+/// Returns a detailed error if no Chromium browser is installed or CDP fails so Motion renders
+/// NEVER silently drop animations.
+pub async fn capture_hyperframes_rgba_sequence<F>(
     comp: &AicutComposition,
     fps: u32,
     out_dir: &Path,
-) -> AicutResult<Option<usize>> {
+    mut on_progress: F,
+) -> AicutResult<usize>
+where
+    F: FnMut(usize, usize),
+{
     let Some(chromium_bin) = find_system_chromium() else {
-        return Ok(None);
+        return Err(AicutError::dependency_missing(
+            "chromium",
+            "Nenhum navegador Chromium/Chrome/Brave encontrado para renderizar as animações do Motion Studio. No CachyOS/Arch instale com: sudo pacman -S chromium",
+        ));
     };
 
     std::fs::create_dir_all(out_dir)?;
@@ -395,6 +403,11 @@ pub async fn capture_hyperframes_rgba_sequence(
 
     let profile_dir = out_dir.join("cdp-profile");
     std::fs::create_dir_all(&profile_dir)?;
+
+    let stderr_path = out_dir.join("chromium-cdp.stderr.log");
+    let stderr_stdio = std::fs::File::create(&stderr_path)
+        .map(std::process::Stdio::from)
+        .unwrap_or_else(|_| std::process::Stdio::null());
 
     let port = pick_free_port()?;
     let file_url = path_to_file_url(&html_path);
@@ -407,6 +420,7 @@ pub async fn capture_hyperframes_rgba_sequence(
         "--disable-gpu",
         "--no-sandbox",
         "--disable-dev-shm-usage",
+        "--disable-software-rasterizer",
         "--hide-scrollbars",
         "--mute-audio",
         "--disable-extensions",
@@ -421,22 +435,31 @@ pub async fn capture_hyperframes_rgba_sequence(
         &file_url,
     ])
     .stdout(std::process::Stdio::null())
-    .stderr(std::process::Stdio::null());
+    .stderr(stderr_stdio);
 
-    let child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(_) => return Ok(None),
-    };
+    let child = cmd.spawn().map_err(|e| {
+        AicutError::internal(format!(
+            "Falha ao iniciar Chromium ({}) para renderizar Motion HyperFrames: {e}",
+            chromium_bin.display()
+        ))
+    })?;
     let _guard = ChildKillGuard(Some(child));
 
-    // Wait for CDP endpoint to come up
+    let read_stderr_tail = || -> String {
+        let raw = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        let lines: Vec<&str> = raw.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let tail = if lines.len() > 5 { &lines[lines.len() - 5..] } else { &lines[..] };
+        tail.join(" | ")
+    };
+
+    // Wait up to 12 seconds for CDP endpoint to come up
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .map_err(|e| AicutError::internal(format!("HTTP client init failed: {e}")))?;
     let list_url = format!("http://127.0.0.1:{port}/json/list");
     let mut ws_url: Option<String> = None;
-    for _ in 0..30 {
+    for _ in 0..60 {
         if let Ok(resp) = http.get(&list_url).send().await {
             if let Ok(targets) = resp.json::<Vec<Value>>().await {
                 if let Some(u) = targets
@@ -454,13 +477,19 @@ pub async fn capture_hyperframes_rgba_sequence(
     }
 
     let Some(ws_url) = ws_url else {
-        return Ok(None);
+        let detail = read_stderr_tail();
+        return Err(AicutError::internal(format!(
+            "Chromium CDP ({}) não respondeu na porta {port} dentro de 12s.{}",
+            chromium_bin.display(),
+            if detail.is_empty() { String::new() } else { format!(" Detalhe: {detail}") }
+        )));
     };
 
-    let (mut ws, _) = match tokio_tungstenite::connect_async(ws_url.as_str()).await {
-        Ok(pair) => pair,
-        Err(_) => return Ok(None),
-    };
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url.as_str())
+        .await
+        .map_err(|e| {
+            AicutError::internal(format!("Falha ao conectar WebSocket CDP do Chromium: {e}"))
+        })?;
 
     let mut msg_id = 1u64;
     let send_cdp = |id: &mut u64, method: &str, params: Value| -> (u64, String) {
@@ -470,8 +499,9 @@ pub async fn capture_hyperframes_rgba_sequence(
         (cur, payload)
     };
 
-    // Configure exact 1080x1920 viewport + transparent RGBA background (alpha = 0)
+    // Enable Page domain, navigate cleanly to motion.html if needed, and lock 1080x1920 transparent RGBA viewport
     for (method, params) in [
+        ("Page.enable", json!({})),
         (
             "Emulation.setDeviceMetricsOverride",
             json!({
@@ -491,7 +521,13 @@ pub async fn capture_hyperframes_rgba_sequence(
     }
 
     // Wait until the HyperFrames HTML document finished loading & registered window.__aicutSeek
-    for _ in 0..25 {
+    let mut page_ready = false;
+    for attempt in 0..40 {
+        if attempt == 8 {
+            // Explicit Page.navigate fallback if initial tab opened at about:blank
+            let (nid, nav_payload) = send_cdp(&mut msg_id, "Page.navigate", json!({ "url": file_url }));
+            let _ = cdp_roundtrip(&mut ws, nid, nav_payload).await;
+        }
         let (rid, ready_payload) = send_cdp(
             &mut msg_id,
             "Runtime.evaluate",
@@ -507,10 +543,17 @@ pub async fn capture_hyperframes_rgba_sequence(
                 .and_then(|v| v.as_bool())
                 == Some(true)
             {
+                page_ready = true;
                 break;
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    }
+
+    if !page_ready {
+        return Err(AicutError::internal(
+            "Documento HyperFrames não inicializou window.__aicutSeek no Chromium headless.",
+        ));
     }
 
     let capture_fps = fps.clamp(10, 30);
@@ -518,12 +561,14 @@ pub async fn capture_hyperframes_rgba_sequence(
 
     for i in 0..total_frames {
         let t = i as f64 / capture_fps as f64;
+        // Seek deterministically AND await a real layout/paint tick before capturing PNG
         let (id1, eval_payload) = send_cdp(
             &mut msg_id,
             "Runtime.evaluate",
             json!({
-                "expression": format!("window.__aicutSeek({t:.4}); true"),
-                "awaitPromise": false
+                "expression": format!("(async () => {{ window.__aicutSeek({t:.4}); await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))); return true; }})()"),
+                "awaitPromise": true,
+                "returnByValue": true
             }),
         );
         let _ = cdp_roundtrip(&mut ws, id1, eval_payload).await?;
@@ -531,7 +576,17 @@ pub async fn capture_hyperframes_rgba_sequence(
         let (id2, shot_payload) = send_cdp(
             &mut msg_id,
             "Page.captureScreenshot",
-            json!({ "format": "png", "fromSurface": true }),
+            json!({
+                "format": "png",
+                "fromSurface": true,
+                "clip": {
+                    "x": 0,
+                    "y": 0,
+                    "width": comp.width,
+                    "height": comp.height,
+                    "scale": 1
+                }
+            }),
         );
         let res = cdp_roundtrip(&mut ws, id2, shot_payload).await?;
         let b64 = res
@@ -544,9 +599,13 @@ pub async fn capture_hyperframes_rgba_sequence(
             .map_err(|e| AicutError::internal(format!("Failed decoding CDP PNG: {e}")))?;
         let frame_path = out_dir.join(format!("hf_{i:05}.png"));
         std::fs::write(&frame_path, png_bytes)?;
+
+        if i == 0 || (i + 1) % 10 == 0 || i + 1 == total_frames {
+            on_progress(i + 1, total_frames);
+        }
     }
 
-    Ok(Some(total_frames))
+    Ok(total_frames)
 }
 
 async fn cdp_roundtrip<S>(
@@ -586,11 +645,20 @@ fn pick_free_port() -> AicutResult<u16> {
 }
 
 fn path_to_file_url(path: &Path) -> String {
-    let s = path.to_string_lossy().replace('\\', "/");
-    if s.starts_with('/') {
-        format!("file://{s}")
+    let raw = path.to_string_lossy().replace('\\', "/");
+    let encoded: String = raw
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' | b':' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    if encoded.starts_with('/') {
+        format!("file://{encoded}")
     } else {
-        format!("file:///{s}")
+        format!("file:///{encoded}")
     }
 }
 

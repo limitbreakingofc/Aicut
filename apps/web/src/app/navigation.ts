@@ -1,11 +1,18 @@
-import { Download, Film, Layers, Mic, Scissors, Settings, type LucideIcon } from "lucide-react";
+import { Download, Film, Layers, Mic, Scissors, Settings, SlidersHorizontal, type LucideIcon } from "lucide-react";
 import type { RouteId } from "../lib/types";
 
-/** Single source of truth for app navigation: 5 studio workspaces + Settings hub pinned at bottom. */
+/** Single source of truth for app navigation: studio workspaces + Settings hub pinned at bottom. */
 
-export const APP_VERSION = "0.10.1";
+export const APP_VERSION = "0.11.0";
 
-export type PrimaryRouteId = "ingest" | "library" | "transcribe" | "smart-clips" | "motion-studio" | "settings";
+export type PrimaryRouteId =
+  | "ingest"
+  | "library"
+  | "transcribe"
+  | "smart-clips"
+  | "motion-studio"
+  | "audio-master"
+  | "settings";
 export type SmartClipsTabId = "generate" | "results" | "framing";
 export type SettingsTabId = "ai" | "tools" | "system" | "integrations" | "modules" | "jobs";
 
@@ -66,6 +73,14 @@ export const ROUTES: RouteMeta[] = [
     keywords: "motion studio remotion hyperframes layout dinamico chat ia preview",
   },
   {
+    id: "audio-master",
+    label: "Áudio IA",
+    title: "Áudio IA · Masterização YouTube",
+    description: "Normalização automática YouTube (-14 LUFS), redução neural de ruído (RNNoise) e compressão vocal.",
+    icon: SlidersHorizontal,
+    keywords: "audio masterizacao youtube lufs ruido rnnoise compressao volume equalizacao voz",
+  },
+  {
     id: "settings",
     label: "Configurações",
     title: "Configurações",
@@ -98,6 +113,7 @@ export function resolveRouteTarget(id: RouteId): {
     case "transcribe":
     case "smart-clips":
     case "motion-studio":
+    case "audio-master":
     case "settings":
       return { route: id };
     default:

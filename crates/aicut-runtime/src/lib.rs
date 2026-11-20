@@ -1,7 +1,10 @@
 use aicut_core::{
-    ActionAnnotations, ActionHandler, ActionSpec, ActivityEntry, AicutError, AicutEvent,
-    AicutKernel, AicutModule, AicutResult, EmptyInput, HardwareProfile, JobRecord, ModuleInfo,
-    ModuleManifest, NotificationLevel, ToolStatus, TypedAction, UiState, WorkspaceConfig,
+    download_rnnoise_model, enhance_media_audio_to_library, installed_rnnoise_model,
+    load_audio_master_config, rnnoise_model_path, save_audio_master_config, ActionAnnotations,
+    ActionHandler, ActionSpec, ActivityEntry, AicutError, AicutEvent, AicutKernel, AicutModule,
+    AicutResult, AudioEnhanceResult, AudioMasterConfig, EmptyInput, HardwareProfile, JobRecord,
+    ModuleInfo, ModuleManifest, NotificationLevel, ToolStatus, TypedAction, UiState,
+    WorkspaceConfig,
 };
 use aicut_module_media_ingest::MediaIngestModule;
 use aicut_module_motion_studio::MotionStudioModule;
@@ -24,6 +27,7 @@ pub async fn bootstrap_kernel(workspace: WorkspaceConfig) -> AicutResult<Arc<Aic
     kernel.register_module(TranscribeModule::new()).await?;
     kernel.register_module(SmartClipsModule::new()).await?;
     kernel.register_module(MotionStudioModule::new()).await?;
+    kernel.register_module(Arc::new(AudioMasterModule)).await?;
     Ok(kernel)
 }
 
@@ -577,7 +581,7 @@ impl AicutModule for UiModule {
                 ActionAnnotations { idempotent: true, ..Default::default() },
                 |ctx, input| {
                     Box::pin(async move {
-                        let allowed = ["ingest", "library", "transcribe", "smart-clips", "framing", "motion-studio", "jobs", "modules", "ai-connect", "settings"];
+                        let allowed = ["ingest", "library", "transcribe", "smart-clips", "framing", "motion-studio", "audio-master", "jobs", "modules", "ai-connect", "settings"];
                         if !allowed.contains(&input.route.as_str()) {
                             return Err(AicutError::invalid_input(format!(
                                 "Unknown route '{}'. Valid routes: {}",
@@ -644,6 +648,278 @@ impl AicutModule for UiModule {
                         });
                         let summary = format!("Displayed notification '{}'", input.title);
                         Ok((UiNotifyOutput { sent: true }, summary, vec![]))
+                    })
+                },
+            )),
+        ]
+    }
+}
+
+// ============================================================================
+// 5. AudioMasterModule (YouTube -14 LUFS auto-mastering, RNNoise neural denoise)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AudioConfigOutput {
+    pub config: AudioMasterConfig,
+    pub rnnoise_installed: bool,
+    pub rnnoise_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AudioConfigSetInput {
+    #[serde(default)]
+    pub preset: Option<String>,
+    #[serde(default)]
+    pub denoise: Option<String>,
+    #[serde(default)]
+    pub voice_eq: Option<bool>,
+    #[serde(default)]
+    pub auto_compressor: Option<bool>,
+    #[serde(default)]
+    pub target_lufs: Option<f64>,
+    #[serde(default)]
+    pub true_peak_db: Option<f64>,
+    #[serde(default)]
+    pub lra: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AudioEnhanceInput {
+    pub media_id: String,
+    #[serde(default)]
+    pub preset: Option<String>,
+    #[serde(default)]
+    pub wait: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AudioEnhanceJobOutput {
+    pub job_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<AudioEnhanceResult>,
+}
+
+pub struct AudioMasterModule;
+
+#[async_trait]
+impl AicutModule for AudioMasterModule {
+    fn manifest(&self) -> ModuleManifest {
+        ModuleManifest {
+            id: "audio-master".to_string(),
+            name: "Áudio IA (Masterização YouTube)".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            description: "Masterização automática de áudio para YouTube (-14 LUFS / -1.0 dBTP), redução neural de ruído (RNNoise), equalização de voz e compressão dinâmica — aplicada automaticamente nos Cortes Shorts, no Motion Studio e em mídias da Biblioteca.".to_string(),
+            category: "audio".to_string(),
+            core: false,
+            capabilities: vec![
+                "youtube-loudness-14lufs".into(),
+                "rnnoise-neural-denoise".into(),
+                "auto-voice-compression".into(),
+            ],
+        }
+    }
+
+    fn actions(&self) -> Vec<Arc<dyn ActionHandler>> {
+        vec![
+            Arc::new(TypedAction::<EmptyInput, AudioConfigOutput, _>::new(
+                "audio.config.get",
+                "audio-master",
+                "Obter Configuração de Masterização de Áudio",
+                "Get the active automatic YouTube audio mastering preset (-14 LUFS), noise reduction mode, voice EQ, compression settings, and RNNoise neural model status.",
+                ActionAnnotations { read_only: true, idempotent: true, ..Default::default() },
+                |ctx, _| {
+                    Box::pin(async move {
+                        let config = load_audio_master_config(&ctx.kernel);
+                        let rnnoise_installed =
+                            installed_rnnoise_model(&ctx.kernel.workspace.models_dir).is_some();
+                        let rnnoise_path =
+                            rnnoise_model_path(&ctx.kernel.workspace.models_dir)
+                                .to_string_lossy()
+                                .to_string();
+                        let summary = format!(
+                            "Audio preset '{}' ({:.1} LUFS, RNNoise: {})",
+                            config.preset, config.target_lufs, rnnoise_installed
+                        );
+                        Ok((
+                            AudioConfigOutput {
+                                config,
+                                rnnoise_installed,
+                                rnnoise_path,
+                            },
+                            summary,
+                            vec![],
+                        ))
+                    })
+                },
+            )),
+            Arc::new(TypedAction::<AudioConfigSetInput, AudioConfigOutput, _>::new(
+                "audio.config.set",
+                "audio-master",
+                "Salvar Configuração de Masterização de Áudio",
+                "Update the automatic audio mastering preset (youtube_auto, reels_tiktok, podcast_voice, off) and voice processing options applied automatically to all Cortes Shorts and Motion Studio renders.",
+                ActionAnnotations { idempotent: true, ..Default::default() },
+                |ctx, input| {
+                    Box::pin(async move {
+                        let mut cfg = if let Some(ref p) = input.preset {
+                            AudioMasterConfig::from_preset(p)
+                        } else {
+                            load_audio_master_config(&ctx.kernel)
+                        };
+                        if let Some(d) = input.denoise {
+                            cfg.denoise = d;
+                        }
+                        if let Some(eq) = input.voice_eq {
+                            cfg.voice_eq = eq;
+                        }
+                        if let Some(comp) = input.auto_compressor {
+                            cfg.auto_compressor = comp;
+                        }
+                        if let Some(lufs) = input.target_lufs {
+                            cfg.target_lufs = lufs;
+                        }
+                        if let Some(tp) = input.true_peak_db {
+                            cfg.true_peak_db = tp;
+                        }
+                        if let Some(lra) = input.lra {
+                            cfg.lra = lra;
+                        }
+                        let saved = save_audio_master_config(&ctx.kernel, &cfg)?;
+                        let rnnoise_installed =
+                            installed_rnnoise_model(&ctx.kernel.workspace.models_dir).is_some();
+                        let rnnoise_path =
+                            rnnoise_model_path(&ctx.kernel.workspace.models_dir)
+                                .to_string_lossy()
+                                .to_string();
+                        let summary = format!(
+                            "Saved audio mastering preset '{}' ({:.1} LUFS / {:.1} dBTP)",
+                            saved.preset, saved.target_lufs, saved.true_peak_db
+                        );
+                        Ok((
+                            AudioConfigOutput {
+                                config: saved,
+                                rnnoise_installed,
+                                rnnoise_path,
+                            },
+                            summary,
+                            vec![],
+                        ))
+                    })
+                },
+            )),
+            Arc::new(TypedAction::<EmptyInput, AudioConfigOutput, _>::new(
+                "audio.install_rnnoise",
+                "audio-master",
+                "Instalar Modelo Neural RNNoise (Grátis · 85 KB)",
+                "Download the open-source RNNoise neural speech denoising model (bd.rnnn) for AI background noise removal inside FFmpeg.",
+                ActionAnnotations { idempotent: true, ..Default::default() },
+                |ctx, _| {
+                    Box::pin(async move {
+                        let path = download_rnnoise_model(&ctx.kernel).await?;
+                        let config = load_audio_master_config(&ctx.kernel);
+                        let summary = format!("Installed RNNoise neural model at {}", path.display());
+                        Ok((
+                            AudioConfigOutput {
+                                config,
+                                rnnoise_installed: true,
+                                rnnoise_path: path.to_string_lossy().to_string(),
+                            },
+                            summary,
+                            vec![],
+                        ))
+                    })
+                },
+            )),
+            Arc::new(TypedAction::<AudioEnhanceInput, AudioEnhanceJobOutput, _>::new(
+                "audio.enhance",
+                "audio-master",
+                "Masterizar Áudio de Mídia da Biblioteca (YouTube -14 LUFS)",
+                "Run automatic AI audio mastering (2-pass EBU R128 loudness normalization, RNNoise/spectral denoise, voice EQ & auto compression) on any Library video or audio without re-encoding video.",
+                ActionAnnotations { long_running: true, ..Default::default() },
+                |ctx, input| {
+                    Box::pin(async move {
+                        let source = ctx
+                            .kernel
+                            .repo
+                            .get_media(&input.media_id)?
+                            .ok_or_else(|| {
+                                AicutError::not_found(format!(
+                                    "Mídia '{}' não encontrada",
+                                    input.media_id
+                                ))
+                            })?;
+                        let (job, cancel) = ctx.kernel.jobs.create_job(
+                            "audio.enhance",
+                            format!("Masterizar áudio de '{}'", source.title),
+                            "audio-master",
+                            ctx.actor,
+                        );
+                        let job_id = job.id.clone();
+                        let kernel = ctx.kernel.clone();
+                        let task_job_id = job_id.clone();
+                        let media_id = input.media_id.clone();
+                        let override_cfg = input
+                            .preset
+                            .as_deref()
+                            .map(AudioMasterConfig::from_preset);
+
+                        let handle = tokio::spawn(async move {
+                            kernel.jobs.mark_running(&task_job_id, "mastering_audio");
+                            if cancel.is_cancelled() {
+                                kernel.jobs.mark_cancelled(&task_job_id);
+                                return Err(AicutError::cancelled("Masterização cancelada."));
+                            }
+                            match enhance_media_audio_to_library(
+                                &kernel,
+                                &media_id,
+                                override_cfg,
+                                Some(&task_job_id),
+                            )
+                            .await
+                            {
+                                Ok(res) => {
+                                    kernel.jobs.complete(
+                                        &task_job_id,
+                                        serde_json::to_value(&res).unwrap_or(Value::Null),
+                                    );
+                                    Ok(res)
+                                }
+                                Err(err) => {
+                                    kernel.jobs.fail(&task_job_id, err.clone());
+                                    Err(err)
+                                }
+                            }
+                        });
+
+                        if input.wait {
+                            let res = handle
+                                .await
+                                .map_err(|e| AicutError::internal(format!("Audio task panicked: {e}")))??;
+                            let summary = format!(
+                                "Mastered '{}' ({:.1} LUFS)",
+                                res.asset.title, res.target_lufs
+                            );
+                            Ok((
+                                AudioEnhanceJobOutput {
+                                    job_id,
+                                    status: "completed".to_string(),
+                                    result: Some(res),
+                                },
+                                summary,
+                                vec![],
+                            ))
+                        } else {
+                            Ok((
+                                AudioEnhanceJobOutput {
+                                    job_id: job_id.clone(),
+                                    status: "queued".to_string(),
+                                    result: None,
+                                },
+                                format!("Started automatic audio mastering job {job_id}"),
+                                vec![],
+                            ))
+                        }
                     })
                 },
             )),

@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v0.10.1)"
+        description: "Release tag (e.g. v0.11.0)"
         required: false
-        default: "v0.10.1"
+        default: "v0.11.0"
 
 permissions:
   contents: write
@@ -90,7 +90,7 @@ jobs:
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             echo "name=${GITHUB_REF_NAME}" >> "${GITHUB_OUTPUT}"
           else
-            echo "name=${{ inputs.tag || 'v0.10.1' }}" >> "${GITHUB_OUTPUT}"
+            echo "name=${{ inputs.tag || 'v0.11.0' }}" >> "${GITHUB_OUTPUT}"
           fi
 
       - name: Publish GitHub Release
@@ -103,23 +103,13 @@ jobs:
           draft: false
           prerelease: false
           body: |
-            ## Novidades da ${{ steps.tag.outputs.name }} — Migração Nativa para Linux (Arch / CachyOS & NVIDIA)
+            ## Novidades da ${{ steps.tag.outputs.name }} — Masterização Automática de Áudio YouTube (-14 LUFS) + Correção de Renderização do Motion Studio
 
-            - **Migração completa para Linux nativo (suporte a Windows encerrado):** build, CI e distribuição 100% focados em Linux com **AppImage universal** (base glibc 2.35 compatível com CachyOS / Arch Linux rolling, com GStreamer embutido para preview de vídeo) + **`PKGBUILD`** nativo para Arch/CachyOS.
-            - **Compatibilidade total com NVIDIA no Linux (CUDA, NVENC e Vulkan):**
-              - Proteção automática contra tela preta / erro GBM no WebKitGTK em sessões **Wayland + NVIDIA** (`WEBKIT_DISABLE_DMABUF_RENDERER=1` automático no boot, sobrescrevível via env).
-              - Sanitização automática de `LD_LIBRARY_PATH` dentro do AppImage + suporte nativo a `/opt/cuda/lib64` (Arch/CachyOS) e preservação de symlinks `.so` para `llama-server` e `whisper-cli`.
-              - Seleção inteligente de aceleração GPU: prioriza **CUDA** quando o CUDA Runtime está instalado (`pacman -S cuda`) ou **Vulkan** imediatamente out-of-the-box com `nvidia-utils`, além de **NVENC** em cortes, Motion Studio e proxy de preview.
-            - **Download automático do FFmpeg Linux GPL (BtbN Static NVENC/CUDA/VAAPI)** e suporte nativo a `ffmpeg` do sistema (`pacman -S ffmpeg`), além de detecção automática de navegadores Chromium/Chrome/Brave/Vivaldi no Linux para o Motion Studio.
-
-            ### Como rodar no CachyOS / Arch Linux
-            - **Via AppImage (recomendado, sem instalação):**
-              ```bash
-              chmod +x Aicut_*_amd64.AppImage
-              ./Aicut_*_amd64.AppImage
-              ```
-              *(Se não tiver `fuse2` instalado no Arch/CachyOS, execute com `--appimage-extract-and-run` ou instale `sudo pacman -S fuse2`.)*
-            - **Ou nativo via `PKGBUILD` (opcional, compilado com flags do CachyOS):**
-              Baixe o `PKGBUILD` abaixo e execute `makepkg -si`.
+            - **Correção definitiva da renderização do Motion Studio:**
+              - Corrigida a captura RGBA do **HyperFrames** via Chromium CDP (`Page.enable`, sincronização real de pintura `requestAnimationFrame` antes de cada screenshot, recorte exato `1080×1920`, codificação segura de URL `file://`, progresso frame a frame e erro claro caso o Chromium não esteja instalado — nunca mais exporta silenciosamente sem as animações).
+              - Fluxo dual explícito em **Cortes Shorts → Resultados**: agora você tem **`Renderizar padrão`** (sempre mantém o enquadramento/layout original) e, quando o corte já foi editado no Motion Studio, aparece o selo **`Motion editado`** + botão **`Renderizar Motion`** dedicado (além de salvar automaticamente antes de exportar dentro do Motion Studio).
+            - **Tratamento e Masterização Automática de Áudio para YouTube (`-14 LUFS` / `-1.0 dBTP`):**
+              - Aplicada automaticamente em **2 passos (EBU R128 linear)** nas exportações de **Cortes Shorts** e **Motion Studio**: corte de graves sub-sônicos (`highpass 75 Hz`), redução de ruído (**RNNoise Neural** quando instalado ou espectral adaptativo `afftdn`), equalização de clareza vocal, compressão dinâmica + limiter (nivela sussurros e gritos) e normalização oficial do YouTube (`-14 LUFS`, pico real `-1.0 dBTP`, 48 kHz).
+              - Nova aba **`Áudio IA`** no menu lateral com presets (**YouTube/Shorts -14 LUFS**, **Reels/TikTok Impacto**, **Podcast -16 LUFS** ou **Desligado**), instalação em 1 clique do modelo neural **RNNoise** (~85 KB grátis) e masterização em 1 clique para qualquer vídeo/áudio da Biblioteca sem re-encodar o vídeo (`-c:v copy`).
           files: |
             release-assets/*

@@ -1,7 +1,7 @@
 use aicut_core::{
-    configure_tokio_command, AccelBackend, AicutError, AicutEvent, AicutKernel, AicutResult,
-    MediaAsset, MediaKind, MediaMetadata, MediaSourceType, SmartClipPlan, SmartClipSegment,
-    TranscriptRecord,
+    configure_tokio_command, prepare_clip_audio_master_chain, AccelBackend, AicutError, AicutEvent,
+    AicutKernel, AicutResult, MediaAsset, MediaKind, MediaMetadata, MediaSourceType, SmartClipPlan,
+    SmartClipSegment, TranscriptRecord,
 };
 use chrono::Utc;
 use schemars::JsonSchema;
@@ -250,8 +250,20 @@ pub async fn render_clip_to_library(
             (None, None)
         };
 
+    // Pass 1 automatic YouTube audio mastering analysis (-14 LUFS / -1.0 dBTP + denoise + EQ + compressor)
+    let span_start = clip.segments.first().map(|s| s.start_sec);
+    let span_dur = clip.segments.first().map(|s| (s.end_sec - s.start_sec).max(0.5));
+    let audio_master_chain = prepare_clip_audio_master_chain(
+        kernel,
+        ffmpeg_bin,
+        Path::new(&source.file_path),
+        span_start,
+        span_dur,
+    )
+    .await;
+
     let hw_encoder = select_hw_h264_encoder(kernel.hardware.recommended_accel);
-    let first_attempt = run_ffmpeg_render(
+    let mut render_res = run_ffmpeg_render(
         ffmpeg_bin,
         Path::new(&source.file_path),
         &clip.segments,
@@ -268,14 +280,15 @@ pub async fn render_clip_to_library(
             .as_ref()
             .map(|p| (p, tmp_content_cmd_path.as_deref())),
         tmp_ass.as_deref(),
+        audio_master_chain.as_deref(),
         hw_encoder,
         &out_path,
     )
     .await;
 
-    // Automatic safe fallback to software libx264 if hardware encoder is unavailable/fails
-    if first_attempt.is_err() && hw_encoder != "libx264" {
-        run_ffmpeg_render(
+    // Fallback 1: software libx264 keeping full YouTube mastered audio
+    if render_res.is_err() && hw_encoder != "libx264" {
+        render_res = run_ffmpeg_render(
             ffmpeg_bin,
             Path::new(&source.file_path),
             &clip.segments,
@@ -292,13 +305,41 @@ pub async fn render_clip_to_library(
                 .as_ref()
                 .map(|p| (p, tmp_content_cmd_path.as_deref())),
             tmp_ass.as_deref(),
+            audio_master_chain.as_deref(),
             "libx264",
             &out_path,
         )
-        .await?;
-    } else {
-        first_attempt?;
+        .await;
     }
+
+    // Fallback 2: if a denoise filter isn't present in host FFmpeg, apply pure YouTube loudnorm
+    if render_res.is_err() && audio_master_chain.is_some() {
+        let simple_loudnorm = "loudnorm=I=-14.0:TP=-1.0:LRA=11.0,aresample=48000";
+        render_res = run_ffmpeg_render(
+            ffmpeg_bin,
+            Path::new(&source.file_path),
+            &clip.segments,
+            layout,
+            webcam_corner,
+            effective_content_fit,
+            resolved_template
+                .as_ref()
+                .map(|(p, g)| (p.as_path(), *g)),
+            camera_track_plan
+                .as_ref()
+                .map(|p| (p, tmp_cam_cmd_path.as_deref())),
+            content_track_plan
+                .as_ref()
+                .map(|p| (p, tmp_content_cmd_path.as_deref())),
+            tmp_ass.as_deref(),
+            Some(simple_loudnorm),
+            "libx264",
+            &out_path,
+        )
+        .await;
+    }
+
+    render_res?;
 
     if let Some(ref p) = tmp_ass {
         let _ = std::fs::remove_file(p);
@@ -544,6 +585,7 @@ async fn run_ffmpeg_render(
     camera_track: Option<(&CameraTrackPlan, Option<&Path>)>,
     content_track: Option<(&CameraTrackPlan, Option<&Path>)>,
     ass_path: Option<&Path>,
+    audio_master_chain: Option<&str>,
     encoder: &str,
     out_path: &Path,
 ) -> AicutResult<()> {
@@ -551,6 +593,10 @@ async fn run_ffmpeg_render(
     configure_tokio_command(&mut cmd);
 
     let mut filter_parts: Vec<String> = Vec::new();
+    let has_master = audio_master_chain
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some();
 
     if segments.len() == 1 {
         let seg = &segments[0];
@@ -565,7 +611,11 @@ async fn run_ffmpeg_render(
         ])
         .arg(input_path);
         filter_parts.push("[0:v]setpts=PTS-STARTPTS[vbase]".to_string());
-        filter_parts.push("[0:a]asetpts=PTS-STARTPTS[abase]".to_string());
+        if let Some(af) = audio_master_chain.map(str::trim).filter(|s| !s.is_empty()) {
+            filter_parts.push(format!("[0:a]asetpts=PTS-STARTPTS,{af}[abase]"));
+        } else {
+            filter_parts.push("[0:a]asetpts=PTS-STARTPTS[abase]".to_string());
+        }
     } else {
         cmd.args(["-y", "-i"]).arg(input_path);
         let mut concat_inputs = String::new();
@@ -582,10 +632,19 @@ async fn run_ffmpeg_render(
             ));
             concat_inputs.push_str(&format!("[v{i}][a{i}]"));
         }
-        filter_parts.push(format!(
-            "{concat_inputs}concat=n={}:v=1:a=1[vbase][abase]",
-            segments.len()
-        ));
+        if has_master {
+            let af = audio_master_chain.unwrap().trim();
+            filter_parts.push(format!(
+                "{concat_inputs}concat=n={}:v=1:a=1[vbase][araw]",
+                segments.len()
+            ));
+            filter_parts.push(format!("[araw]{af}[abase]"));
+        } else {
+            filter_parts.push(format!(
+                "{concat_inputs}concat=n={}:v=1:a=1[vbase][abase]",
+                segments.len()
+            ));
+        }
     }
 
     // Add PNG template as input 1 when using TemplateSplit

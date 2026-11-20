@@ -1,6 +1,7 @@
 use aicut_core::{
-    configure_tokio_command, AicutError, AicutEvent, AicutKernel, AicutResult, MediaAsset,
-    MediaKind, MediaMetadata, MediaSourceType, SmartClipSegment, TranscriptRecord,
+    configure_tokio_command, prepare_clip_audio_master_chain, AicutError, AicutEvent, AicutKernel,
+    AicutResult, JobProgress, MediaAsset, MediaKind, MediaMetadata, MediaSourceType,
+    SmartClipSegment, TranscriptRecord,
 };
 use aicut_module_smart_clips::framing::NormalizedRect;
 use aicut_module_smart_clips::renderer::{
@@ -18,10 +19,12 @@ use crate::hyperframes_render::capture_hyperframes_rgba_sequence;
 use crate::schema::{AicutComposition, MotionScene, PipCorner, SceneEffects, SceneLayoutPreset};
 
 /// Renders a full dynamic multi-scene `AicutComposition` via FFmpeg NVENC (with automatic
-/// libx264 fallback) and saves the resulting 9:16 MP4 directly to the Aicut Library.
+/// libx264 fallback) + HyperFrames transparent RGBA overlay + automatic YouTube audio mastering,
+/// and saves the resulting 9:16 MP4 directly to the Aicut Library.
 pub async fn render_composition_to_library(
     kernel: &AicutKernel,
     comp: &AicutComposition,
+    job_id: Option<&str>,
 ) -> AicutResult<MediaAsset> {
     let source = kernel
         .repo
@@ -64,22 +67,81 @@ pub async fn render_composition_to_library(
 
     // Capture bespoke HyperFrames HTML/CSS/SVG motion layer to transparent RGBA PNG sequence
     // using system Chromium/Chrome/Brave/Vivaldi on Linux via headless CDP.
-    let wants_hyperframes = normalized
+    let has_custom_motion = normalized
         .motion_html
         .as_deref()
         .map(|s| !s.trim().is_empty())
-        .unwrap_or(false)
-        || normalized.scenes.iter().any(|s| {
-            s.overlay.headline.is_some()
-                || s.overlay.badge.is_some()
-                || s.overlay.callout_text.is_some()
-        });
+        .unwrap_or(false);
+    let has_scene_overlays = normalized.scenes.iter().any(|s| {
+        s.overlay.headline.is_some()
+            || s.overlay.badge.is_some()
+            || s.overlay.callout_text.is_some()
+    });
+    let wants_hyperframes = has_custom_motion || has_scene_overlays;
+
     let hf_fps = 15u32;
     let tmp_hf_dir = std::env::temp_dir().join(format!("aicut-hf-ovl-{short_id}"));
     let hf_overlay_pattern = if wants_hyperframes {
-        match capture_hyperframes_rgba_sequence(&normalized, hf_fps, &tmp_hf_dir).await {
-            Ok(Some(count)) if count > 0 => Some((tmp_hf_dir.join("hf_%05d.png"), hf_fps)),
-            _ => None,
+        if let Some(jid) = job_id {
+            kernel.jobs.append_log(
+                jid,
+                format!(
+                    "Capturando animações HyperFrames ({} FPS · {:.1}s) via Chromium headless...",
+                    hf_fps, normalized.duration_sec
+                ),
+            );
+        }
+        let capture_res =
+            capture_hyperframes_rgba_sequence(&normalized, hf_fps, &tmp_hf_dir, |done, total| {
+                if let Some(jid) = job_id {
+                    let pct = 15.0 + (done as f64 / total.max(1) as f64) * 45.0;
+                    kernel.jobs.update_progress(
+                        jid,
+                        JobProgress {
+                            percent: pct,
+                            stage: "capturing_hyperframes".into(),
+                            message: Some(format!(
+                                "Capturando animações Motion ({done}/{total} frames)..."
+                            )),
+                            ..Default::default()
+                        },
+                    );
+                }
+            })
+            .await;
+
+        match capture_res {
+            Ok(count) if count > 0 => {
+                if let Some(jid) = job_id {
+                    kernel.jobs.append_log(
+                        jid,
+                        format!("HyperFrames capturado com sucesso ({count} frames RGBA)."),
+                    );
+                }
+                Some((tmp_hf_dir.join("hf_%05d.png"), hf_fps))
+            }
+            Ok(_) => {
+                if has_custom_motion {
+                    let _ = std::fs::remove_dir_all(&tmp_hf_dir);
+                    return Err(AicutError::internal(
+                        "Nenhum frame RGBA foi gerado pelo HyperFrames — renderização abortada para não exportar o vídeo sem o Motion.",
+                    ));
+                }
+                None
+            }
+            Err(err) => {
+                if let Some(jid) = job_id {
+                    kernel
+                        .jobs
+                        .append_log(jid, format!("Falha ao capturar HyperFrames: {}", err.message));
+                }
+                // NEVER silently drop custom Motion Studio illustrations/animations!
+                if has_custom_motion {
+                    let _ = std::fs::remove_dir_all(&tmp_hf_dir);
+                    return Err(err);
+                }
+                None
+            }
         }
     } else {
         None
@@ -99,34 +161,93 @@ pub async fn render_composition_to_library(
         None
     };
 
+    // Pass 1 automatic YouTube audio mastering analysis (-14 LUFS / -1.0 dBTP + denoise + EQ + compressor)
+    if let Some(jid) = job_id {
+        kernel.jobs.update_progress(
+            jid,
+            JobProgress {
+                percent: 65.0,
+                stage: "mastering_audio".into(),
+                message: Some("Analisando e masterizando áudio para YouTube (-14 LUFS)...".into()),
+                ..Default::default()
+            },
+        );
+    }
+    let audio_master_chain = prepare_clip_audio_master_chain(
+        kernel,
+        &ffmpeg_bin,
+        Path::new(&source.file_path),
+        Some(normalized.clip_start_sec),
+        Some(normalized.duration_sec),
+    )
+    .await;
+    if let (Some(jid), Some(_)) = (job_id, audio_master_chain.as_ref()) {
+        kernel.jobs.append_log(
+            jid,
+            "Masterização automática de áudio ativa (YouTube -14 LUFS / -1.0 dBTP + redução de ruído + compressão).",
+        );
+    }
+
+    if let Some(jid) = job_id {
+        kernel.jobs.update_progress(
+            jid,
+            JobProgress {
+                percent: 72.0,
+                stage: "encoding_video".into(),
+                message: Some("Codificando vídeo + Motion em GPU (NVENC)...".into()),
+                ..Default::default()
+            },
+        );
+    }
+
     let hw_encoder = select_hw_h264_encoder(kernel.hardware.recommended_accel);
-    let first = run_ffmpeg_motion_render(
+    let mut render_res = run_ffmpeg_motion_render(
         &ffmpeg_bin,
         Path::new(&source.file_path),
         &normalized,
         resolved_template.as_ref().map(|(p, g)| (p.as_path(), *g)),
         hf_overlay_pattern.as_ref().map(|(p, f)| (p.as_path(), *f)),
         tmp_ass.as_deref(),
+        audio_master_chain.as_deref(),
         hw_encoder,
         &out_path,
     )
     .await;
 
-    if first.is_err() && hw_encoder != "libx264" {
-        run_ffmpeg_motion_render(
+    // Fallback 1: if hardware encoder failed, retry with software libx264 keeping mastered audio
+    if render_res.is_err() && hw_encoder != "libx264" {
+        render_res = run_ffmpeg_motion_render(
             &ffmpeg_bin,
             Path::new(&source.file_path),
             &normalized,
             resolved_template.as_ref().map(|(p, g)| (p.as_path(), *g)),
             hf_overlay_pattern.as_ref().map(|(p, f)| (p.as_path(), *f)),
             tmp_ass.as_deref(),
+            audio_master_chain.as_deref(),
             "libx264",
             &out_path,
         )
-        .await?;
-    } else {
-        first?;
+        .await;
     }
+
+    // Fallback 2: if an audio filter (e.g. afftdn/arnndn) isn't compiled in host FFmpeg, retry with pure YouTube loudnorm
+    if render_res.is_err() && audio_master_chain.is_some() {
+        let simple_loudnorm = "loudnorm=I=-14.0:TP=-1.0:LRA=11.0,aresample=48000";
+        render_res = run_ffmpeg_motion_render(
+            &ffmpeg_bin,
+            Path::new(&source.file_path),
+            &normalized,
+            resolved_template.as_ref().map(|(p, g)| (p.as_path(), *g)),
+            hf_overlay_pattern.as_ref().map(|(p, f)| (p.as_path(), *f)),
+            tmp_ass.as_deref(),
+            Some(simple_loudnorm),
+            "libx264",
+            &out_path,
+        )
+        .await;
+    }
+
+    render_res?;
 
     if let Some(ref p) = tmp_ass {
         let _ = std::fs::remove_file(p);
@@ -198,13 +319,18 @@ pub fn build_motion_filtergraph(
     template_geom: Option<TemplateGeometry>,
     hf_input_idx: Option<usize>,
     ass_path: Option<&Path>,
+    audio_master_chain: Option<&str>,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     let fps = comp.fps.max(1);
     let n = comp.scenes.len();
 
     parts.push(format!("[0:v]setpts=PTS-STARTPTS,fps={fps}[vbase]"));
-    parts.push("[0:a]asetpts=PTS-STARTPTS[abase]".to_string());
+    if let Some(af) = audio_master_chain.map(str::trim).filter(|s| !s.is_empty()) {
+        parts.push(format!("[0:a]asetpts=PTS-STARTPTS,{af}[abase]"));
+    } else {
+        parts.push("[0:a]asetpts=PTS-STARTPTS[abase]".to_string());
+    }
 
     if n > 1 {
         let outs: String = (0..n).map(|i| format!("[vs{i}]")).collect();
@@ -540,6 +666,7 @@ async fn run_ffmpeg_motion_render(
     template: Option<(&Path, TemplateGeometry)>,
     hf_overlay: Option<(&Path, u32)>,
     ass_path: Option<&Path>,
+    audio_master_chain: Option<&str>,
     encoder: &str,
     out_path: &Path,
 ) -> AicutResult<()> {
@@ -572,7 +699,13 @@ async fn run_ffmpeg_motion_render(
         None
     };
 
-    let filter = build_motion_filtergraph(comp, template.map(|(_, g)| g), hf_input_idx, ass_path);
+    let filter = build_motion_filtergraph(
+        comp,
+        template.map(|(_, g)| g),
+        hf_input_idx,
+        ass_path,
+        audio_master_chain,
+    );
     cmd.args(["-filter_complex", &filter, "-map", "[vout]", "-map", "[abase]"]);
 
     match encoder {
@@ -752,11 +885,18 @@ mod tests {
             updated_at: Utc::now().to_rfc3339(),
         };
 
-        let fg = build_motion_filtergraph(&comp, Some(TemplateGeometry::default()), Some(2), None);
+        let fg = build_motion_filtergraph(
+            &comp,
+            Some(TemplateGeometry::default()),
+            Some(2),
+            None,
+            Some("loudnorm=I=-14.0:TP=-1.0:LRA=11.0,aresample=48000"),
+        );
         assert!(fg.contains("[vbase]split=3[vs0][vs1][vs2]"));
         assert!(fg.contains("concat=n=3:v=1:a=0[vlayout]"));
         assert!(fg.contains("[tpl0]overlay=0:0:format=auto"));
         assert!(fg.contains("[2:v]scale=1080:1920,format=rgba[hf_ovl]"));
+        assert!(fg.contains("loudnorm=I=-14.0:TP=-1.0:LRA=11.0"));
         assert!(fg.contains("zoompan=z="));
         assert!(fg.contains("vignette=PI/4.5"));
 

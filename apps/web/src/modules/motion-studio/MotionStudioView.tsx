@@ -686,11 +686,16 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
     if (!comp) return;
     setRendering(true);
     try {
+      // Ensure latest composition state is persisted before rendering
+      await runAction<AicutComposition>("motion.save", { composition: comp });
       const res = await runAction<{ job_id: string }>("motion.render", { id: comp.id, wait: false });
+      const withMotion = Boolean(comp.motion_html?.trim() || comp.scenes.length > 1);
       onNotify(
         "success",
-        "Renderização iniciada",
-        `Aplicando HyperFrames + GPU NVENC (${res.data.job_id.slice(0, 8)}) — o vídeo final irá para a Biblioteca.`,
+        withMotion ? "Renderização com Motion iniciada" : "Renderização padrão iniciada",
+        withMotion
+          ? `Aplicando animações HyperFrames + áudio YouTube (-14 LUFS) + GPU NVENC (${res.data.job_id.slice(0, 8)}).`
+          : `Renderizando layout padrão + áudio YouTube (-14 LUFS) + GPU NVENC (${res.data.job_id.slice(0, 8)}).`,
       );
       void onRefreshMedia();
     } catch (err) {
@@ -793,7 +798,9 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
             onClick={() => void handleRender()}
           >
             <BusyIcon busy={rendering} icon={Download} size={13} />
-            Renderizar MP4
+            {comp && (comp.motion_html?.trim() || comp.scenes.length > 1)
+              ? "Renderizar com Motion"
+              : "Renderizar padrão"}
           </button>
         </div>
       </header>

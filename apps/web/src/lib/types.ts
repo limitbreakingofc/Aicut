@@ -12,6 +12,7 @@ export type RouteId =
   | "smart-clips"
   | "framing"
   | "motion-studio"
+  | "audio-master"
   | "jobs"
   | "modules"
   | "ai-connect"
@@ -198,6 +199,32 @@ export interface GpuInfo {
   vendor: "nvidia" | "amd" | "intel" | "apple" | "unknown";
   vram_mb?: number;
   driver_version?: string;
+}
+
+export interface AudioMasterConfig {
+  preset: "youtube_auto" | "reels_tiktok" | "podcast_voice" | "off";
+  denoise: "auto" | "neural_rnnoise" | "spectral" | "off";
+  voice_eq: boolean;
+  auto_compressor: boolean;
+  target_lufs: number;
+  true_peak_db: number;
+  lra: number;
+}
+
+export interface AudioConfigOutput {
+  config: AudioMasterConfig;
+  rnnoise_installed: boolean;
+  rnnoise_path: string;
+}
+
+export interface AudioEnhanceResult {
+  asset: MediaAsset;
+  preset_used: string;
+  rnnoise_used: boolean;
+  before_lufs?: number;
+  before_true_peak_db?: number;
+  target_lufs: number;
+  target_true_peak_db: number;
 }
 
 export interface HardwareProfile {
