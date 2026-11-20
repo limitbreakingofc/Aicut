@@ -4,6 +4,7 @@ use aicut_core::{
     ModuleManifest, NotificationLevel, ToolStatus, TypedAction, UiState, WorkspaceConfig,
 };
 use aicut_module_media_ingest::MediaIngestModule;
+use aicut_module_motion_studio::MotionStudioModule;
 use aicut_module_smart_clips::SmartClipsModule;
 use aicut_module_transcribe::TranscribeModule;
 use async_trait::async_trait;
@@ -22,6 +23,7 @@ pub async fn bootstrap_kernel(workspace: WorkspaceConfig) -> AicutResult<Arc<Aic
     kernel.register_module(MediaIngestModule::new()).await?;
     kernel.register_module(TranscribeModule::new()).await?;
     kernel.register_module(SmartClipsModule::new()).await?;
+    kernel.register_module(MotionStudioModule::new()).await?;
     Ok(kernel)
 }
 
@@ -571,11 +573,11 @@ impl AicutModule for UiModule {
                 "ui.navigate",
                 "ui",
                 "Navegar para Aba",
-                "Switch the visible tab in the Aicut desktop window ('ingest', 'library', 'transcribe', 'smart-clips', 'framing', 'jobs', 'modules', 'ai-connect', 'settings').",
+                "Switch the visible tab in the Aicut desktop window ('ingest', 'library', 'transcribe', 'smart-clips', 'framing', 'motion-studio', 'jobs', 'modules', 'ai-connect', 'settings').",
                 ActionAnnotations { idempotent: true, ..Default::default() },
                 |ctx, input| {
                     Box::pin(async move {
-                        let allowed = ["ingest", "library", "transcribe", "smart-clips", "framing", "jobs", "modules", "ai-connect", "settings"];
+                        let allowed = ["ingest", "library", "transcribe", "smart-clips", "framing", "motion-studio", "jobs", "modules", "ai-connect", "settings"];
                         if !allowed.contains(&input.route.as_str()) {
                             return Err(AicutError::invalid_input(format!(
                                 "Unknown route '{}'. Valid routes: {}",

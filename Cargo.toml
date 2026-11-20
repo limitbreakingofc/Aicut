@@ -5,6 +5,7 @@ members = [
     "crates/modules/media-ingest",
     "crates/modules/transcribe",
     "crates/modules/smart-clips",
+    "crates/modules/motion-studio",
     "crates/aicut-runtime",
     "crates/aicut-mcp",
     "crates/aicut-server",
@@ -15,7 +16,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 license = "MIT"
 
@@ -24,6 +25,7 @@ aicut-core = { path = "crates/aicut-core" }
 aicut-module-media-ingest = { path = "crates/modules/media-ingest" }
 aicut-module-transcribe = { path = "crates/modules/transcribe" }
 aicut-module-smart-clips = { path = "crates/modules/smart-clips" }
+aicut-module-motion-studio = { path = "crates/modules/motion-studio" }
 aicut-runtime = { path = "crates/aicut-runtime" }
 aicut-mcp = { path = "crates/aicut-mcp" }
 aicut-server = { path = "crates/aicut-server" }

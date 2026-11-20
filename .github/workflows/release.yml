@@ -83,6 +83,12 @@ jobs:
           body: |
             ## Aicut ${{ steps.tag.outputs.name }} — Estúdio Modular AI-First para Windows 11
 
+            ### Novidades da v0.7.0 — Fase 1 do Aicut Motion Studio (Layout Dinâmico em Código + Chat com IA)
+            - **Novo Módulo `Motion Studio` (`Estúdio → Motion Studio`, atalho `Alt+6`):** sistema de composição em código motion (`AicutComposition`) onde a IA controla o layout **cena a cena** conforme o que acontece de mais importante no vídeo — alternando automaticamente entre **Moldura SMOKING33**, **Conteúdo Tela Cheia + Webcam PiP flutuante**, **Foco na Câmera (gancho/reação)**, **Câmera Grande (68%)**, **100% Conteúdo** e **Zoom Destaque + Callout**!
+            - **Chat Interativo com a IA Diretora (`motion.chat_edit`):** converse em português direto na tela (*"entre 0:10 e 0:18 destaca tela cheia com minha webcam no canto superior direito"*, *"nos primeiros 4s coloca foco na câmera com título 'OLHA ISSO!'"*) e veja as cenas e o **preview 9:16 ao vivo a 60fps** atualizarem instantaneamente! (Funciona com Gemini API e inclui interpretador offline em PT-BR.)
+            - **Ponte Pronta para HyperFrames & Remotion (`motion.export_code`):** visualize e copie em 1 clique o código **HyperFrames (HTML + CSS + GSAP)**, **Remotion (`inputProps` JSON)** ou **Scene Graph JSON** gerado em tempo real a partir das suas cenas — base pronta para os renderizadores das Fases 2 e 3!
+            - **Renderização Multi-Cena em GPU NVENC (`motion.render`):** renderiza todas as trocas dinâmicas de layout, PiP com borda, zoom focal, títulos animados e legendas karaokê em segundos na sua GPU, usando automaticamente as áreas salvas da aba **Enquadramento** e acessível por qualquer IA via **MCP / REST / CLI**.
+
             ### Novidades da v0.6.1 — Novo Design Minimalista em "Baixar & Importar"
             - **Tela inteira como área de arrastar e soltar (Drag & Drop):** arraste qualquer vídeo, áudio ou legenda do Windows direto para toda a área escura da tela e importe instantaneamente para a Biblioteca.
             - **Ícone central minimalista de importação:** clique no ícone central refinado para abrir o seletor de arquivos do PC (ou use o atalho discreto para importar uma pasta inteira).

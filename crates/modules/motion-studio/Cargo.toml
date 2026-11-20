@@ -1,0 +1,17 @@
+[package]
+name = "aicut-module-motion-studio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aicut-core.workspace = true
+aicut-module-smart-clips.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true

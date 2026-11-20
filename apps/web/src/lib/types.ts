@@ -11,6 +11,7 @@ export type RouteId =
   | "transcribe"
   | "smart-clips"
   | "framing"
+  | "motion-studio"
   | "jobs"
   | "modules"
   | "ai-connect"
@@ -390,6 +391,92 @@ export interface FramingReviewOutput {
   suggestions: string[];
   cropped_webcam_preview_data_url: string;
   suggested_webcam_rect?: NormalizedRect | null;
+}
+
+export type SceneLayoutPreset =
+  | "split_branded"
+  | "split_clean"
+  | "content_hero_pip"
+  | "content_fullscreen"
+  | "camera_focus"
+  | "camera_hero_pip"
+  | "callout_zoom";
+
+export type SceneTransition = "cut" | "fade" | "slide_up" | "wipe_left";
+export type PipCorner = "top_right" | "top_left" | "bottom_right" | "bottom_left";
+
+export interface PipConfig {
+  corner: PipCorner;
+  width_pct: number;
+  border_hex: string;
+  visible: boolean;
+}
+
+export interface ContentFocusConfig {
+  focus_x: number;
+  focus_y: number;
+  zoom: number;
+  fit_blur: boolean;
+}
+
+export interface SceneOverlay {
+  headline?: string | null;
+  badge?: string | null;
+  callout_text?: string | null;
+  accent_hex: string;
+}
+
+export interface CustomMotionCode {
+  engine: string;
+  code: string;
+}
+
+export interface MotionScene {
+  id: string;
+  title: string;
+  start_sec: number;
+  end_sec: number;
+  layout: SceneLayoutPreset;
+  transition_in: SceneTransition;
+  pip: PipConfig;
+  content_focus: ContentFocusConfig;
+  overlay: SceneOverlay;
+  rationale: string;
+  custom_code?: CustomMotionCode | null;
+}
+
+export interface MotionChatMessage {
+  role: "user" | "assistant" | string;
+  text: string;
+  created_at: string;
+}
+
+export interface AicutComposition {
+  id: string;
+  title: string;
+  media_id: string;
+  clip_start_sec: number;
+  clip_end_sec: number;
+  duration_sec: number;
+  width: number;
+  height: number;
+  fps: number;
+  webcam_rect: NormalizedRect;
+  content_rect?: NormalizedRect | null;
+  burn_subtitles: boolean;
+  template_path?: string | null;
+  engine_preference: string;
+  scenes: MotionScene[];
+  chat_history: MotionChatMessage[];
+  rendered_media_id?: string | null;
+  updated_at: string;
+}
+
+export interface MotionExportCodeOutput {
+  id: string;
+  target: string;
+  language: string;
+  code: string;
 }
 
 export interface SmartClipSegment {

@@ -526,10 +526,64 @@ pub(crate) async fn generate_with_inline_image(
     Ok(text.to_string())
 }
 
+/// Sends a text prompt to an active Gemini model requesting strict JSON output.
+pub async fn generate_json_text(
+    http: &reqwest::Client,
+    api_key: &str,
+    model: &str,
+    prompt: &str,
+) -> AicutResult<String> {
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    );
+    let body = serde_json::json!({
+        "contents": [{
+            "role": "user",
+            "parts": [{ "text": prompt }]
+        }],
+        "generationConfig": {
+            "temperature": 0.25,
+            "responseMimeType": "application/json",
+            "maxOutputTokens": 4096
+        }
+    });
+
+    let resp = http
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| AicutError::internal(format!("Gemini JSON request failed: {e}")))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err_txt = resp.text().await.unwrap_or_default();
+        return Err(AicutError::new(
+            "GEMINI_API_ERROR",
+            format!("Gemini API ({model}) retornou HTTP {status}: {err_txt}"),
+        ));
+    }
+
+    let val: Value = resp
+        .json()
+        .await
+        .map_err(|e| AicutError::internal(format!("Failed parsing Gemini JSON response: {e}")))?;
+    let text = val
+        .get("candidates")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("content"))
+        .and_then(|c| c.get("parts"))
+        .and_then(|p| p.as_array())
+        .and_then(|arr| arr.iter().find_map(|part| part.get("text").and_then(|t| t.as_str())))
+        .ok_or_else(|| AicutError::internal("Gemini returned empty response text"))?;
+    Ok(text.to_string())
+}
+
 /// Queries the user's Gemini API key for currently available `generateContent` models so deprecated
 /// model IDs (like `gemini-2.5-flash` / `gemini-2.5-pro`) automatically upgrade to the newest
 /// compatible Gemini Flash & Pro models (e.g. `gemini-3.8-flash` / `gemini-3.8-pro`).
-pub(crate) async fn resolve_active_gemini_models(
+pub async fn resolve_active_gemini_models(
     http: &reqwest::Client,
     api_key: &str,
     requested_scan: &str,

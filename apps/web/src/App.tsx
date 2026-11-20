@@ -36,6 +36,7 @@ import { LibraryView } from "./modules/media-ingest/LibraryView";
 import { TranscribeView } from "./modules/transcribe/TranscribeView";
 import { SmartClipsView } from "./modules/smart-clips/SmartClipsView";
 import { FramingStudioView } from "./modules/smart-clips/FramingStudioView";
+import { MotionStudioView, type MotionSeed } from "./modules/motion-studio/MotionStudioView";
 import { JobsView } from "./modules/core/JobsView";
 import { ModulesView } from "./modules/core/ModulesView";
 import { AiConnectView } from "./modules/core/AiConnectView";
@@ -75,6 +76,7 @@ function AicutApp() {
   const [selectedMediaId, setSelectedMediaId] = useState<string | null>(null);
   const [transcribeTargetId, setTranscribeTargetId] = useState<string | null>(null);
   const [smartClipsTargetId, setSmartClipsTargetId] = useState<string | null>(null);
+  const [motionSeed, setMotionSeed] = useState<MotionSeed | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [filterKind, setFilterKind] = useState<string | null>(null);
 
@@ -529,6 +531,10 @@ function AicutApp() {
                 setSelectedMediaId(mediaId);
                 navigate("library");
               }}
+              onOpenInMotionStudio={(seed) => {
+                setMotionSeed(seed);
+                navigate("motion-studio");
+              }}
               onNotify={pushToast}
               onRefreshTools={refreshTools}
               onRefreshMedia={refreshMedia}
@@ -542,6 +548,22 @@ function AicutApp() {
               preselectedMediaId={smartClipsTargetId ?? selectedMediaId}
               onNavigate={navigate}
               onNotify={pushToast}
+            />
+          )}
+
+          {route === "motion-studio" && (
+            <MotionStudioView
+              media={media}
+              tools={tools}
+              jobs={jobs}
+              seed={motionSeed}
+              onNavigate={navigate}
+              onSelectMedia={(mediaId) => {
+                setSelectedMediaId(mediaId);
+                navigate("library");
+              }}
+              onNotify={pushToast}
+              onRefreshMedia={refreshMedia}
             />
           )}
 

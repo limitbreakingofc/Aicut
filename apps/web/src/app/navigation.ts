@@ -1,9 +1,9 @@
-import { Activity, Blocks, Bot, Crop, Download, Film, Mic, Scissors, Settings, type LucideIcon } from "lucide-react";
+import { Activity, Blocks, Bot, Crop, Download, Film, Layers, Mic, Scissors, Settings, type LucideIcon } from "lucide-react";
 import type { RouteId } from "../lib/types";
 
 /** Single source of truth for app navigation: sidebar, breadcrumb, page headers and command palette. */
 
-export const APP_VERSION = "0.6.1";
+export const APP_VERSION = "0.7.0";
 
 export type NavGroupId = "studio" | "system";
 
@@ -85,6 +85,17 @@ export const ROUTES: RouteMeta[] = [
     group: "studio",
     step: 5,
     keywords: "webcam bordas enquadramento crop area conteudo revisao ia framing moldura",
+  },
+  {
+    id: "motion-studio",
+    label: "Motion Studio",
+    title: "Motion Studio · Layout Dinâmico IA",
+    description:
+      "Direção de cenas em código motion controlável pelo chat com a IA — alterne layouts dinamicamente ao longo do vídeo, visualize em 9:16 ao vivo, exporte para HyperFrames/Remotion e renderize em GPU.",
+    icon: Layers,
+    group: "studio",
+    step: 6,
+    keywords: "motion studio remotion hyperframes layout dinamico chat ia cenas timeline codigo",
   },
   {
     id: "jobs",

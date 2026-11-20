@@ -11,6 +11,7 @@ import {
   Film,
   HardDrive,
   KeyRound,
+  Layers,
   Lightbulb,
   Play,
   Scissors,
@@ -62,6 +63,7 @@ interface SmartClipsViewProps {
   preselectedMediaId?: string | null;
   onNavigate: (route: RouteId) => void;
   onSelectMedia: (mediaId: string) => void;
+  onOpenInMotionStudio?: (seed: { mediaId: string; startSec?: number; endSec?: number; title?: string }) => void;
   onNotify: NotifyFn;
   onRefreshTools: () => Promise<void>;
   onRefreshMedia: () => Promise<void>;
@@ -144,6 +146,7 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
   preselectedMediaId,
   onNavigate,
   onSelectMedia,
+  onOpenInMotionStudio,
   onNotify,
   onRefreshTools,
   onRefreshMedia,
@@ -1020,6 +1023,23 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
                     <div className="clip-times">{clipTimecodes(clip)}</div>
                   </div>
                   <Badge tone="accent">{formatDuration(clip.total_duration_sec)}</Badge>
+                  {onOpenInMotionStudio && clip.segments.length > 0 && (
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      title="Dirigir layouts dinâmicos cena a cena com chat da IA no Motion Studio"
+                      onClick={() =>
+                        onOpenInMotionStudio({
+                          mediaId: activeRun.media_id,
+                          startSec: clip.segments[0].start_sec,
+                          endSec: clip.segments[clip.segments.length - 1].end_sec,
+                          title: clip.title,
+                        })
+                      }
+                    >
+                      <Layers size={13} aria-hidden /> Motion IA
+                    </button>
+                  )}
                   {clip.rendered_media_id && (
                     <button type="button" className="btn btn-sm" onClick={() => onSelectMedia(clip.rendered_media_id!)}>
                       <Play aria-hidden /> Abrir

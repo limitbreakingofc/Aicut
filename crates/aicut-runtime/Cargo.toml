@@ -9,6 +9,7 @@ aicut-core.workspace = true
 aicut-module-media-ingest.workspace = true
 aicut-module-transcribe.workspace = true
 aicut-module-smart-clips.workspace = true
+aicut-module-motion-studio.workspace = true
 async-trait.workspace = true
 schemars.workspace = true
 serde.workspace = true

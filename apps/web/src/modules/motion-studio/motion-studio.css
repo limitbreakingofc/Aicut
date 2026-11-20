@@ -1,0 +1,182 @@
+/* Motion Studio — Minimalist Dynamic Layout Editor + Live 9:16 Preview + AI Chat */
+
+.motion-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(340px, 0.95fr);
+  gap: 14px;
+  align-items: start;
+}
+
+@media (max-width: 1080px) {
+  .motion-workspace {
+    grid-template-columns: 1fr;
+  }
+}
+
+.motion-player-stage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.motion-canvas-shell {
+  position: relative;
+  width: 270px;
+  height: 480px;
+  border-radius: 14px;
+  overflow: hidden;
+  border: 1.5px solid var(--border-strong);
+  background: #08090d;
+  box-shadow: 0 18px 46px rgba(0, 0, 0, 0.5);
+}
+
+.motion-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.motion-playback-bar {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-default);
+  background: var(--bg-surface-2);
+}
+
+.motion-timecode {
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+/* Interactive Multi-Scene Timeline */
+.motion-timeline {
+  width: 100%;
+  display: flex;
+  gap: 4px;
+  padding: 6px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-default);
+  background: var(--inset-bg);
+  min-height: 54px;
+}
+
+.motion-scene-block {
+  position: relative;
+  min-width: 48px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  background: var(--bg-surface-2);
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 2px;
+  transition: border-color 140ms ease, background 140ms ease, transform 120ms ease;
+}
+
+.motion-scene-block:hover {
+  border-color: var(--accent);
+}
+
+.motion-scene-block[data-selected="true"] {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+  background: var(--accent-soft);
+}
+
+.motion-scene-block[data-playing="true"]::after {
+  content: "";
+  position: absolute;
+  inset: auto 0 0 0;
+  height: 3px;
+  background: var(--accent);
+}
+
+.motion-scene-block[data-layout="split_branded"] { border-top: 2px solid #eab308; }
+.motion-scene-block[data-layout="content_hero_pip"] { border-top: 2px solid #38bdf8; }
+.motion-scene-block[data-layout="content_fullscreen"] { border-top: 2px solid #06b6d4; }
+.motion-scene-block[data-layout="camera_focus"] { border-top: 2px solid #a855f7; }
+.motion-scene-block[data-layout="camera_hero_pip"] { border-top: 2px solid #ec4899; }
+.motion-scene-block[data-layout="callout_zoom"] { border-top: 2px solid #22c55e; }
+
+.motion-scene-title {
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.motion-scene-meta {
+  font-size: 10px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* AI Director Chat Panel */
+.motion-chat-feed {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 290px;
+  overflow-y: auto;
+  padding: 8px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-subtle);
+  background: var(--inset-bg);
+}
+
+.motion-msg {
+  padding: 8px 11px;
+  border-radius: var(--radius-md);
+  font-size: var(--text-xs);
+  line-height: 1.45;
+  max-width: 92%;
+}
+
+.motion-msg[data-role="user"] {
+  align-self: flex-end;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-border);
+  color: var(--text-primary);
+}
+
+.motion-msg[data-role="assistant"] {
+  align-self: flex-start;
+  background: var(--bg-surface-2);
+  border: 1px solid var(--border-default);
+  color: var(--text-primary);
+}
+
+.motion-chat-input-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.motion-code-pre {
+  max-height: 260px;
+  overflow: auto;
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-subtle);
+  background: #080a0e;
+  color: #cbd5e1;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre;
+}
