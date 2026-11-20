@@ -83,6 +83,10 @@ jobs:
           body: |
             ## Aicut ${{ steps.tag.outputs.name }} — Estúdio Modular AI-First para Windows 11
 
+            ### Correções da v0.4.6 — Gemini 3.8 Automático & Contexto 16k para Lives no Modo Local
+            - **Gemini API atualizada & à prova de futuro (`gemini-3.8-flash` / `gemini-3.8-pro` + auto-descoberta):** corrigido o HTTP 404 dos modelos antigos `gemini-2.5-*`. Agora o Aicut consulta automaticamente os modelos disponíveis na sua chave Gemini, escolhe o melhor Flash/Pro mais recente (com opção **Automático** e fallback seguro caso Pro não esteja liberado na chave) e migra configurações antigas sem precisar reconfigurar.
+            - **Modo Local Free (`llama-server`) calibrado para lives longas (zero `exceed_context_size_error`):** contexto dinâmico por VRAM (**16k tokens** em GPUs >= 10 GB como RTX 3060 12 GB, **12k** em 6–9 GB e **8k** em 4 GB/CPU), blocos de 10 min com 3 min de overlap e compactação automática segura caso algum trecho ultrapasse o limite.
+
             ### Novidades da v0.4.5 — Nova Interface Estilo Terminal Moderno
             - **Visual de terminal moderno, em largura total**: tipografia mono (Cascadia Code / JetBrains Mono), painéis com bordas finas e cabeçalhos estilo TUI, tabelas densas no estilo `ls -la`, barra de progresso em blocos e barra de status inferior clicável (estado do core MCP, tarefas, mídias, ferramentas e GPU).
             - **Menus de botão direito em todo o app**: mídias (abrir, transcrever, cortes, copiar caminho/ID, mover para a Lixeira), seleção múltipla em lote, tarefas (cancelar, logs, copiar erro), transcrições (exportar em qualquer formato), falas, cortes, modelos, ferramentas, módulos, atividade e caminhos do workspace — com navegação por teclado e botões `⋯` equivalentes.

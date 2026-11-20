@@ -41,6 +41,15 @@ pub async fn analyze_with_gemini(
     cancel: &CancellationToken,
 ) -> AicutResult<Vec<RawClipPlan>> {
     let http = kernel.tools.http_client();
+    // Dynamically resolve active Gemini models available to this API key (auto-upgrading deprecated 2.5 models)
+    let (scan_model, director_model) =
+        resolve_active_gemini_models(http, &cfg.api_key, &cfg.scan_model, &cfg.director_model)
+            .await;
+    kernel.jobs.append_log(
+        job_id,
+        format!("Modelos Gemini ativos resolvidos: varredura={scan_model} | diretor={director_model}"),
+    );
+
     // 25-minute windows with 3-minute overlap so 3-minute stories never get split across chunks
     let windows = plan_windows(duration_sec, 1500.0, 180.0);
     if windows.is_empty() {
@@ -62,9 +71,8 @@ pub async fn analyze_with_gemini(
                 percent: pct_base,
                 stage: "gemini_scan".into(),
                 message: Some(format!(
-                    "Passagem A ({}/{total_windows}): gerando proxy leve e assistindo via {}...",
+                    "Passagem A ({}/{total_windows}): gerando proxy leve e assistindo via {scan_model}...",
                     idx + 1,
-                    cfg.scan_model
                 )),
                 ..Default::default()
             },
@@ -111,7 +119,7 @@ pub async fn analyze_with_gemini(
         let gen_res = generate_with_video_file(
             http,
             &cfg.api_key,
-            &cfg.scan_model,
+            &scan_model,
             &uploaded.uri,
             &prompt,
         )
@@ -160,9 +168,8 @@ pub async fn analyze_with_gemini(
                 percent: pct,
                 stage: "gemini_director".into(),
                 message: Some(format!(
-                    "Passagem B ({}/{total_cands}): refinando arco inicio-meio-fim com {}...",
+                    "Passagem B ({}/{total_cands}): refinando arco inicio-meio-fim com {director_model}...",
                     idx + 1,
-                    cfg.director_model
                 )),
                 ..Default::default()
             },
@@ -215,14 +222,29 @@ pub async fn analyze_with_gemini(
             &detailed_tr,
         );
 
-        let gen_res = generate_with_video_file(
+        let gen_res = match generate_with_video_file(
             http,
             &cfg.api_key,
-            &cfg.director_model,
+            &director_model,
             &uploaded.uri,
             &prompt,
         )
-        .await;
+        .await
+        {
+            Ok(txt) => Ok(txt),
+            Err(_) if director_model != scan_model => {
+                // Safe fallback to verified scan_model (e.g. gemini-3.8-flash) if Pro model is unavailable
+                generate_with_video_file(
+                    http,
+                    &cfg.api_key,
+                    &scan_model,
+                    &uploaded.uri,
+                    &prompt,
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        };
 
         let _ = delete_gemini_file(http, &cfg.api_key, &uploaded.name).await;
         let _ = std::fs::remove_file(&refine_proxy);
@@ -439,4 +461,186 @@ async fn delete_gemini_file(http: &reqwest::Client, api_key: &str, name: &str) -
     let url = format!("https://generativelanguage.googleapis.com/v1beta/{name}?key={api_key}");
     let _ = http.delete(&url).send().await;
     Ok(())
+}
+
+/// Queries the user's Gemini API key for currently available `generateContent` models so deprecated
+/// model IDs (like `gemini-2.5-flash` / `gemini-2.5-pro`) automatically upgrade to the newest
+/// compatible Gemini Flash & Pro models (e.g. `gemini-3.8-flash` / `gemini-3.8-pro`).
+async fn resolve_active_gemini_models(
+    http: &reqwest::Client,
+    api_key: &str,
+    requested_scan: &str,
+    requested_director: &str,
+) -> (String, String) {
+    let available = fetch_available_gemini_models(http, api_key).await;
+
+    let normalize = |req: &str| -> String {
+        let trimmed = req.trim().trim_start_matches("models/");
+        if trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("auto")
+            || trimmed.starts_with("gemini-2.")
+            || trimmed.starts_with("gemini-1.")
+        {
+            "auto".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    };
+
+    let req_scan = normalize(requested_scan);
+    let req_dir = normalize(requested_director);
+
+    if available.is_empty() {
+        let fallback_scan = if req_scan == "auto" {
+            "gemini-3.8-flash".to_string()
+        } else {
+            req_scan
+        };
+        let fallback_dir = if req_dir == "auto" {
+            "gemini-3.8-pro".to_string()
+        } else {
+            req_dir
+        };
+        return (fallback_scan, fallback_dir);
+    }
+
+    let scan = if req_scan != "auto" && available.iter().any(|m| m == &req_scan) {
+        req_scan
+    } else {
+        pick_best_gemini_model(&available, true)
+            .unwrap_or_else(|| "gemini-3.8-flash".to_string())
+    };
+
+    let want_flash_dir = req_dir.contains("flash");
+    let director = if req_dir != "auto" && available.iter().any(|m| m == &req_dir) {
+        req_dir
+    } else if want_flash_dir {
+        scan.clone()
+    } else {
+        pick_best_gemini_model(&available, false).unwrap_or_else(|| scan.clone())
+    };
+
+    (scan, director)
+}
+
+async fn fetch_available_gemini_models(http: &reqwest::Client, api_key: &str) -> Vec<String> {
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100&key={api_key}"
+    );
+    let Ok(resp) = http.get(&url).send().await else {
+        return Vec::new();
+    };
+    if !resp.status().is_success() {
+        return Vec::new();
+    }
+    let Ok(val) = resp.json::<Value>().await else {
+        return Vec::new();
+    };
+    let Some(models) = val.get("models").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    models
+        .iter()
+        .filter_map(|m| {
+            let methods = m.get("supportedGenerationMethods")?.as_array()?;
+            let can_gen = methods
+                .iter()
+                .any(|x| x.as_str() == Some("generateContent"));
+            if !can_gen {
+                return None;
+            }
+            let raw_name = m.get("name")?.as_str()?;
+            let id = raw_name.trim_start_matches("models/");
+            let lower = id.to_lowercase();
+            if !lower.starts_with("gemini-") {
+                return None;
+            }
+            if lower.contains("embedding")
+                || lower.contains("imagen")
+                || lower.contains("veo")
+                || lower.contains("tts")
+                || lower.contains("audio")
+                || lower.contains("image")
+                || lower.contains("robotics")
+                || lower.contains("computer-use")
+                || lower.contains("aqa")
+                || lower.contains("lite")
+            {
+                return None;
+            }
+            Some(id.to_string())
+        })
+        .collect()
+}
+
+/// Ranks available Gemini model IDs and selects the highest-version Flash (or Pro) model.
+pub fn pick_best_gemini_model(models: &[String], prefer_flash: bool) -> Option<String> {
+    let score = |id: &str| -> (u8, u32, u32, u8) {
+        let lower = id.to_lowercase();
+        let tier_match = if prefer_flash {
+            if lower.contains("flash") { 2 } else { 1 }
+        } else if lower.contains("pro") {
+            2
+        } else if lower.contains("flash") {
+            1
+        } else {
+            0
+        };
+        let (maj, min) = parse_gemini_version(&lower);
+        let stability = if lower.contains("exp") {
+            0
+        } else if lower.contains("preview") || lower.contains("latest") {
+            1
+        } else {
+            2
+        };
+        (tier_match, maj, min, stability)
+    };
+
+    models
+        .iter()
+        .max_by_key(|m| score(m))
+        .cloned()
+}
+
+fn parse_gemini_version(id: &str) -> (u32, u32) {
+    let rest = id.trim_start_matches("gemini-");
+    let token = rest.split('-').next().unwrap_or("");
+    let mut parts = token.split('.');
+    let major = parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    let minor = parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    (major, minor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picks_newest_stable_gemini_flash_and_pro() {
+        let list = vec![
+            "gemini-2.5-flash".to_string(),
+            "gemini-3.0-pro-preview".to_string(),
+            "gemini-3.8-flash".to_string(),
+            "gemini-3.8-pro".to_string(),
+        ];
+        assert_eq!(
+            pick_best_gemini_model(&list, true).as_deref(),
+            Some("gemini-3.8-flash")
+        );
+        assert_eq!(
+            pick_best_gemini_model(&list, false).as_deref(),
+            Some("gemini-3.8-pro")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_flash_when_pro_unavailable() {
+        let list = vec!["gemini-3.8-flash".to_string(), "gemini-3.5-flash".to_string()];
+        assert_eq!(
+            pick_best_gemini_model(&list, false).as_deref(),
+            Some("gemini-3.8-flash")
+        );
+    }
 }

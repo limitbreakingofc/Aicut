@@ -159,7 +159,7 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
   // Provider configuration
   const [config, setConfig] = useState<ClipsConfig | null>(null);
   const [geminiKeyInput, setGeminiKeyInput] = useState<string>("");
-  const [geminiDirectorModel, setGeminiDirectorModel] = useState<string>("gemini-2.5-pro");
+  const [geminiDirectorModel, setGeminiDirectorModel] = useState<string>("auto");
   const [savingConfig, setSavingConfig] = useState<boolean>(false);
 
   // Local Free vision models
@@ -227,7 +227,7 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
       } else {
         setProvider("gemini");
       }
-      setGeminiDirectorModel(cfgRes.data.gemini_director_model || "gemini-2.5-pro");
+      setGeminiDirectorModel(cfgRes.data.gemini_director_model || "auto");
 
       const mList = modelsRes.data.models ?? [];
       setVisionModels(mList);
@@ -671,7 +671,7 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
             <>
               <Callout tone="info" icon={Cloud}>
                 O Gemini assiste diretamente aos blocos de vídeo (25 min com 3 min de sobreposição) usando{" "}
-                <strong>Gemini 2.5 Flash</strong> na varredura e <strong>{geminiDirectorModel}</strong> na direção final. 0 MB de
+                <strong>Gemini 3.8 Flash (auto)</strong> na varredura e <strong>{geminiDirectorModel}</strong> na direção final. 0 MB de
                 download local.
               </Callout>
 
@@ -712,8 +712,9 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
                   value={geminiDirectorModel}
                   onChange={(e) => setGeminiDirectorModel(e.target.value)}
                 >
-                  <option value="gemini-2.5-pro">Gemini 2.5 Pro (Máxima inteligência visual e narrativa)</option>
-                  <option value="gemini-2.5-flash">Gemini 2.5 Flash (Mais rápido e econômico)</option>
+                  <option value="auto">Automático (Melhor Gemini disponível na chave · Recomendado)</option>
+                  <option value="gemini-3.8-pro">Gemini 3.8 Pro (Máxima inteligência visual e narrativa)</option>
+                  <option value="gemini-3.8-flash">Gemini 3.8 Flash (Mais rápido e econômico)</option>
                 </select>
               </Field>
             </>

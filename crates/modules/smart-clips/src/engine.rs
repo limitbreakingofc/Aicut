@@ -176,12 +176,12 @@ pub async fn start_clip_analysis(
                 .ok()
                 .flatten()
                 .and_then(|v| v.as_str().map(|s| s.to_string()))
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "gemini-2.5-flash".to_string());
+                .filter(|s| !s.trim().is_empty() && !s.starts_with("gemini-2."))
+                .unwrap_or_else(|| "gemini-3.8-flash".to_string());
             let director_model = req
                 .model_id
                 .clone()
-                .filter(|s| !s.trim().is_empty())
+                .filter(|s| !s.trim().is_empty() && !s.starts_with("gemini-2."))
                 .or_else(|| {
                     kernel
                         .repo
@@ -189,9 +189,9 @@ pub async fn start_clip_analysis(
                         .ok()
                         .flatten()
                         .and_then(|v| v.as_str().map(|s| s.to_string()))
-                        .filter(|s| !s.trim().is_empty())
+                        .filter(|s| !s.trim().is_empty() && !s.starts_with("gemini-2."))
                 })
-                .unwrap_or_else(|| "gemini-2.5-pro".to_string());
+                .unwrap_or_else(|| "auto".to_string());
             ResolvedProvider::Gemini(GeminiConfig {
                 api_key,
                 scan_model,

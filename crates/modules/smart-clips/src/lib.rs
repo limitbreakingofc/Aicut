@@ -153,8 +153,22 @@ fn read_clips_config(kernel: &AicutKernel) -> ClipsConfigOutput {
         gemini_configured: key.is_some(),
         gemini_key_preview: preview,
         default_provider: get_str(SETTING_DEFAULT_PROVIDER, "gemini"),
-        gemini_scan_model: get_str(SETTING_GEMINI_SCAN_MODEL, "gemini-2.5-flash"),
-        gemini_director_model: get_str(SETTING_GEMINI_DIRECTOR_MODEL, "gemini-2.5-pro"),
+        gemini_scan_model: {
+            let v = get_str(SETTING_GEMINI_SCAN_MODEL, "gemini-3.8-flash");
+            if v.starts_with("gemini-2.") {
+                "gemini-3.8-flash".to_string()
+            } else {
+                v
+            }
+        },
+        gemini_director_model: {
+            let v = get_str(SETTING_GEMINI_DIRECTOR_MODEL, "auto");
+            if v.starts_with("gemini-2.") {
+                "auto".to_string()
+            } else {
+                v
+            }
+        },
         local_vision_model: get_str(
             SETTING_LOCAL_VISION_MODEL,
             recommended_vision_model_id(&kernel.hardware),
