@@ -74,6 +74,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.name }}
+          # Manual runs: create the tag on the commit that was actually built (not the default branch)
+          target_commitish: ${{ github.sha }}
           name: "Aicut ${{ steps.tag.outputs.name }} (Windows 11)"
           generate_release_notes: true
           draft: false
