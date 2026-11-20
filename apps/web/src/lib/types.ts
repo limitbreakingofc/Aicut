@@ -431,6 +431,13 @@ export interface CustomMotionCode {
   code: string;
 }
 
+export interface SceneEffects {
+  camera_zoom_end: number;
+  impact_shake: number;
+  vignette: boolean;
+  color_mood: string;
+}
+
 export interface MotionScene {
   id: string;
   title: string;
@@ -441,6 +448,7 @@ export interface MotionScene {
   pip: PipConfig;
   content_focus: ContentFocusConfig;
   overlay: SceneOverlay;
+  effects?: SceneEffects;
   rationale: string;
   custom_code?: CustomMotionCode | null;
 }
@@ -466,6 +474,8 @@ export interface AicutComposition {
   burn_subtitles: boolean;
   template_path?: string | null;
   engine_preference: string;
+  motion_html?: string | null;
+  creative_direction?: string;
   scenes: MotionScene[];
   chat_history: MotionChatMessage[];
   rendered_media_id?: string | null;

@@ -83,6 +83,13 @@ jobs:
           body: |
             ## Aicut ${{ steps.tag.outputs.name }} — Estúdio Modular AI-First para Windows 11
 
+            ### Novidades da v0.8.0 — Editora IA Contextual + Motor HyperFrames Real (Preview Ao Vivo & Render RGBA em NVENC)
+            - **A IA agora ASSISTE ao vídeo de verdade antes de editar:** extrai um storyboard visual (grade 4×2 de frames reais do trecho) + transcrição com timestamps e cria **técnicas de edição e motion graphics HyperFrames (HTML + CSS + SVG + contadores + setas desenhadas + flashes + cards) sob medida para o contexto específico de cada vídeo**!
+            - **Interface Ultra-Minimalista (Zero poluição de botões e formulários):**
+              - **Esquerda:** Preview 9:16 ao vivo a 60fps combinando coreografia dinâmica de câmera (*zoom-in* progressivo, tremor de impacto, vinheta, mood de cor, SMOKING33, tela cheia + PiP) + **camada HyperFrames HTML/CSS/SVG rodando ao vivo por cima do vídeo**!
+              - **Direita:** Chat livre em altura total para **conversar, planejar ideias (`discuss`) e pedir melhorias (`apply`)** diretamente com a IA editora — sem precisar mexer em dezenas de botões.
+            - **Renderização Real do HyperFrames Transparente (RGBA) no MP4 Final (Zero Node.js!):** usa o Chromium nativo já presente no Windows 11 (Microsoft Edge / Chrome em modo headless via CDP) para capturar exatamente o código HyperFrames da IA em PNG transparente 1080×1920 e compor sobre o vídeo acelerado em GPU **NVENC**!
+
             ### Novidades da v0.7.1 — Fase 1 do Aicut Motion Studio (Layout Dinâmico em Código + Chat com IA)
             - **Novo Módulo `Motion Studio` (`Estúdio → Motion Studio`, atalho `Alt+6`):** sistema de composição em código motion (`AicutComposition`) onde a IA controla o layout **cena a cena** conforme o que acontece de mais importante no vídeo — alternando automaticamente entre **Moldura SMOKING33**, **Conteúdo Tela Cheia + Webcam PiP flutuante**, **Foco na Câmera (gancho/reação)**, **Câmera Grande (68%)**, **100% Conteúdo** e **Zoom Destaque + Callout**!
             - **Chat Interativo com a IA Diretora (`motion.chat_edit`):** converse em português direto na tela (*"entre 0:10 e 0:18 destaca tela cheia com minha webcam no canto superior direito"*, *"nos primeiros 4s coloca foco na câmera com título 'OLHA ISSO!'"*) e veja as cenas e o **preview 9:16 ao vivo a 60fps** atualizarem instantaneamente! (Funciona com Gemini API e inclui interpretador offline em PT-BR.)

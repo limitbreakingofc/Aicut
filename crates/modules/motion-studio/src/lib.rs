@@ -1,4 +1,5 @@
 pub mod director;
+pub mod hyperframes_render;
 pub mod renderer;
 pub mod schema;
 
@@ -12,10 +13,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::director::{edit_composition_via_chat, plan_composition_with_ai};
+use crate::hyperframes_render::build_live_hyperframes_document;
 use crate::renderer::render_composition_to_library;
 use crate::schema::{
-    compile_to_hyperframes_html, compile_to_remotion_props, delete_composition, get_composition,
-    load_all_compositions, save_composition, AicutComposition,
+    compile_to_remotion_props, delete_composition, get_composition, load_all_compositions,
+    save_composition, AicutComposition,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -301,7 +303,7 @@ impl AicutModule for MotionStudioModule {
                             _ => (
                                 "hyperframes".to_string(),
                                 "html".to_string(),
-                                compile_to_hyperframes_html(&comp),
+                                build_live_hyperframes_document(&comp),
                             ),
                         };
                         let summary = format!("Exported '{}' as {target} motion code", comp.title);

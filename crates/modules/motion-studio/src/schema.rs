@@ -141,6 +141,38 @@ impl Default for SceneOverlay {
     }
 }
 
+/// Dynamic camera & visual editing techniques applied automatically by the AI per scene context.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SceneEffects {
+    /// Smooth zoom-in over the scene (1.0 = steady, 1.08 = subtle punch-in, 1.18 = dramatic zoom).
+    #[serde(default = "default_one")]
+    pub camera_zoom_end: f64,
+    /// Brief energetic camera shake on scene entry (0.0 = off, 0.3..1.0 = impact shake).
+    #[serde(default)]
+    pub impact_shake: f64,
+    /// Subtle dark cinema vignette for tension / storytelling emphasis.
+    #[serde(default)]
+    pub vignette: bool,
+    /// Visual color mood: "natural" | "vibrant" | "dramatic" | "cyber"
+    #[serde(default = "default_mood")]
+    pub color_mood: String,
+}
+
+impl Default for SceneEffects {
+    fn default() -> Self {
+        Self {
+            camera_zoom_end: 1.0,
+            impact_shake: 0.0,
+            vignette: false,
+            color_mood: default_mood(),
+        }
+    }
+}
+
+fn default_mood() -> String {
+    "natural".to_string()
+}
+
 /// Optional custom motion code slot for Phase 2 (HyperFrames HTML/CSS/GSAP) & Phase 3 (Remotion TSX).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CustomMotionCode {
@@ -169,6 +201,9 @@ pub struct MotionScene {
     pub content_focus: ContentFocusConfig,
     #[serde(default)]
     pub overlay: SceneOverlay,
+    /// Context-aware camera & visual techniques (zoom punch-in, shake, vignette, mood).
+    #[serde(default)]
+    pub effects: SceneEffects,
     /// Short explanation of why the AI chose this layout for this moment.
     #[serde(default)]
     pub rationale: String,
@@ -219,6 +254,12 @@ pub struct AicutComposition {
     /// "hybrid_nvenc" | "hyperframes" | "remotion"
     #[serde(default = "default_engine_pref")]
     pub engine_preference: String,
+    /// Bespoke HyperFrames HTML/CSS/SVG/JS motion overlay authored by the AI specifically for THIS video.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motion_html: Option<String>,
+    /// High-level creative editing direction & rationale crafted by the AI for this video.
+    #[serde(default)]
+    pub creative_direction: String,
     #[serde(default)]
     pub scenes: Vec<MotionScene>,
     #[serde(default)]
@@ -256,6 +297,7 @@ impl AicutComposition {
                 pip: PipConfig::default(),
                 content_focus: ContentFocusConfig::default(),
                 overlay: SceneOverlay::default(),
+                effects: SceneEffects::default(),
                 rationale: "Layout padrão SMOKING33.".to_string(),
                 custom_code: None,
             });
@@ -299,6 +341,7 @@ impl AicutComposition {
                 pip: PipConfig::default(),
                 content_focus: ContentFocusConfig::default(),
                 overlay: SceneOverlay::default(),
+                effects: SceneEffects::default(),
                 rationale: String::new(),
                 custom_code: None,
             });
@@ -603,6 +646,8 @@ mod tests {
             burn_subtitles: true,
             template_path: None,
             engine_preference: "hybrid_nvenc".into(),
+            motion_html: None,
+            creative_direction: String::new(),
             scenes: vec![
                 MotionScene {
                     id: "s2".into(),
@@ -617,6 +662,7 @@ mod tests {
                         headline: Some("MOMENTO INSANO!".into()),
                         ..Default::default()
                     },
+                    effects: SceneEffects::default(),
                     rationale: String::new(),
                     custom_code: None,
                 },
@@ -630,6 +676,7 @@ mod tests {
                     pip: PipConfig::default(),
                     content_focus: ContentFocusConfig::default(),
                     overlay: SceneOverlay::default(),
+                    effects: SceneEffects::default(),
                     rationale: String::new(),
                     custom_code: None,
                 },

@@ -1,37 +1,96 @@
-use aicut_core::{AicutError, AicutKernel, AicutResult, TranscriptRecord};
+use aicut_core::{configure_tokio_command, AicutError, AicutKernel, AicutResult, TranscriptRecord};
 use aicut_module_smart_clips::engine::{
     resolve_gemini_api_key, SETTING_GEMINI_DIRECTOR_MODEL, SETTING_GEMINI_SCAN_MODEL,
     SETTING_TEMPLATE_PATH,
 };
-use aicut_module_smart_clips::framing::resolve_effective_framing;
+use aicut_module_smart_clips::framing::{resolve_effective_framing, NormalizedRect};
 use aicut_module_smart_clips::frames::probe_duration_sec;
-use aicut_module_smart_clips::gemini::{generate_json_text, resolve_active_gemini_models};
+use aicut_module_smart_clips::gemini::{
+    generate_json_text, generate_with_inline_image, resolve_active_gemini_models,
+};
 use aicut_module_smart_clips::prompts::extract_json_object;
+use base64::Engine as _;
 use chrono::Utc;
 use serde::Deserialize;
 use std::path::Path;
+use tokio::process::Command;
 use uuid::Uuid;
 
 use crate::schema::{
     save_composition, AicutComposition, ContentFocusConfig, MotionChatMessage, MotionScene,
-    PipConfig, PipCorner, SceneLayoutPreset, SceneOverlay, SceneTransition,
+    PipConfig, PipCorner, SceneEffects, SceneLayoutPreset, SceneOverlay, SceneTransition,
 };
 
 #[derive(Debug, Deserialize)]
-struct AiPlanResponse {
+struct AiDirectorResponse {
+    /// "apply" (update scenes & motion_html) | "discuss" (brainstorm / plan with user without overwriting edit)
+    #[serde(default = "default_apply_mode")]
+    mode: String,
     #[serde(default)]
     title: Option<String>,
+    #[serde(default)]
+    creative_direction: Option<String>,
     #[serde(default)]
     assistant_reply: Option<String>,
     #[serde(default)]
     scenes: Vec<MotionScene>,
+    /// Bespoke HyperFrames HTML/CSS/SVG/JS motion graphics written specifically for THIS video!
+    #[serde(default)]
+    motion_html: Option<String>,
     #[serde(default)]
     burn_subtitles: Option<bool>,
 }
 
-/// Plans a dynamic multi-scene `AicutComposition` for a video/clip using Gemini (when configured)
-/// or an intelligent multi-scene editorial template (when offline), automatically inheriting the
-/// user's saved webcam & content areas from the Enquadramento tab.
+fn default_apply_mode() -> String {
+    "apply".to_string()
+}
+
+/// Extracts a crisp 4x2 (8-frame) visual storyboard JPEG of the exact clip so the AI
+/// literally WATCHES the video frames and tailors editing techniques & HyperFrames motion
+/// graphics to what is actually happening on screen.
+async fn extract_clip_storyboard_b64(
+    ffmpeg_bin: &Path,
+    video_path: &Path,
+    clip_start: f64,
+    duration_sec: f64,
+) -> Option<String> {
+    let tmp_path = std::env::temp_dir().join(format!("aicut-motion-sb-{}.jpg", Uuid::new_v4()));
+    let dur = duration_sec.max(1.0);
+    let sample_fps = (8.0 / dur).clamp(0.05, 4.0);
+    let vf = format!(
+        "fps={sample_fps:.4},scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2:color=black,tile=4x2:margin=4:padding=4:color=0x111111"
+    );
+
+    let mut cmd = Command::new(ffmpeg_bin);
+    configure_tokio_command(&mut cmd);
+    let ok = cmd
+        .args([
+            "-y",
+            "-ss",
+            &format!("{clip_start:.3}"),
+            "-t",
+            &format!("{dur:.3}"),
+            "-i",
+        ])
+        .arg(video_path)
+        .args(["-vf", &vf, "-frames:v", "1", "-q:v", "5"])
+        .arg(&tmp_path)
+        .output()
+        .await
+        .map(|o| o.status.success() && tmp_path.is_file())
+        .unwrap_or(false);
+
+    if !ok {
+        let _ = std::fs::remove_file(&tmp_path);
+        return None;
+    }
+    let bytes = std::fs::read(&tmp_path).ok();
+    let _ = std::fs::remove_file(&tmp_path);
+    bytes.map(|b| base64::engine::general_purpose::STANDARD.encode(b))
+}
+
+/// Watches the video frames + reads the transcript and automatically crafts a bespoke,
+/// video-specific editing plan + dynamic camera choreography + custom HyperFrames motion code!
 pub async fn plan_composition_with_ai(
     kernel: &AicutKernel,
     media_id: &str,
@@ -46,6 +105,7 @@ pub async fn plan_composition_with_ai(
         .ok_or_else(|| AicutError::not_found(format!("Media '{media_id}' not found in Library")))?;
 
     let ffprobe_bin = kernel.tools.resolve_tool("ffprobe").ok();
+    let ffmpeg_bin = kernel.tools.resolve_tool("ffmpeg").ok();
     let total_dur = match source.metadata.duration_sec {
         Some(d) if d > 0.5 => d,
         _ => match ffprobe_bin {
@@ -56,7 +116,9 @@ pub async fn plan_composition_with_ai(
         },
     };
 
-    let start = clip_start_sec.unwrap_or(0.0).clamp(0.0, (total_dur - 1.0).max(0.0));
+    let start = clip_start_sec
+        .unwrap_or(0.0)
+        .clamp(0.0, (total_dur - 1.0).max(0.0));
     let default_end = (start + 60.0).min(total_dur);
     let end = clip_end_sec
         .unwrap_or(default_end)
@@ -64,7 +126,7 @@ pub async fn plan_composition_with_ai(
     let duration_sec = (end - start).max(1.0);
 
     let (framing, _) = resolve_effective_framing(kernel, Some(&source.id));
-    let webcam_rect = framing.webcam_rect.unwrap_or(aicut_module_smart_clips::framing::NormalizedRect {
+    let webcam_rect = framing.webcam_rect.unwrap_or(NormalizedRect {
         x: 0.70,
         y: 0.64,
         w: 0.28,
@@ -86,13 +148,21 @@ pub async fn plan_composition_with_ai(
         .map(|rt| rt.transcript);
     let transcript_excerpt = format_relative_transcript(transcript.as_ref(), start, end);
 
+    let storyboard_b64 = match ffmpeg_bin {
+        Some(ref bin) => {
+            extract_clip_storyboard_b64(bin, Path::new(&source.file_path), start, duration_sec)
+                .await
+        }
+        None => None,
+    };
+
     let mut comp = AicutComposition {
         id: Uuid::new_v4().to_string(),
         title: title_override
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("{} · Motion", source.title)),
+            .unwrap_or_else(|| format!("{} · Edição IA", source.title)),
         media_id: source.id.clone(),
         clip_start_sec: start,
         clip_end_sec: end,
@@ -105,6 +175,8 @@ pub async fn plan_composition_with_ai(
         burn_subtitles: true,
         template_path,
         engine_preference: "hybrid_nvenc".to_string(),
+        motion_html: None,
+        creative_direction: String::new(),
         scenes: Vec::new(),
         chat_history: Vec::new(),
         rendered_media_id: None,
@@ -114,7 +186,7 @@ pub async fn plan_composition_with_ai(
     let goal_str = user_goal
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or("Criar um Short dinâmico e profissional alternando entre SMOKING33, destaque em tela cheia nos momentos importantes e foco na câmera no gancho/reação.");
+        .unwrap_or("Assista ao vídeo e aplique automaticamente técnicas de edição profissionais + motion graphics HyperFrames sob medida para o contexto exato deste vídeo.");
 
     let mut reply = String::new();
     let mut used_ai = false;
@@ -129,9 +201,20 @@ pub async fn plan_composition_with_ai(
         )
         .await;
         let model = if dir_m.is_empty() { scan_m } else { dir_m };
-        let prompt = build_plan_prompt(&comp.title, duration_sec, goal_str, &transcript_excerpt);
-        if let Ok(raw) = generate_json_text(http, &api_key, &model, &prompt).await {
-            if let Some(parsed) = parse_ai_plan_response(&raw) {
+        let prompt = build_context_aware_plan_prompt(
+            &comp.title,
+            duration_sec,
+            goal_str,
+            &transcript_excerpt,
+            storyboard_b64.is_some(),
+        );
+        let raw_res = if let Some(ref b64) = storyboard_b64 {
+            generate_with_inline_image(http, &api_key, &model, b64, &prompt).await
+        } else {
+            generate_json_text(http, &api_key, &model, &prompt).await
+        };
+        if let Ok(raw) = raw_res {
+            if let Some(parsed) = parse_ai_director_response(&raw) {
                 if !parsed.scenes.is_empty() {
                     if let Some(t) = parsed.title.filter(|s| !s.trim().is_empty()) {
                         if title_override.is_none() {
@@ -139,9 +222,15 @@ pub async fn plan_composition_with_ai(
                         }
                     }
                     comp.scenes = parsed.scenes;
+                    if let Some(html) = parsed.motion_html.filter(|s| !s.trim().is_empty()) {
+                        comp.motion_html = Some(html);
+                    }
+                    if let Some(cd) = parsed.creative_direction {
+                        comp.creative_direction = cd;
+                    }
                     reply = parsed.assistant_reply.unwrap_or_else(|| {
                         format!(
-                            "Criei um roteiro dinâmico com {} cenas usando {model}. Você pode testar no preview ao lado e me pedir qualquer alteração pelo chat!",
+                            "Assisti ao vídeo e montei uma edição personalizada com {} momentos + motion graphics HyperFrames sob medida! Dá play ao lado e me diz no chat o que você quer ajustar ou planejar.",
                             comp.scenes.len()
                         )
                     });
@@ -153,10 +242,8 @@ pub async fn plan_composition_with_ai(
 
     if !used_ai {
         comp.scenes = build_smart_default_scenes(duration_sec);
-        reply = format!(
-            "Montei uma estrutura dinâmica inicial com {} cenas (Gancho → SMOKING33 → Destaque Tela Cheia + Webcam PiP → Fechamento). Me diga no chat qualquer ajuste que quiser fazer!",
-            comp.scenes.len()
-        );
+        comp.motion_html = Some(build_default_hyperframes_motion(duration_sec, &comp.title));
+        reply = "Montei uma primeira edição dinâmica com abertura chamativa, SMOKING33 e destaque em tela cheia! Conecte sua Gemini API Key em Cortes IA para eu assistir visualmente aos frames e criar animações HyperFrames 100% sob medida — e já pode conversar comigo aqui no chat para ajustar o que quiser!".to_string();
     }
 
     comp.normalize();
@@ -169,8 +256,9 @@ pub async fn plan_composition_with_ai(
     Ok((comp, reply))
 }
 
-/// Interactively edits an existing `AicutComposition` from a natural-language chat message
-/// (using Gemini when configured, with a responsive offline PT-BR command fallback!).
+/// Conversational AI Video Editor:
+/// - Can brainstorm & PLAN ideas with the user (`mode: "discuss"`) based on the real video frames + transcript
+/// - Can APPLY / IMPROVE bespoke camera choreography & HyperFrames HTML/CSS/SVG motion graphics (`mode: "apply"`)
 pub async fn edit_composition_via_chat(
     kernel: &AicutKernel,
     mut comp: AicutComposition,
@@ -178,7 +266,9 @@ pub async fn edit_composition_via_chat(
 ) -> AicutResult<(AicutComposition, String)> {
     let trimmed = user_message.trim();
     if trimmed.is_empty() {
-        return Err(AicutError::invalid_input("Digite uma instrução para a IA ajustar o layout."));
+        return Err(AicutError::invalid_input(
+            "Digite o que você quer planejar ou mudar na edição.",
+        ));
     }
 
     comp.chat_history.push(MotionChatMessage {
@@ -186,6 +276,21 @@ pub async fn edit_composition_via_chat(
         text: trimmed.to_string(),
         created_at: Utc::now().to_rfc3339(),
     });
+
+    let source = kernel.repo.get_media(&comp.media_id).ok().flatten();
+    let ffmpeg_bin = kernel.tools.resolve_tool("ffmpeg").ok();
+    let storyboard_b64 = match (source.as_ref(), ffmpeg_bin.as_ref()) {
+        (Some(src), Some(bin)) => {
+            extract_clip_storyboard_b64(
+                bin,
+                Path::new(&src.file_path),
+                comp.clip_start_sec,
+                comp.duration_sec,
+            )
+            .await
+        }
+        _ => None,
+    };
 
     let transcript = kernel
         .repo
@@ -208,17 +313,46 @@ pub async fn edit_composition_via_chat(
         )
         .await;
         let model = if dir_m.is_empty() { scan_m } else { dir_m };
-        let prompt = build_chat_edit_prompt(&comp, &transcript_excerpt, trimmed);
-        if let Ok(raw) = generate_json_text(http, &api_key, &model, &prompt).await {
-            if let Some(parsed) = parse_ai_plan_response(&raw) {
-                if !parsed.scenes.is_empty() {
-                    comp.scenes = parsed.scenes;
-                }
-                if let Some(b) = parsed.burn_subtitles {
-                    comp.burn_subtitles = b;
+        let prompt = build_conversational_editor_prompt(
+            &comp,
+            &transcript_excerpt,
+            trimmed,
+            storyboard_b64.is_some(),
+        );
+        let raw_res = if let Some(ref b64) = storyboard_b64 {
+            generate_with_inline_image(http, &api_key, &model, b64, &prompt).await
+        } else {
+            generate_json_text(http, &api_key, &model, &prompt).await
+        };
+
+        if let Ok(raw) = raw_res {
+            if let Some(parsed) = parse_ai_director_response(&raw) {
+                let is_discuss = parsed.mode.eq_ignore_ascii_case("discuss");
+                if !is_discuss {
+                    if !parsed.scenes.is_empty() {
+                        comp.scenes = parsed.scenes;
+                    }
+                    if let Some(html) = parsed.motion_html {
+                        let cleaned = html.trim().to_string();
+                        comp.motion_html = if cleaned.is_empty() {
+                            None
+                        } else {
+                            Some(cleaned)
+                        };
+                    }
+                    if let Some(cd) = parsed.creative_direction.filter(|s| !s.trim().is_empty()) {
+                        comp.creative_direction = cd;
+                    }
+                    if let Some(b) = parsed.burn_subtitles {
+                        comp.burn_subtitles = b;
+                    }
                 }
                 assistant_reply = Some(parsed.assistant_reply.unwrap_or_else(|| {
-                    "Layout atualizado! Confira as novas cenas no preview ao vivo e me diga se quer refinar mais algum detalhe.".to_string()
+                    if is_discuss {
+                        "Essas são minhas sugestões para este vídeo — me diga qual você gostou mais que eu já aplico na hora!".to_string()
+                    } else {
+                        "Edição atualizada! Dá play no preview ao lado para ver as novas animações e cortes em tempo real.".to_string()
+                    }
                 }));
             }
         }
@@ -243,75 +377,44 @@ pub async fn edit_composition_via_chat(
     Ok((comp, final_reply))
 }
 
-/// Deterministic offline PT-BR command interpreter so the user can still adjust scenes via chat
-/// instantaneously even without an internet connection or Gemini API key.
+/// Offline PT-BR fallback command handler when no Gemini API key is configured.
 pub fn apply_local_ptbr_chat_edit(comp: &mut AicutComposition, msg: &str) -> String {
     let lower = msg.to_lowercase();
     let dur = comp.duration_sec;
-
-    // 1. Parse optional quoted title/headline text
     let extracted_quote = extract_quoted_text(msg);
 
-    // 2. Determine requested layout preset
-    let requested_layout = if lower.contains("zoom") || lower.contains("detalhe") || lower.contains("destaque com seta") {
-        Some(SceneLayoutPreset::CalloutZoom)
-    } else if (lower.contains("tela cheia") || lower.contains("conteudo cheio") || lower.contains("conteúdo cheio"))
-        && (lower.contains("sem webcam") || lower.contains("so conteudo") || lower.contains("só conteúdo") || lower.contains("esconde"))
-    {
-        Some(SceneLayoutPreset::ContentFullscreen)
-    } else if lower.contains("tela cheia") || lower.contains("pip") || lower.contains("webcam pequena") || lower.contains("canto") {
-        Some(SceneLayoutPreset::ContentHeroPip)
-    } else if lower.contains("camera grande") || lower.contains("câmera grande") || lower.contains("webcam grande") {
-        Some(SceneLayoutPreset::CameraHeroPip)
-    } else if lower.contains("so camera") || lower.contains("só câmera") || lower.contains("foco na camera") || lower.contains("foco na câmera") || lower.contains("gancho") {
-        Some(SceneLayoutPreset::CameraFocus)
-    } else if lower.contains("sem moldura") || lower.contains("split limpo") {
-        Some(SceneLayoutPreset::SplitClean)
-    } else if lower.contains("smoking") || lower.contains("moldura") || lower.contains("padrao") || lower.contains("padrão") {
-        Some(SceneLayoutPreset::SplitBranded)
-    } else {
-        None
-    };
+    let requested_layout =
+        if lower.contains("zoom") || lower.contains("detalhe") || lower.contains("seta") {
+            Some(SceneLayoutPreset::CalloutZoom)
+        } else if (lower.contains("tela cheia") || lower.contains("conteudo cheio"))
+            && (lower.contains("sem webcam") || lower.contains("só conteúdo") || lower.contains("so conteudo"))
+        {
+            Some(SceneLayoutPreset::ContentFullscreen)
+        } else if lower.contains("tela cheia") || lower.contains("pip") || lower.contains("canto") {
+            Some(SceneLayoutPreset::ContentHeroPip)
+        } else if lower.contains("camera grande") || lower.contains("câmera grande") {
+            Some(SceneLayoutPreset::CameraHeroPip)
+        } else if lower.contains("foco na camera") || lower.contains("foco na câmera") || lower.contains("gancho") || lower.contains("reação") || lower.contains("reacao") {
+            Some(SceneLayoutPreset::CameraFocus)
+        } else if lower.contains("smoking") || lower.contains("padrao") || lower.contains("padrão") {
+            Some(SceneLayoutPreset::SplitBranded)
+        } else {
+            None
+        };
 
-    // 3. Determine optional PiP corner
-    let requested_corner = if lower.contains("superior esquerdo") || lower.contains("cima esquerda") {
+    let requested_corner = if lower.contains("superior esquerdo") {
         Some(PipCorner::TopLeft)
-    } else if lower.contains("superior direito") || lower.contains("cima direita") {
+    } else if lower.contains("superior direito") {
         Some(PipCorner::TopRight)
-    } else if lower.contains("inferior esquerdo") || lower.contains("baixo esquerda") {
+    } else if lower.contains("inferior esquerdo") {
         Some(PipCorner::BottomLeft)
-    } else if lower.contains("inferior direito") || lower.contains("baixo direita") {
+    } else if lower.contains("inferior direito") {
         Some(PipCorner::BottomRight)
     } else {
         None
     };
 
-    // 4. Determine target time range
     let time_range = parse_time_range_ptbr(&lower, dur);
-
-    if lower.contains("tudo") || lower.contains("video inteiro") || lower.contains("vídeo inteiro") {
-        let lay = requested_layout.unwrap_or(SceneLayoutPreset::SplitBranded);
-        comp.scenes = vec![MotionScene {
-            id: format!("sc-{}", &Uuid::new_v4().to_string()[..6]),
-            title: "Vídeo inteiro".to_string(),
-            start_sec: 0.0,
-            end_sec: dur,
-            layout: lay,
-            transition_in: SceneTransition::Cut,
-            pip: PipConfig {
-                corner: requested_corner.unwrap_or_default(),
-                ..Default::default()
-            },
-            content_focus: ContentFocusConfig::default(),
-            overlay: SceneOverlay {
-                headline: extracted_quote.clone(),
-                ..Default::default()
-            },
-            rationale: format!("Aplicado via chat: {msg}"),
-            custom_code: None,
-        }];
-        return format!("Pronto! Apliquei o layout {:?} no vídeo inteiro (0:00 → {:.1}s).", lay, dur);
-    }
 
     if let Some((t0, t1)) = time_range {
         let lay = requested_layout.unwrap_or(SceneLayoutPreset::ContentHeroPip);
@@ -334,52 +437,39 @@ pub fn apply_local_ptbr_chat_edit(comp: &mut AicutComposition, msg: &str) -> Str
             },
             overlay: SceneOverlay {
                 headline: extracted_quote.clone(),
-                callout_text: if lay == SceneLayoutPreset::CalloutZoom {
-                    extracted_quote.or_else(|| Some("DESTAQUE".to_string()))
-                } else {
-                    None
-                },
                 ..Default::default()
             },
-            rationale: format!("Ajustado pelo usuário: {msg}"),
+            effects: SceneEffects {
+                camera_zoom_end: if lay == SceneLayoutPreset::CameraFocus { 1.10 } else { 1.04 },
+                impact_shake: if lower.contains("trem") || lower.contains("impacto") { 0.5 } else { 0.0 },
+                vignette: lower.contains("tensão") || lower.contains("tensao") || lower.contains("dramático"),
+                color_mood: "natural".into(),
+            },
+            rationale: format!("Ajustado via chat: {msg}"),
             custom_code: None,
         };
         insert_scene_into_timeline(&mut comp.scenes, new_scene, dur);
-        return format!(
-            "Feito! Inseri a cena {:?} entre {:.1}s e {:.1}s. Confira no preview ao vivo!",
-            lay, t0, t1
-        );
-    }
-
-    // Apply subtitle toggle if requested
-    if lower.contains("sem legenda") || lower.contains("tira legenda") || lower.contains("desativa legenda") {
-        comp.burn_subtitles = false;
-        return "Legendas desativadas nesta composição.".to_string();
-    }
-    if lower.contains("com legenda") || lower.contains("ativa legenda") {
-        comp.burn_subtitles = true;
-        return "Legendas karaokê ativadas nesta composição.".to_string();
-    }
-
-    // Apply headline or corner change to the first/selected scene
-    if let Some(first) = comp.scenes.first_mut() {
         if let Some(q) = extracted_quote {
-            first.overlay.headline = Some(q.clone());
-            return format!("Atualizei o título da cena de abertura para \"{q}\"!");
+            let mut html = comp.motion_html.clone().unwrap_or_default();
+            html.push_str(&format!(
+                "\n<div class=\"hf-headline\" data-start=\"{t0:.2}\" data-end=\"{t1:.2}\" data-anim=\"pop\">{}</div>",
+                q.replace('<', "&lt;").replace('>', "&gt;")
+            ));
+            comp.motion_html = Some(html);
         }
-        if let Some(c) = requested_corner {
-            for s in &mut comp.scenes {
-                s.pip.corner = c;
-            }
-            return format!("Reposicionei a webcam flutuante (PiP) para {:?} nas cenas aplicáveis.", c);
-        }
-        if let Some(lay) = requested_layout {
-            first.layout = lay;
-            return format!("Alterei a primeira cena para {:?}. Para mudar um trecho específico, diga o tempo (ex.: 'de 0:10 a 0:18 tela cheia').", lay);
-        }
+        return format!("Pronto! Apliquei esse ajuste entre {t0:.1}s e {t1:.1}s. Dá play ao lado para conferir!");
     }
 
-    "Não identifiquei um trecho exato no modo offline — tente algo como: 'de 0:08 a 0:18 tela cheia com webcam no canto superior direito' ou configure sua Gemini API Key para direção completa por IA!".to_string()
+    if lower.contains("sem legenda") {
+        comp.burn_subtitles = false;
+        return "Legendas desativadas.".to_string();
+    }
+    if lower.contains("com legenda") {
+        comp.burn_subtitles = true;
+        return "Legendas karaokê ativadas.".to_string();
+    }
+
+    "Para eu assistir visualmente ao vídeo e criar animações HyperFrames sob medida pelo chat, salve sua Gemini API Key na aba Cortes IA. No modo offline você pode pedir por tempo exato (ex.: 'entre 0:08 e 0:16 tela cheia com título \"OLHA ISSO\"').".to_string()
 }
 
 fn insert_scene_into_timeline(scenes: &mut Vec<MotionScene>, inserted: MotionScene, total_dur: f64) {
@@ -388,14 +478,12 @@ fn insert_scene_into_timeline(scenes: &mut Vec<MotionScene>, inserted: MotionSce
         if s.end_sec <= inserted.start_sec + 0.1 || s.start_sec >= inserted.end_sec - 0.1 {
             next.push(s);
         } else {
-            // Left slice before inserted scene
             if s.start_sec + 0.5 < inserted.start_sec {
                 let mut left = s.clone();
                 left.id = format!("sc-{}", &Uuid::new_v4().to_string()[..6]);
                 left.end_sec = inserted.start_sec;
                 next.push(left);
             }
-            // Right slice after inserted scene
             if s.end_sec > inserted.end_sec + 0.5 {
                 let mut right = s.clone();
                 right.id = format!("sc-{}", &Uuid::new_v4().to_string()[..6]);
@@ -409,7 +497,7 @@ fn insert_scene_into_timeline(scenes: &mut Vec<MotionScene>, inserted: MotionSce
     if next.is_empty() {
         next.push(MotionScene {
             id: format!("sc-{}", &Uuid::new_v4().to_string()[..6]),
-            title: "Cena principal".into(),
+            title: "Principal".into(),
             start_sec: 0.0,
             end_sec: total_dur,
             layout: SceneLayoutPreset::SplitBranded,
@@ -417,6 +505,7 @@ fn insert_scene_into_timeline(scenes: &mut Vec<MotionScene>, inserted: MotionSce
             pip: PipConfig::default(),
             content_focus: ContentFocusConfig::default(),
             overlay: SceneOverlay::default(),
+            effects: SceneEffects::default(),
             rationale: String::new(),
             custom_code: None,
         });
@@ -424,11 +513,33 @@ fn insert_scene_into_timeline(scenes: &mut Vec<MotionScene>, inserted: MotionSce
     *scenes = next;
 }
 
+fn build_default_hyperframes_motion(dur: f64, title: &str) -> String {
+    let hook_end = (dur * 0.14).clamp(2.8, 4.2);
+    let safe_title: String = title
+        .chars()
+        .take(28)
+        .collect::<String>()
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    format!(
+        r#"<div class="hf-headline" data-start="0.15" data-end="{hook_end:.2}" data-anim="pop">{safe_title}</div>
+<div style="position:absolute;bottom:24px;left:48px;right:48px;height:6px;border-radius:99px;background:rgba(255,255,255,0.16);overflow:hidden;" data-start="0" data-end="{dur:.2}" data-anim="fade">
+  <div id="aicut-prog" style="height:100%;width:0%;background:linear-gradient(90deg,#eab308,#f97316);border-radius:99px;"></div>
+</div>
+<script>
+window.__aicutCustomSeek = function(t) {{
+  var p = document.getElementById('aicut-prog');
+  if (p) p.style.width = Math.min(100, Math.max(0, (t / {dur:.2}) * 100)).toFixed(2) + '%';
+}};
+</script>"#
+    )
+}
+
 fn build_smart_default_scenes(dur: f64) -> Vec<MotionScene> {
     if dur <= 10.0 {
         return vec![MotionScene {
             id: "sc-main".into(),
-            title: "SMOKING33 Principal".into(),
+            title: "SMOKING33".into(),
             start_sec: 0.0,
             end_sec: dur,
             layout: SceneLayoutPreset::SplitBranded,
@@ -436,7 +547,8 @@ fn build_smart_default_scenes(dur: f64) -> Vec<MotionScene> {
             pip: PipConfig::default(),
             content_focus: ContentFocusConfig::default(),
             overlay: SceneOverlay::default(),
-            rationale: "Clipe curto mantido em SMOKING33 para leitura direta.".into(),
+            effects: SceneEffects { camera_zoom_end: 1.04, ..Default::default() },
+            rationale: "Clipe curto em SMOKING33.".into(),
             custom_code: None,
         }];
     }
@@ -446,23 +558,21 @@ fn build_smart_default_scenes(dur: f64) -> Vec<MotionScene> {
     vec![
         MotionScene {
             id: "sc-hook".into(),
-            title: "Gancho na câmera".into(),
+            title: "Gancho".into(),
             start_sec: 0.0,
             end_sec: hook_end,
             layout: SceneLayoutPreset::CameraFocus,
             transition_in: SceneTransition::Cut,
             pip: PipConfig::default(),
             content_focus: ContentFocusConfig::default(),
-            overlay: SceneOverlay {
-                badge: Some("GANCHO".into()),
-                ..Default::default()
-            },
-            rationale: "Abertura direta na webcam para prender atenção nos primeiros segundos.".into(),
+            overlay: SceneOverlay::default(),
+            effects: SceneEffects { camera_zoom_end: 1.08, ..Default::default() },
+            rationale: "Punch-in natural na webcam para prender atenção no gancho.".into(),
             custom_code: None,
         },
         MotionScene {
             id: "sc-split-1".into(),
-            title: "Contexto · SMOKING33".into(),
+            title: "Desenvolvimento".into(),
             start_sec: hook_end,
             end_sec: mid_start,
             layout: SceneLayoutPreset::SplitBranded,
@@ -470,32 +580,27 @@ fn build_smart_default_scenes(dur: f64) -> Vec<MotionScene> {
             pip: PipConfig::default(),
             content_focus: ContentFocusConfig::default(),
             overlay: SceneOverlay::default(),
-            rationale: "Layout padrão SMOKING33 equilibrando webcam natural e conteúdo.".into(),
+            effects: SceneEffects::default(),
+            rationale: "SMOKING33 natural equilibrando webcam e conteúdo.".into(),
             custom_code: None,
         },
         MotionScene {
             id: "sc-hero".into(),
-            title: "Momento principal · Tela cheia + PiP".into(),
+            title: "Destaque na tela".into(),
             start_sec: mid_start,
             end_sec: mid_end,
             layout: SceneLayoutPreset::ContentHeroPip,
             transition_in: SceneTransition::Fade,
-            pip: PipConfig {
-                corner: PipCorner::TopRight,
-                width_pct: 0.34,
-                ..Default::default()
-            },
+            pip: PipConfig { corner: PipCorner::TopRight, width_pct: 0.34, ..Default::default() },
             content_focus: ContentFocusConfig::default(),
-            overlay: SceneOverlay {
-                badge: Some("DESTAQUE".into()),
-                ..Default::default()
-            },
-            rationale: "Amplia o conteúdo para tela cheia no clímax mantendo a reação em PiP.".into(),
+            overlay: SceneOverlay::default(),
+            effects: SceneEffects { camera_zoom_end: 1.06, ..Default::default() },
+            rationale: "Conteúdo em tela cheia no ponto principal com reação em PiP.".into(),
             custom_code: None,
         },
         MotionScene {
             id: "sc-close".into(),
-            title: "Fechamento · SMOKING33".into(),
+            title: "Fechamento".into(),
             start_sec: mid_end,
             end_sec: dur,
             layout: SceneLayoutPreset::SplitBranded,
@@ -503,99 +608,133 @@ fn build_smart_default_scenes(dur: f64) -> Vec<MotionScene> {
             pip: PipConfig::default(),
             content_focus: ContentFocusConfig::default(),
             overlay: SceneOverlay::default(),
-            rationale: "Retorna ao layout SMOKING33 para o fechamento com reação completa.".into(),
+            effects: SceneEffects::default(),
+            rationale: "Retorno limpo ao SMOKING33 para encerramento.".into(),
             custom_code: None,
         },
     ]
 }
 
-fn parse_ai_plan_response(raw: &str) -> Option<AiPlanResponse> {
+fn parse_ai_director_response(raw: &str) -> Option<AiDirectorResponse> {
     let json_str = extract_json_object(raw).unwrap_or(raw);
-    serde_json::from_str::<AiPlanResponse>(json_str).ok()
+    serde_json::from_str::<AiDirectorResponse>(json_str).ok()
 }
 
-fn build_plan_prompt(title: &str, dur: f64, goal: &str, transcript: &str) -> String {
+fn build_context_aware_plan_prompt(
+    title: &str,
+    dur: f64,
+    goal: &str,
+    transcript: &str,
+    has_storyboard: bool,
+) -> String {
+    let vis_note = if has_storyboard {
+        "VOCÊ ESTÁ VENDO O STORYBOARD VISUAL REAL (grade 4x2 de frames do vídeo anexada)! Observe exatamente o tema, ambiente, cores, expressões e o que aparece na tela."
+    } else {
+        "Baseie-se profundamente na transcrição e no tema do vídeo."
+    };
     format!(
-        r##"Você é o Diretor de Motion & Layout Dinâmico do Aicut (editor de Shorts 9:16 estilo motion code).
-Crie um roteiro de cenas dinâmicas para um Short de {dur:.1} segundos ("{title}").
-Objetivo editorial do usuário: {goal}
+        r##"Você é um Editor de Vídeo & Diretor de Motion Graphics Sênior (estilo edição profissional de YouTube Shorts / Reels + HyperFrames HTML/CSS/SVG).
+{vis_note}
 
-Layouts disponíveis para `layout` (escolha dinamicamente o melhor para cada momento!):
-- "split_branded": Moldura SMOKING33 (webcam natural limpa em cima + conteúdo em baixo)
-- "split_clean": Split 9:16 sem moldura
-- "content_hero_pip": Conteúdo em TELA CHEIA + webcam limpa flutuante no canto (ideal quando algo visualmente importante acontece na tela!)
-- "content_fullscreen": 100% conteúdo sem webcam
-- "camera_focus": Webcam limpa em tela cheia (ideal para gancho 3–4s ou reação épica!)
-- "camera_hero_pip": Webcam grande (68%) + conteúdo compacto (32%)
-- "callout_zoom": Zoom focal em (focus_x, focus_y, zoom 1.5..2.2) + callout_text destacando um detalhe específico na tela + webcam PiP
+Sua missão: criar uma edição ÚNICA, feita SOB MEDIDA para o contexto exato deste vídeo de {dur:.1}s ("{title}") — NÃO genérica!
+Pedido do criador: {goal}
 
-Regras:
-- Crie entre 3 e 6 cenas cobrindo exatamente 0.0 até {dur:.1}s sem lacunas nem sobreposições.
-- Trocas naturais (cada cena com pelo menos 2.5s). Use `overlay.headline` curto (<= 5 palavras) só em 1–2 momentos de impacto.
-- Responda APENAS JSON válido no formato:
+Você controla DUAS camadas em total harmonia:
+1. **Coreografia de Câmera & Ritmo (`scenes[]`, cobrindo 0.0 até {dur:.1}s sem lacunas):**
+   - `layout`: "split_branded" (moldura SMOKING33), "content_hero_pip" (tela cheia + webcam PiP quando algo importante acontece na tela!), "content_fullscreen" (100% conteúdo), "camera_focus" (foco na webcam para gancho/reação), "camera_hero_pip" (webcam grande 68%), "callout_zoom" (zoom focal em `focus_x, focus_y, zoom`).
+   - `effects`: `camera_zoom_end` (1.0=parado, 1.06..1.16=aproximação suave dramática), `impact_shake` (0.0..0.8=tremor breve de impacto/susto/jogada), `vignette` (true para suspense/ênfase), `color_mood` ("natural"|"vibrant"|"dramatic"|"cyber").
+
+2. **Camada HyperFrames de Motion Graphics Personalizados (`motion_html` — HTML + CSS + SVG + JS sobre canvas transparente 1080x1920!):**
+   - Crie elementos visuais **específicos para o assunto deste vídeo** (ex.: se falar de dinheiro/número → contador animado `data-count-from`/`data-count-to`; se citar 3 pontos → cards glassmorphism surgindo no tempo exato da fala; se apontar algo na tela → seta/círculo SVG animado com `data-anim="draw"`; flash suave `data-anim="flash"` em viradas; título de gancho cinematográfico com a paleta de cor do vídeo!).
+   - REGRAS DO RUNTIME HYPERFRAMES (100% offline, determinístico):
+     * NÃO use URLs externas, NÃO use `<img>` externos, NÃO use CSS `@keyframes` dependente do relógio.
+     * TODO elemento animado DEVE ter `data-start="SEG"` e `data-end="SEG"` e `data-anim="pop|slide-up|slide-down|slide-left|slide-right|fade|scale|pulse|draw|flash"`.
+     * Contadores animados usam `data-count-from="0" data-count-to="600" data-prefix="R$ " data-suffix=""`.
+     * Para animações customizadas avançadas, opcionalmente defina `<script>window.__aicutCustomSeek = function(t) {{ ... }};</script>`.
+     * Deixe a zona inferior (y > 1480px) livre para legendas karaokê e a área da webcam limpa (não cubra o rosto!).
+
+Responda APENAS JSON válido:
 {{
-  "title": "Título curto",
-  "assistant_reply": "Explicação amigável em PT-BR das escolhas de layout.",
-  "scenes": [
-    {{
-      "id": "sc-1",
-      "title": "Gancho inicial",
-      "start_sec": 0.0,
-      "end_sec": 3.8,
-      "layout": "camera_focus",
-      "transition_in": "cut",
-      "pip": {{ "corner": "top_right", "width_pct": 0.34, "border_hex": "#EAB308", "visible": true }},
-      "content_focus": {{ "focus_x": 0.5, "focus_y": 0.5, "zoom": 1.0, "fit_blur": false }},
-      "overlay": {{ "headline": "OLHA ISSO!", "badge": null, "callout_text": null, "accent_hex": "#EAB308" }},
-      "rationale": "Prende atenção imediatamente na expressão do apresentador."
-    }}
-  ]
+  "mode": "apply",
+  "title": "Título curto impactante",
+  "creative_direction": "Resumo em 1 frase da linguagem visual escolhida para este vídeo.",
+  "assistant_reply": "Explicação natural em PT-BR contando o que você viu/ouviu no vídeo e quais técnicas de edição + motions você aplicou sob medida.",
+  "burn_subtitles": true,
+  "scenes": [ ... ],
+  "motion_html": "<div ...>...</div>"
 }}
 
-Transcrição relativa (0.0s .. {dur:.1}s):
+Transcrição com tempos relativos (0.0s .. {dur:.1}s):
 {transcript}"##
     )
 }
 
-fn build_chat_edit_prompt(comp: &AicutComposition, transcript: &str, user_msg: &str) -> String {
+fn build_conversational_editor_prompt(
+    comp: &AicutComposition,
+    transcript: &str,
+    user_msg: &str,
+    has_storyboard: bool,
+) -> String {
     let scenes_json = serde_json::to_string_pretty(&comp.scenes).unwrap_or_else(|_| "[]".into());
+    let cur_html = comp.motion_html.as_deref().unwrap_or("(nenhum motion customizado ainda)");
     let recent_chat: String = comp
         .chat_history
         .iter()
         .rev()
-        .take(6)
+        .take(8)
         .rev()
         .map(|m| format!("{}: {}", m.role, m.text))
         .collect::<Vec<_>>()
         .join("\n");
+    let vis_note = if has_storyboard {
+        "O storyboard visual (4x2 frames reais do vídeo) está anexado — use o que você VÊ na imagem."
+    } else {
+        ""
+    };
 
     format!(
-        r#"Você é o Diretor de Motion & Layout do Aicut editando uma composição de Short 9:16 de {dur:.1}s.
-Aplique EXATAMENTE o pedido do usuário preservando o restante das cenas que ele não pediu para mudar.
+        r##"Você é o Editor de Vídeo & Diretor de Motion Graphics pessoal do criador no Aicut (estilo HyperFrames HTML/CSS/SVG + coreografia de câmera).
+{vis_note}
 
-Layouts válidos: "split_branded", "split_clean", "content_hero_pip", "content_fullscreen", "camera_focus", "camera_hero_pip", "callout_zoom".
-Cantos PiP válidos: "top_right", "top_left", "bottom_right", "bottom_left".
-Transições válidas: "cut", "fade", "slide_up", "wipe_left".
+IMPORTANTE — Escolha `mode` conforme a intenção da mensagem do criador:
+- Use `"mode": "discuss"` quando o criador estiver **conversando, perguntando sua opinião, pedindo sugestões ou planejando ideias** ANTES de aplicar (ex.: "o que você sugere?", "como deixamos mais dinâmico?", "qual estilo combina?"). Nesse modo, responda de forma criativa, específica para este vídeo e NÃO precisa alterar `scenes`/`motion_html`.
+- Use `"mode": "apply"` quando o criador pedir para **editar, aplicar, criar, trocar, melhorar, remover ou aprovar um plano** (ex.: "aplica isso", "faz a opção 2", "coloca um card animado quando falo o preço", "tira o flash", "dá mais ritmo"). Nesse modo, entregue `scenes` completos (0.0 .. {dur:.1}s sem lacunas) e o `motion_html` completo atualizado!
 
-Cenas atuais (JSON):
+Regras para `motion_html` (canvas 1080x1920 transparente):
+- HTML + CSS inline + SVG vetorial + opcional `<script>window.__aicutCustomSeek = function(t){{...}};</script>`.
+- Sem URLs externas; todo elemento usa `data-start`, `data-end`, `data-anim="pop|slide-up|slide-down|slide-left|slide-right|fade|scale|pulse|draw|flash"` (e opcional `data-count-from`/`data-count-to`/`data-prefix`/`data-suffix`).
+- Nunca cubra o rosto na webcam nem a faixa de legendas (y > 1480px).
+
+Layouts válidos em `scenes[].layout`: "split_branded", "split_clean", "content_hero_pip", "content_fullscreen", "camera_focus", "camera_hero_pip", "callout_zoom".
+Effects válidos em `scenes[].effects`: `camera_zoom_end` (1.0..1.25), `impact_shake` (0.0..1.0), `vignette` (bool), `color_mood` ("natural"|"vibrant"|"dramatic"|"cyber").
+
+Direção criativa atual: {cd}
+Cenas atuais (0.0s .. {dur:.1}s):
 {scenes_json}
 
-Transcrição do clipe (0.0s .. {dur:.1}s):
+Motion HTML HyperFrames atual:
+{cur_html}
+
+Transcrição do vídeo:
 {transcript}
 
-Histórico recente:
+Conversa recente:
 {recent_chat}
 
-Novo pedido do usuário:
+Nova mensagem do criador:
 "{user_msg}"
 
 Responda APENAS JSON válido:
 {{
-  "assistant_reply": "Resposta direta em PT-BR explicando exatamente o que você mudou.",
+  "mode": "apply",
+  "creative_direction": "Resumo atualizado da direção criativa",
+  "assistant_reply": "Resposta natural e colaborativa em PT-BR.",
   "burn_subtitles": {subs},
-  "scenes": [ ...array completo atualizado de 0.0 até {dur:.1}s sem lacunas... ]
-}}"#,
+  "scenes": [ ... ],
+  "motion_html": "..."
+}}"##,
         dur = comp.duration_sec,
+        cd = comp.creative_direction,
         subs = comp.burn_subtitles,
     )
 }
@@ -685,7 +824,6 @@ fn parse_time_range_ptbr(lower: &str, dur: f64) -> Option<(f64, f64)> {
         return Some(((dur - secs).max(0.0), dur));
     }
 
-    // Look for two time tokens like "0:12" and "0:20", or "10s" and "22s"
     let mut found = Vec::new();
     for raw in lower.split(|c: char| c.is_whitespace() || c == ',' || c == '-' || c == '–' || c == '→') {
         let w = raw.trim_matches(|c: char| !c.is_ascii_digit() && c != ':' && c != 's' && c != '.');
@@ -710,7 +848,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn offline_ptbr_chat_inserts_fullscreen_pip_scene_at_exact_timecode() {
+    fn offline_ptbr_chat_inserts_scene_and_hyperframes_headline() {
         let mut comp = AicutComposition {
             id: "c-test".into(),
             title: "Teste".into(),
@@ -721,11 +859,13 @@ mod tests {
             width: 1080,
             height: 1920,
             fps: 30,
-            webcam_rect: aicut_module_smart_clips::framing::NormalizedRect { x: 0.7, y: 0.65, w: 0.28, h: 0.33 },
+            webcam_rect: NormalizedRect { x: 0.7, y: 0.65, w: 0.28, h: 0.33 },
             content_rect: None,
             burn_subtitles: true,
             template_path: None,
             engine_preference: "hybrid_nvenc".into(),
+            motion_html: None,
+            creative_direction: String::new(),
             scenes: build_smart_default_scenes(30.0),
             chat_history: vec![],
             rendered_media_id: None,
@@ -737,13 +877,6 @@ mod tests {
         );
         comp.normalize();
         assert!(reply.contains("10.0s"));
-        let target = comp
-            .scenes
-            .iter()
-            .find(|s| (s.start_sec - 10.0).abs() < 0.2 && (s.end_sec - 18.0).abs() < 0.2)
-            .expect("expected inserted scene 10..18s");
-        assert_eq!(target.layout, SceneLayoutPreset::ContentHeroPip);
-        assert_eq!(target.pip.corner, PipCorner::TopLeft);
-        assert_eq!(target.overlay.headline.as_deref(), Some("OLHA O PLACAR!"));
+        assert!(comp.motion_html.as_deref().unwrap_or("").contains("OLHA O PLACAR!"));
     }
 }

@@ -1,182 +1,338 @@
-/* Motion Studio — Minimalist Dynamic Layout Editor + Live 9:16 Preview + AI Chat */
+/* Motion Studio — Minimalist AI Video Editor (Live 9:16 Stage + Conversational AI Chat) */
 
-.motion-workspace {
-  display: grid;
-  grid-template-columns: minmax(0, 1.15fr) minmax(340px, 0.95fr);
-  gap: 14px;
-  align-items: start;
+.ms-shell {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: calc(100vh - 118px);
 }
 
-@media (max-width: 1080px) {
-  .motion-workspace {
+.ms-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+}
+
+.ms-topbar-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+  flex: 1;
+}
+
+.ms-media-select {
+  max-width: 340px;
+}
+
+.ms-range-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-default);
+  background: var(--bg-surface-2);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.ms-range-input {
+  width: 48px;
+  background: transparent;
+  border: 0;
+  outline: none;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 11px;
+  text-align: center;
+}
+
+/* Main 2-column ultra-clean workspace */
+.ms-grid {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(320px, 400px) minmax(0, 1fr);
+  gap: 16px;
+  align-items: stretch;
+}
+
+@media (max-width: 980px) {
+  .ms-grid {
     grid-template-columns: 1fr;
   }
 }
 
-.motion-player-stage {
+/* LEFT: Live 9:16 Video + Synchronized HyperFrames HTML/CSS/SVG Overlay Stage */
+.ms-stage-col {
   display: flex;
   flex-direction: column;
   align-items: center;
+  justify-content: center;
   gap: 12px;
+  padding: 16px;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
 }
 
-.motion-canvas-shell {
+.ms-phone-frame {
   position: relative;
-  width: 270px;
-  height: 480px;
-  border-radius: 14px;
+  width: 288px;
+  height: 512px;
+  border-radius: 16px;
   overflow: hidden;
   border: 1.5px solid var(--border-strong);
-  background: #08090d;
-  box-shadow: 0 18px 46px rgba(0, 0, 0, 0.5);
+  background: #06070a;
+  box-shadow: 0 22px 54px rgba(0, 0, 0, 0.55);
+  flex-shrink: 0;
 }
 
-.motion-canvas {
+.ms-video-canvas {
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
   display: block;
 }
 
-.motion-playback-bar {
-  width: 100%;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 10px;
-  border-radius: var(--radius-md);
-  border: 1px solid var(--border-default);
-  background: var(--bg-surface-2);
+/* Exact 1080x1920 HyperFrames layer scaled cleanly into 288x512 (288/1080 = 0.2666667) */
+.ms-hyperframes-iframe {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1080px;
+  height: 1920px;
+  border: 0;
+  background: transparent;
+  transform: scale(0.2666667);
+  transform-origin: top left;
+  pointer-events: none;
+  z-index: 4;
 }
 
-.motion-timecode {
+.ms-empty-stage {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 24px;
+  text-align: center;
+  color: var(--text-muted);
   font-size: var(--text-xs);
+}
+
+.ms-player-controls {
+  width: 100%;
+  max-width: 320px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ms-scrubber-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ms-time {
+  font-size: 11px;
   font-variant-numeric: tabular-nums;
   color: var(--text-secondary);
   white-space: nowrap;
 }
 
-/* Interactive Multi-Scene Timeline */
-.motion-timeline {
-  width: 100%;
+/* Minimalist scene progress dots strip (no clutter!) */
+.ms-scene-bar {
   display: flex;
-  gap: 4px;
-  padding: 6px;
-  border-radius: var(--radius-md);
-  border: 1px solid var(--border-default);
-  background: var(--inset-bg);
-  min-height: 54px;
+  gap: 3px;
+  height: 5px;
+  width: 100%;
+  border-radius: 99px;
+  overflow: hidden;
 }
 
-.motion-scene-block {
-  position: relative;
-  min-width: 48px;
-  padding: 6px 8px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border-strong);
-  background: var(--bg-surface-2);
-  color: var(--text-primary);
-  text-align: left;
+.ms-scene-seg {
+  height: 100%;
+  border: 0;
+  padding: 0;
   cursor: pointer;
-  overflow: hidden;
+  background: var(--border-strong);
+  border-radius: 99px;
+  transition: background 140ms ease, opacity 140ms ease;
+  opacity: 0.55;
+}
+
+.ms-scene-seg[data-active="true"] {
+  background: var(--accent);
+  opacity: 1;
+}
+
+.ms-scene-seg:hover {
+  opacity: 0.9;
+}
+
+/* RIGHT: Full-height Conversational AI Editor Chat */
+.ms-chat-col {
   display: flex;
   flex-direction: column;
-  justify-content: space-between;
-  gap: 2px;
-  transition: border-color 140ms ease, background 140ms ease, transform 120ms ease;
-}
-
-.motion-scene-block:hover {
-  border-color: var(--accent);
-}
-
-.motion-scene-block[data-selected="true"] {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 1px var(--accent);
-  background: var(--accent-soft);
-}
-
-.motion-scene-block[data-playing="true"]::after {
-  content: "";
-  position: absolute;
-  inset: auto 0 0 0;
-  height: 3px;
-  background: var(--accent);
-}
-
-.motion-scene-block[data-layout="split_branded"] { border-top: 2px solid #eab308; }
-.motion-scene-block[data-layout="content_hero_pip"] { border-top: 2px solid #38bdf8; }
-.motion-scene-block[data-layout="content_fullscreen"] { border-top: 2px solid #06b6d4; }
-.motion-scene-block[data-layout="camera_focus"] { border-top: 2px solid #a855f7; }
-.motion-scene-block[data-layout="camera_hero_pip"] { border-top: 2px solid #ec4899; }
-.motion-scene-block[data-layout="callout_zoom"] { border-top: 2px solid #22c55e; }
-
-.motion-scene-title {
-  font-size: 11px;
-  font-weight: 600;
-  white-space: nowrap;
+  min-height: 560px;
+  max-height: calc(100vh - 178px);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
   overflow: hidden;
-  text-overflow: ellipsis;
 }
 
-.motion-scene-meta {
-  font-size: 10px;
+.ms-chat-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-surface-2);
+}
+
+.ms-chat-head-meta {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ms-chat-head-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.ms-chat-direction {
+  font-size: 11px;
   color: var(--text-muted);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-/* AI Director Chat Panel */
-.motion-chat-feed {
+.ms-chat-messages {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  max-height: 290px;
-  overflow-y: auto;
-  padding: 8px;
-  border-radius: var(--radius-md);
-  border: 1px solid var(--border-subtle);
-  background: var(--inset-bg);
+  gap: 12px;
 }
 
-.motion-msg {
-  padding: 8px 11px;
-  border-radius: var(--radius-md);
-  font-size: var(--text-xs);
-  line-height: 1.45;
-  max-width: 92%;
+.ms-chat-welcome {
+  margin: auto;
+  max-width: 440px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 12px;
+  padding: 20px 10px;
 }
 
-.motion-msg[data-role="user"] {
+.ms-chat-welcome-icon {
+  width: 52px;
+  height: 52px;
+  border-radius: 16px;
+  border: 1px solid var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent);
+  display: grid;
+  place-items: center;
+}
+
+.ms-bubble {
+  max-width: 86%;
+  padding: 10px 14px;
+  border-radius: 12px;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.ms-bubble[data-role="user"] {
   align-self: flex-end;
   background: var(--accent-soft);
   border: 1px solid var(--accent-border);
   color: var(--text-primary);
 }
 
-.motion-msg[data-role="assistant"] {
+.ms-bubble[data-role="assistant"] {
   align-self: flex-start;
   background: var(--bg-surface-2);
   border: 1px solid var(--border-default);
   color: var(--text-primary);
 }
 
-.motion-chat-input-row {
+.ms-chat-footer {
+  padding: 12px 14px;
+  border-top: 1px solid var(--border-subtle);
+  background: var(--bg-surface-2);
   display: flex;
+  flex-direction: column;
   gap: 8px;
-  align-items: center;
 }
 
-.motion-code-pre {
-  max-height: 260px;
-  overflow: auto;
-  margin: 0;
+.ms-chat-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ms-chat-input {
+  flex: 1;
+  min-width: 0;
   padding: 10px 12px;
   border-radius: var(--radius-md);
-  border: 1px solid var(--border-subtle);
-  background: #080a0e;
-  color: #cbd5e1;
+  border: 1px solid var(--border-default);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 13px;
+  outline: none;
+  transition: border-color 140ms ease;
+}
+
+.ms-chat-input:focus {
+  border-color: var(--accent);
+}
+
+.ms-code-drawer {
+  padding: 10px 14px;
+  border-top: 1px solid var(--border-subtle);
+  background: #07090d;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ms-code-pre {
+  max-height: 200px;
+  overflow: auto;
+  margin: 0;
   font-size: 11px;
   line-height: 1.45;
+  color: #cbd5e1;
   white-space: pre;
 }

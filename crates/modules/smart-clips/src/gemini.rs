@@ -464,7 +464,7 @@ async fn delete_gemini_file(http: &reqwest::Client, api_key: &str, name: &str) -
 }
 
 /// Sends an inline JPEG image + prompt to an active Gemini model and returns raw JSON text.
-pub(crate) async fn generate_with_inline_image(
+pub async fn generate_with_inline_image(
     http: &reqwest::Client,
     api_key: &str,
     model: &str,
@@ -488,9 +488,9 @@ pub(crate) async fn generate_with_inline_image(
             ]
         }],
         "generationConfig": {
-            "temperature": 0.15,
+            "temperature": 0.25,
             "responseMimeType": "application/json",
-            "maxOutputTokens": 1200
+            "maxOutputTokens": 6144
         }
     });
 

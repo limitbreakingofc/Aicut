@@ -14,7 +14,8 @@ use std::path::Path;
 use tokio::process::Command;
 use uuid::Uuid;
 
-use crate::schema::{AicutComposition, MotionScene, PipCorner, SceneLayoutPreset};
+use crate::hyperframes_render::capture_hyperframes_rgba_sequence;
+use crate::schema::{AicutComposition, MotionScene, PipCorner, SceneEffects, SceneLayoutPreset};
 
 /// Renders a full dynamic multi-scene `AicutComposition` via FFmpeg NVENC (with automatic
 /// libx264 fallback) and saves the resulting 9:16 MP4 directly to the Aicut Library.
@@ -61,8 +62,35 @@ pub async fn render_composition_to_library(
         None
     };
 
-    // Unified kinetic ASS track: animated scene headlines + badges + callout labels + karaoke subs
-    let ass_content = build_motion_ass_track(&normalized, transcript.as_ref());
+    // Capture bespoke HyperFrames HTML/CSS/SVG motion layer to transparent RGBA PNG sequence
+    // using Windows 11's built-in Chromium (Edge/Chrome) via CDP — zero extra downloads!
+    let wants_hyperframes = normalized
+        .motion_html
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+        || normalized.scenes.iter().any(|s| {
+            s.overlay.headline.is_some()
+                || s.overlay.badge.is_some()
+                || s.overlay.callout_text.is_some()
+        });
+    let hf_fps = 15u32;
+    let tmp_hf_dir = std::env::temp_dir().join(format!("aicut-hf-ovl-{short_id}"));
+    let hf_overlay_pattern = if wants_hyperframes {
+        match capture_hyperframes_rgba_sequence(&normalized, hf_fps, &tmp_hf_dir).await {
+            Ok(Some(count)) if count > 0 => Some((tmp_hf_dir.join("hf_%05d.png"), hf_fps)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    // Unified ASS track: karaoke subtitles (+ fallback kinetic headlines only if HyperFrames didn't run)
+    let ass_content = build_motion_ass_track(
+        &normalized,
+        transcript.as_ref(),
+        hf_overlay_pattern.is_none(),
+    );
     let tmp_ass = if !ass_content.is_empty() {
         let p = std::env::temp_dir().join(format!("aicut-motion-ovl-{short_id}.ass"));
         std::fs::write(&p, ass_content)?;
@@ -77,6 +105,7 @@ pub async fn render_composition_to_library(
         Path::new(&source.file_path),
         &normalized,
         resolved_template.as_ref().map(|(p, g)| (p.as_path(), *g)),
+        hf_overlay_pattern.as_ref().map(|(p, f)| (p.as_path(), *f)),
         tmp_ass.as_deref(),
         hw_encoder,
         &out_path,
@@ -89,6 +118,7 @@ pub async fn render_composition_to_library(
             Path::new(&source.file_path),
             &normalized,
             resolved_template.as_ref().map(|(p, g)| (p.as_path(), *g)),
+            hf_overlay_pattern.as_ref().map(|(p, f)| (p.as_path(), *f)),
             tmp_ass.as_deref(),
             "libx264",
             &out_path,
@@ -100,6 +130,9 @@ pub async fn render_composition_to_library(
 
     if let Some(ref p) = tmp_ass {
         let _ = std::fs::remove_file(p);
+    }
+    if tmp_hf_dir.exists() {
+        let _ = std::fs::remove_dir_all(&tmp_hf_dir);
     }
 
     // Thumbnail for Library card
@@ -163,6 +196,7 @@ pub async fn render_composition_to_library(
 pub fn build_motion_filtergraph(
     comp: &AicutComposition,
     template_geom: Option<TemplateGeometry>,
+    hf_input_idx: Option<usize>,
     ass_path: Option<&Path>,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
@@ -208,6 +242,7 @@ pub fn build_motion_filtergraph(
         let cam_crop = norm_rect_crop_expr(comp.webcam_rect);
         let content_crop = build_content_crop_expr(comp.content_rect, sc);
 
+        let fx_tail = build_scene_effects_suffix(&sc.effects);
         match sc.layout {
             SceneLayoutPreset::SplitBranded => {
                 let tc = geom.top_camera;
@@ -226,7 +261,7 @@ pub fn build_motion_filtergraph(
                 parts.push(format!("[bg{i}][cam{i}]overlay={}:{}[o1_{i}]", tc.x, tc.y));
                 parts.push(format!("[o1_{i}][cnt{i}]overlay={}:{}[o2_{i}]", bc.x, bc.y));
                 parts.push(format!(
-                    "[o2_{i}]{t_lbl}overlay=0:0:format=auto,setsar=1,format=yuv420p[sc{i}]"
+                    "[o2_{i}]{t_lbl}overlay=0:0:format=auto{fx_tail},setsar=1,format=yuv420p[sc{i}]"
                 ));
             }
             SceneLayoutPreset::SplitClean => {
@@ -236,7 +271,7 @@ pub fn build_motion_filtergraph(
                 ));
                 push_content_box(&mut parts, i, &content_crop, 1080, 1190, sc.content_focus.fit_blur);
                 parts.push(format!(
-                    "[cam{i}][cnt{i}]vstack=inputs=2,setsar=1,format=yuv420p[sc{i}]"
+                    "[cam{i}][cnt{i}]vstack=inputs=2{fx_tail},setsar=1,format=yuv420p[sc{i}]"
                 ));
             }
             SceneLayoutPreset::CameraHeroPip => {
@@ -246,18 +281,18 @@ pub fn build_motion_filtergraph(
                 ));
                 push_content_box(&mut parts, i, &content_crop, 1080, 660, sc.content_focus.fit_blur);
                 parts.push(format!(
-                    "[cam{i}][cnt{i}]vstack=inputs=2,setsar=1,format=yuv420p[sc{i}]"
+                    "[cam{i}][cnt{i}]vstack=inputs=2{fx_tail},setsar=1,format=yuv420p[sc{i}]"
                 ));
             }
             SceneLayoutPreset::CameraFocus => {
                 parts.push(format!(
-                    "[raw{i}]{cam_crop},scale=1080:1920:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1920,setsar=1,format=yuv420p[sc{i}]"
+                    "[raw{i}]{cam_crop},scale=1080:1920:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1920{fx_tail},setsar=1,format=yuv420p[sc{i}]"
                 ));
             }
             SceneLayoutPreset::ContentFullscreen => {
                 parts.push(format!("[raw{i}]null[ct{i}]"));
                 push_content_box(&mut parts, i, &content_crop, 1080, 1920, sc.content_focus.fit_blur);
-                parts.push(format!("[cnt{i}]setsar=1,format=yuv420p[sc{i}]"));
+                parts.push(format!("[cnt{i}]setsar=1{fx_tail},format=yuv420p[sc{i}]"));
             }
             SceneLayoutPreset::ContentHeroPip | SceneLayoutPreset::CalloutZoom => {
                 let pip_w = (((1080.0 * sc.pip.width_pct).round() as u32) & !1).clamp(220, 520);
@@ -287,12 +322,12 @@ pub fn build_motion_filtergraph(
                         pip_h + 12
                     ));
                     parts.push(format!(
-                        "{cnt_with_ring}[pip{i}]overlay={ox}:{oy},setsar=1,format=yuv420p[sc{i}]"
+                        "{cnt_with_ring}[pip{i}]overlay={ox}:{oy}{fx_tail},setsar=1,format=yuv420p[sc{i}]"
                     ));
                 } else {
                     parts.push(format!("[raw{i}]null[ct{i}]"));
                     push_content_box(&mut parts, i, &content_crop, 1080, 1920, sc.content_focus.fit_blur);
-                    parts.push(format!("[cnt{i}]setsar=1,format=yuv420p[sc{i}]"));
+                    parts.push(format!("[cnt{i}]setsar=1{fx_tail},format=yuv420p[sc{i}]"));
                 }
             }
         }
@@ -305,14 +340,36 @@ pub fn build_motion_filtergraph(
         parts.push(format!("{sc_ins}concat=n={n}:v=1:a=0[vlayout]"));
     }
 
+    let after_hf = if let Some(idx) = hf_input_idx {
+        parts.push(format!("[{idx}:v]scale=1080:1920,format=rgba[hf_ovl]"));
+        parts.push("[vlayout][hf_ovl]overlay=0:0:format=auto:eof_action=pass[vhf]".to_string());
+        "[vhf]"
+    } else {
+        "[vlayout]"
+    };
+
     if let Some(ass) = ass_path {
         let escaped = escape_ffmpeg_filter_path(ass);
-        parts.push(format!("[vlayout]ass='{escaped}'[vout]"));
+        parts.push(format!("{after_hf}ass='{escaped}'[vout]"));
     } else {
-        parts.push("[vlayout]null[vout]".to_string());
+        parts.push(format!("{after_hf}null[vout]"));
     }
 
     parts.join(";")
+}
+
+fn build_scene_effects_suffix(fx: &SceneEffects) -> String {
+    let mut chain = String::new();
+    match fx.color_mood.to_lowercase().as_str() {
+        "vibrant" => chain.push_str(",eq=contrast=1.06:saturation=1.22"),
+        "dramatic" => chain.push_str(",eq=contrast=1.12:brightness=-0.03:saturation=0.90"),
+        "cyber" => chain.push_str(",eq=contrast=1.08:saturation=1.25"),
+        _ => {}
+    }
+    if fx.vignette {
+        chain.push_str(",vignette=PI/4.5");
+    }
+    chain
 }
 
 fn push_content_box(
@@ -380,31 +437,36 @@ fn clean_ffmpeg_hex(hex: &str) -> String {
     }
 }
 
-/// Generates unified kinetic ASS overlay track (animated scene headlines + callout badges + karaoke subtitles).
-pub fn build_motion_ass_track(comp: &AicutComposition, transcript: Option<&TranscriptRecord>) -> String {
+/// Generates unified ASS track (karaoke subtitles + optional fallback headlines when HyperFrames RGBA didn't run).
+pub fn build_motion_ass_track(
+    comp: &AicutComposition,
+    transcript: Option<&TranscriptRecord>,
+    include_fallback_overlays: bool,
+) -> String {
     let mut events: Vec<String> = Vec::new();
 
-    // 1. Scene kinetic headlines, badges, and callouts
-    for sc in &comp.scenes {
-        let s_ts = format_ass_time(sc.start_sec);
-        let e_ts = format_ass_time(sc.end_sec);
-        if let Some(ref hl) = sc.overlay.headline.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            let safe = hl.replace('{', "(").replace('}', ")").replace('\n', " ");
-            events.push(format!(
-                "Dialogue: 2,{s_ts},{e_ts},Headline,,0,0,0,,{{\\fad(160,160)\\fscx85\\fscy85\\t(0,220,\\fscx100\\fscy100)}}{safe}"
-            ));
-        }
-        if let Some(ref badge) = sc.overlay.badge.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            let safe = badge.replace('{', "(").replace('}', ")").to_uppercase();
-            events.push(format!(
-                "Dialogue: 2,{s_ts},{e_ts},Badge,,0,0,0,,{{\\fad(120,120)}}[ {safe} ]"
-            ));
-        }
-        if let Some(ref callout) = sc.overlay.callout_text.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            let safe = callout.replace('{', "(").replace('}', ")");
-            events.push(format!(
-                "Dialogue: 2,{s_ts},{e_ts},Callout,,0,0,0,,{{\\fad(150,150)\\pos(540,620)}}{safe}"
-            ));
+    if include_fallback_overlays {
+        for sc in &comp.scenes {
+            let s_ts = format_ass_time(sc.start_sec);
+            let e_ts = format_ass_time(sc.end_sec);
+            if let Some(ref hl) = sc.overlay.headline.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                let safe = hl.replace('{', "(").replace('}', ")").replace('\n', " ");
+                events.push(format!(
+                    "Dialogue: 2,{s_ts},{e_ts},Headline,,0,0,0,,{{\\fad(160,160)\\fscx85\\fscy85\\t(0,220,\\fscx100\\fscy100)}}{safe}"
+                ));
+            }
+            if let Some(ref badge) = sc.overlay.badge.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                let safe = badge.replace('{', "(").replace('}', ")").to_uppercase();
+                events.push(format!(
+                    "Dialogue: 2,{s_ts},{e_ts},Badge,,0,0,0,,{{\\fad(120,120)}}[ {safe} ]"
+                ));
+            }
+            if let Some(ref callout) = sc.overlay.callout_text.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                let safe = callout.replace('{', "(").replace('}', ")");
+                events.push(format!(
+                    "Dialogue: 2,{s_ts},{e_ts},Callout,,0,0,0,,{{\\fad(150,150)\\pos(540,620)}}{safe}"
+                ));
+            }
         }
     }
 
@@ -435,11 +497,13 @@ pub fn build_motion_ass_track(comp: &AicutComposition, transcript: Option<&Trans
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_ffmpeg_motion_render(
     ffmpeg_bin: &Path,
     input_path: &Path,
     comp: &AicutComposition,
     template: Option<(&Path, TemplateGeometry)>,
+    hf_overlay: Option<(&Path, u32)>,
     ass_path: Option<&Path>,
     encoder: &str,
     out_path: &Path,
@@ -457,11 +521,23 @@ async fn run_ffmpeg_motion_render(
     ])
     .arg(input_path);
 
+    let mut next_input_idx = 1usize;
     if let Some((tpl_path, _)) = template {
         cmd.arg("-i").arg(tpl_path);
+        next_input_idx += 1;
     }
 
-    let filter = build_motion_filtergraph(comp, template.map(|(_, g)| g), ass_path);
+    let hf_input_idx = if let Some((pattern_path, hf_fps)) = hf_overlay {
+        cmd.args(["-framerate", &hf_fps.to_string(), "-i"]).arg(pattern_path);
+        let idx = next_input_idx;
+        next_input_idx += 1;
+        let _ = next_input_idx;
+        Some(idx)
+    } else {
+        None
+    };
+
+    let filter = build_motion_filtergraph(comp, template.map(|(_, g)| g), hf_input_idx, ass_path);
     cmd.args(["-filter_complex", &filter, "-map", "[vout]", "-map", "[abase]"]);
 
     match encoder {
@@ -579,6 +655,8 @@ mod tests {
             burn_subtitles: false,
             template_path: None,
             engine_preference: "hybrid_nvenc".into(),
+            motion_html: None,
+            creative_direction: String::new(),
             scenes: vec![
                 MotionScene {
                     id: "s1".into(),
@@ -593,6 +671,7 @@ mod tests {
                         headline: Some("INACREDITÁVEL!".into()),
                         ..Default::default()
                     },
+                    effects: SceneEffects { vignette: true, color_mood: "vibrant".into(), ..Default::default() },
                     rationale: String::new(),
                     custom_code: None,
                 },
@@ -606,6 +685,7 @@ mod tests {
                     pip: PipConfig::default(),
                     content_focus: ContentFocusConfig::default(),
                     overlay: SceneOverlay::default(),
+                    effects: SceneEffects::default(),
                     rationale: String::new(),
                     custom_code: None,
                 },
@@ -622,6 +702,7 @@ mod tests {
                         badge: Some("DESTAQUE".into()),
                         ..Default::default()
                     },
+                    effects: SceneEffects::default(),
                     rationale: String::new(),
                     custom_code: None,
                 },
@@ -631,12 +712,14 @@ mod tests {
             updated_at: Utc::now().to_rfc3339(),
         };
 
-        let fg = build_motion_filtergraph(&comp, Some(TemplateGeometry::default()), None);
+        let fg = build_motion_filtergraph(&comp, Some(TemplateGeometry::default()), Some(2), None);
         assert!(fg.contains("[vbase]split=3[vs0][vs1][vs2]"));
         assert!(fg.contains("concat=n=3:v=1:a=0[vlayout]"));
         assert!(fg.contains("[tpl0]overlay=0:0:format=auto"));
+        assert!(fg.contains("[2:v]scale=1080:1920,format=rgba[hf_ovl]"));
+        assert!(fg.contains("vignette=PI/4.5"));
 
-        let ass = build_motion_ass_track(&comp, None);
+        let ass = build_motion_ass_track(&comp, None, true);
         assert!(ass.contains("INACREDITÁVEL!"));
         assert!(ass.contains("[ DESTAQUE ]"));
     }
