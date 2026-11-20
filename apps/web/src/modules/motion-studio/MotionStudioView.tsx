@@ -8,6 +8,7 @@ import {
   Loader2,
   Pause,
   Play,
+  Scissors,
   Send,
   Sparkles,
   Wand2,
@@ -24,6 +25,8 @@ import type {
   NormalizedRect,
   NotifyFn,
   RouteId,
+  SmartClipPlan,
+  SmartClipRun,
   ToolStatus,
 } from "../../lib/types";
 import { copyToClipboard } from "../../lib/ui";
@@ -31,6 +34,8 @@ import { ActiveJobsPanel, Badge, BusyIcon, Callout, EmptyState } from "../../com
 import "./motion-studio.css";
 
 export interface MotionSeed {
+  runId?: string;
+  clipId?: string;
   mediaId: string;
   startSec?: number;
   endSec?: number;
@@ -46,6 +51,18 @@ interface MotionStudioViewProps {
   onSelectMedia: (mediaId: string) => void;
   onNotify: NotifyFn;
   onRefreshMedia: () => Promise<void>;
+}
+
+interface PlanClipOption {
+  key: string;
+  runId: string;
+  runTitle: string;
+  mediaId: string;
+  clip: SmartClipPlan;
+  index: number;
+  startSec: number;
+  endSec: number;
+  durationSec: number;
 }
 
 const DEFAULT_WEBCAM_RECT: NormalizedRect = { x: 0.7, y: 0.64, w: 0.28, h: 0.33 };
@@ -135,6 +152,23 @@ function computeZoomedContentRect(base: NormalizedRect | null | undefined, sc: M
   };
 }
 
+function buildPlanClipGoal(opt: PlanClipOption, userPrompt?: string): string {
+  const parts: string[] = [
+    `Corte selecionado do Plano de Cortes: "${opt.clip.title}" (${formatDuration(opt.startSec)} → ${formatDuration(opt.endSec)}).`,
+  ];
+  if (opt.clip.hook_first_5s) parts.push(`Gancho inicial (5s): ${opt.clip.hook_first_5s}`);
+  if (opt.clip.visual_evidence) parts.push(`O que acontece visualmente: ${opt.clip.visual_evidence}`);
+  if (opt.clip.narrative_arc.beginning || opt.clip.narrative_arc.middle || opt.clip.narrative_arc.end) {
+    parts.push(
+      `Arco narrativo: Início="${opt.clip.narrative_arc.beginning}" | Meio="${opt.clip.narrative_arc.middle}" | Fim="${opt.clip.narrative_arc.end}".`,
+    );
+  }
+  if (userPrompt && userPrompt.trim()) {
+    parts.push(`Pedido do criador: ${userPrompt.trim()}`);
+  }
+  return parts.join("\n");
+}
+
 type VideoStatus = "loading" | "proxy" | "ready" | "error";
 
 export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
@@ -147,12 +181,12 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
   onNotify,
   onRefreshMedia,
 }) => {
-  const videoMedia = useMemo(() => media.filter((m) => m.kind === "video" || m.kind === "video_only"), [media]);
   const ffmpegTool = tools.find((t) => t.id === "ffmpeg");
 
-  const [selectedMediaId, setSelectedMediaId] = useState<string>(seed?.mediaId ?? videoMedia[0]?.id ?? "");
-  const [clipStart, setClipStart] = useState<number>(seed?.startSec ?? 0);
-  const [clipEnd, setClipEnd] = useState<number>(seed?.endSec ?? 45);
+  // Clip plans loaded directly from Cortes Shorts (Plano de Cortes)
+  const [runs, setRuns] = useState<SmartClipRun[]>([]);
+  const [loadingRuns, setLoadingRuns] = useState<boolean>(true);
+  const [selectedClipKey, setSelectedClipKey] = useState<string>("");
 
   const [comp, setComp] = useState<AicutComposition | null>(null);
   const [savedFraming, setSavedFraming] = useState<{ webcam: NormalizedRect; content: NormalizedRect | null }>({
@@ -177,61 +211,107 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
-  // Live refs used by 60fps requestAnimationFrame loop (prevents tearing down RAF on every frame!)
   const compRef = useRef<AicutComposition | null>(null);
   const framingRef = useRef(savedFraming);
-  const rangeRef = useRef({ start: clipStart, end: clipEnd });
+  const clipBoundsRef = useRef({ start: 0, duration: 30 });
   const relTimeRef = useRef<number>(0);
   const lastUiSyncRef = useRef<number>(-1);
   const lastIframeSeekRef = useRef<number>(-1);
-
-  compRef.current = comp;
-  framingRef.current = savedFraming;
-  rangeRef.current = { start: clipStart, end: clipEnd };
-
-  const activeMediaId = comp?.media_id ?? selectedMediaId;
-  const activeAsset = useMemo(
-    () => videoMedia.find((m) => m.id === activeMediaId) ?? null,
-    [videoMedia, activeMediaId],
-  );
-  const effectiveStart = comp ? comp.clip_start_sec : clipStart;
-  const effectiveDuration = comp
-    ? comp.duration_sec
-    : Math.max(1, (clipEnd > clipStart ? clipEnd : activeAsset?.metadata.duration_sec ?? 45) - clipStart);
 
   const activeMotionJobs = jobs.filter(
     (j) => j.kind === "motion.render" && (j.status === "queued" || j.status === "running"),
   );
 
-  // Sync seed when coming from Smart Clips
+  // Load all Plano de Cortes runs
   useEffect(() => {
-    if (!seed?.mediaId) return;
-    setSelectedMediaId(seed.mediaId);
-    if (seed.startSec !== undefined) setClipStart(Math.floor(seed.startSec));
-    if (seed.endSec !== undefined) setClipEnd(Math.ceil(seed.endSec));
-  }, [seed]);
+    let alive = true;
+    setLoadingRuns(true);
+    void runAction<{ runs: SmartClipRun[] }>("clips.runs_list")
+      .then((res) => {
+        if (!alive) return;
+        setRuns(res.data.runs ?? []);
+      })
+      .catch(() => {
+        if (alive) setRuns([]);
+      })
+      .finally(() => {
+        if (alive) setLoadingRuns(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [media.length, seed?.runId, seed?.clipId]);
 
+  const planClips = useMemo<PlanClipOption[]>(() => {
+    const out: PlanClipOption[] = [];
+    for (const run of runs) {
+      run.clips.forEach((clip, idx) => {
+        if (!clip.segments || clip.segments.length === 0) return;
+        const startSec = clip.segments[0].start_sec;
+        const endSec = clip.segments[clip.segments.length - 1].end_sec;
+        const durationSec = Math.max(1, endSec - startSec);
+        out.push({
+          key: `${run.id}:${clip.id}`,
+          runId: run.id,
+          runTitle: run.media_title,
+          mediaId: run.media_id,
+          clip,
+          index: idx + 1,
+          startSec,
+          endSec,
+          durationSec,
+        });
+      });
+    }
+    return out;
+  }, [runs]);
+
+  // Select clip from seed (when arriving from Cortes Shorts -> Motion IA) or default to first clip
   useEffect(() => {
-    if (!selectedMediaId && videoMedia.length > 0) {
-      setSelectedMediaId(videoMedia[0].id);
-      const dur = videoMedia[0].metadata.duration_sec;
-      if (dur) {
-        setClipStart(0);
-        setClipEnd(Math.min(60, Math.floor(dur)));
+    if (planClips.length === 0) {
+      setSelectedClipKey("");
+      return;
+    }
+    if (seed?.runId && seed?.clipId) {
+      const exactKey = `${seed.runId}:${seed.clipId}`;
+      if (planClips.some((c) => c.key === exactKey)) {
+        setSelectedClipKey(exactKey);
+        return;
       }
     }
-  }, [selectedMediaId, videoMedia]);
+    if (seed?.mediaId && seed.startSec !== undefined) {
+      const byRange = planClips.find(
+        (c) => c.mediaId === seed.mediaId && Math.abs(c.startSec - seed.startSec!) < 1.5,
+      );
+      if (byRange) {
+        setSelectedClipKey(byRange.key);
+        return;
+      }
+    }
+    setSelectedClipKey((curr) => (curr && planClips.some((c) => c.key === curr) ? curr : planClips[0].key));
+  }, [planClips, seed]);
 
-  // Reset proxy fallback & load saved framing + latest composition whenever media changes
+  const activePlanClip = useMemo(
+    () => planClips.find((c) => c.key === selectedClipKey) ?? planClips[0] ?? null,
+    [planClips, selectedClipKey],
+  );
+
+  const activeMediaId = activePlanClip?.mediaId ?? "";
+  const effectiveStart = comp ? comp.clip_start_sec : (activePlanClip?.startSec ?? 0);
+  const effectiveDuration = comp ? comp.duration_sec : (activePlanClip?.durationSec ?? 30);
+
+  compRef.current = comp;
+  framingRef.current = savedFraming;
+  clipBoundsRef.current = { start: effectiveStart, duration: effectiveDuration };
+
+  // Reset proxy fallback & load saved framing when source video changes
   useEffect(() => {
-    if (!selectedMediaId) return;
+    if (!activeMediaId) return;
     setUseProxyVideo(false);
     setVideoStatus("loading");
     setPlaying(false);
-    relTimeRef.current = 0;
-    setRelTime(0);
 
-    void runAction<FramingGetOutput>("clips.framing_get", { media_id: selectedMediaId })
+    void runAction<FramingGetOutput>("clips.framing_get", { media_id: activeMediaId })
       .then((res) => {
         const p = res.data.active_profile;
         setSavedFraming({
@@ -240,23 +320,50 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
         });
       })
       .catch(() => {});
+  }, [activeMediaId]);
 
-    void runAction<{ compositions: AicutComposition[] }>("motion.list", { media_id: selectedMediaId })
+  // Load composition matching THIS EXACT clip from the Plano de Cortes (never hijack with another clip!)
+  useEffect(() => {
+    if (!activePlanClip) {
+      setComp(null);
+      setLiveHtmlDoc("");
+      return;
+    }
+    relTimeRef.current = 0;
+    lastUiSyncRef.current = 0;
+    setRelTime(0);
+    if (videoRef.current && videoRef.current.readyState >= 1) {
+      try {
+        videoRef.current.pause();
+        videoRef.current.currentTime = activePlanClip.startSec;
+      } catch {
+        // ignore
+      }
+    }
+
+    let alive = true;
+    void runAction<{ compositions: AicutComposition[] }>("motion.list", { media_id: activePlanClip.mediaId })
       .then((res) => {
+        if (!alive) return;
         const list = res.data.compositions ?? [];
-        if (list.length > 0) {
-          setComp(list[0]);
-          setClipStart(Math.floor(list[0].clip_start_sec));
-          setClipEnd(Math.ceil(list[0].clip_end_sec));
-          relTimeRef.current = 0;
-          setRelTime(0);
-        } else {
+        const matched = list.find(
+          (c) =>
+            Math.abs(c.clip_start_sec - activePlanClip.startSec) < 1.5 &&
+            Math.abs(c.clip_end_sec - activePlanClip.endSec) < 1.5,
+        );
+        setComp(matched ?? null);
+        if (!matched) setLiveHtmlDoc("");
+      })
+      .catch(() => {
+        if (alive) {
           setComp(null);
           setLiveHtmlDoc("");
         }
-      })
-      .catch(() => {});
-  }, [selectedMediaId]);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [activePlanClip?.key]);
 
   // Fetch wrapped live HyperFrames HTML document whenever composition updates
   useEffect(() => {
@@ -283,7 +390,7 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
     iframeRef.current?.contentWindow?.postMessage({ type: "aicut_seek", time: t }, "*");
   }, []);
 
-  // Seek video cleanly whenever clip start changes on loaded video
+  // Seek video cleanly whenever active clip start changes
   useEffect(() => {
     const v = videoRef.current;
     if (!v || v.readyState < 1) return;
@@ -291,7 +398,7 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
       try {
         v.currentTime = effectiveStart + relTimeRef.current;
       } catch {
-        // ignore seek before metadata
+        // ignore
       }
     }
   }, [effectiveStart]);
@@ -306,24 +413,19 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
       if (canvas) {
         const ctx = canvas.getContext("2d");
         if (ctx) {
-          const startSec = curComp ? curComp.clip_start_sec : rangeRef.current.start;
-          const durSec = curComp
-            ? curComp.duration_sec
-            : Math.max(1, (rangeRef.current.end > rangeRef.current.start ? rangeRef.current.end : 45) - rangeRef.current.start);
+          const { start: startSec, duration: durSec } = clipBoundsRef.current;
           const endSec = startSec + durSec;
 
           let curRel = relTimeRef.current;
-          if (video && video.readyState >= 1) {
-            if (!video.paused) {
-              if (video.currentTime < startSec || video.currentTime >= endSec) {
-                video.currentTime = startSec;
-              }
-              curRel = Math.max(0, Math.min(durSec, video.currentTime - startSec));
-              relTimeRef.current = curRel;
-              if (Math.abs(curRel - lastUiSyncRef.current) >= 0.06) {
-                lastUiSyncRef.current = curRel;
-                setRelTime(curRel);
-              }
+          if (video && video.readyState >= 1 && !video.paused) {
+            if (video.currentTime < startSec || video.currentTime >= endSec) {
+              video.currentTime = startSec;
+            }
+            curRel = Math.max(0, Math.min(durSec, video.currentTime - startSec));
+            relTimeRef.current = curRel;
+            if (Math.abs(curRel - lastUiSyncRef.current) >= 0.06) {
+              lastUiSyncRef.current = curRel;
+              setRelTime(curRel);
             }
           }
 
@@ -438,7 +540,7 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
                 ctx.fillRect(0, 0, W, H);
               }
             } else {
-              // Live instant preview BEFORE AI edits: show the selected video in SMOKING33 framing!
+              // Instant live preview of the selected Plano de Cortes cut before AI edits it
               const bg = ctx.createLinearGradient(0, 0, 0, H);
               bg.addColorStop(0, "#1d0f2e");
               bg.addColorStop(1, "#181022");
@@ -447,7 +549,7 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
               ctx.fillStyle = "#e8bd52";
               ctx.font = "700 11px monospace";
               ctx.textAlign = "center";
-              ctx.fillText("PREVIEW ORIGINAL", W / 2, 24);
+              ctx.fillText("CORTE DO PLANO", W / 2, 24);
 
               const tx = 30 * sx, ty = 150 * sy, tw = 1020 * sx, th = 582 * sy;
               const bx = 30 * sx, by = 765 * sy, bw = 1020 * sx, bh = 889 * sy;
@@ -511,7 +613,6 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
         .play()
         .then(() => setPlaying(true))
         .catch(() => {
-          // If autoplay with audio was blocked, retry muted
           v.muted = true;
           void v.play().then(() => setPlaying(true)).catch(() => {});
         });
@@ -523,7 +624,6 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
 
   const handleVideoError = () => {
     if (!useProxyVideo && activeMediaId) {
-      // Source format (e.g. MKV/HEVC/AV1) isn't natively playable in WebView2 -> auto-switch to H.264 preview proxy!
       setUseProxyVideo(true);
       setVideoStatus("proxy");
     } else {
@@ -532,15 +632,15 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
   };
 
   const handleAutoEditWithAi = async (customGoal?: string) => {
-    if (!selectedMediaId) return;
+    if (!activePlanClip) return;
     setPlanning(true);
     try {
       const res = await runAction<{ composition: AicutComposition; assistant_reply: string }>("motion.plan", {
-        media_id: selectedMediaId,
-        clip_start_sec: clipStart,
-        clip_end_sec: clipEnd > clipStart + 1 ? clipEnd : undefined,
-        title: seed?.title,
-        goal: customGoal,
+        media_id: activePlanClip.mediaId,
+        clip_start_sec: activePlanClip.startSec,
+        clip_end_sec: activePlanClip.endSec,
+        title: activePlanClip.clip.title,
+        goal: buildPlanClipGoal(activePlanClip, customGoal),
       });
       setComp(res.data.composition);
       relTimeRef.current = 0;
@@ -550,7 +650,7 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
       }
     } catch (e) {
       const msg = e instanceof AicutActionError ? e.message : (e as Error).message;
-      onNotify("error", "Erro ao analisar vídeo", msg);
+      onNotify("error", "Erro ao analisar corte", msg);
     } finally {
       setPlanning(false);
     }
@@ -609,15 +709,15 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
 
   const activeScene = activeSceneIndex >= 0 && comp ? comp.scenes[activeSceneIndex] : null;
 
-  if (videoMedia.length === 0) {
+  if (!loadingRuns && planClips.length === 0) {
     return (
       <EmptyState
-        icon={Film}
-        title="nenhum vídeo na Biblioteca"
-        description="Baixe ou importe um vídeo para conversar com a IA e criar uma edição personalizada."
+        icon={Scissors}
+        title="nenhum corte no Plano de Cortes"
+        description="O Motion Studio edita a partir de um corte gerado no Plano de Cortes. Gere um plano em Cortes Shorts e selecione o corte que deseja editar."
         actions={
-          <button type="button" className="btn btn-primary" onClick={() => onNavigate("ingest")}>
-            Baixar & Importar
+          <button type="button" className="btn btn-primary" onClick={() => onNavigate("smart-clips")}>
+            Ir para Cortes Shorts
           </button>
         }
       />
@@ -632,51 +732,38 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
 
   return (
     <div className="ms-shell">
-      {/* Ultra-minimalist single top bar */}
+      {/* Ultra-minimalist top bar: select cut straight from Plano de Cortes */}
       <header className="ms-topbar">
         <div className="ms-topbar-left">
           <select
             className="select select-sm ms-media-select"
-            aria-label="Vídeo para editar"
-            value={selectedMediaId}
-            onChange={(e) => {
-              const mid = e.target.value;
-              setSelectedMediaId(mid);
-              const m = videoMedia.find((x) => x.id === mid);
-              if (m?.metadata.duration_sec) {
-                setClipStart(0);
-                setClipEnd(Math.min(60, Math.floor(m.metadata.duration_sec)));
-              }
-            }}
+            aria-label="Corte do Plano de Cortes"
+            value={activePlanClip?.key ?? ""}
+            onChange={(e) => setSelectedClipKey(e.target.value)}
           >
-            {videoMedia.map((m) => (
-              <option key={m.id} value={m.id}>
-                {m.title}
-                {m.metadata.duration_sec ? ` (${formatDuration(m.metadata.duration_sec)})` : ""}
-              </option>
-            ))}
+            {runs.map((run) => {
+              const validClips = run.clips
+                .map((clip, idx) => ({ clip, idx }))
+                .filter(({ clip }) => clip.segments && clip.segments.length > 0);
+              if (validClips.length === 0) return null;
+              return (
+                <optgroup key={run.id} label={`Plano: ${run.media_title}`}>
+                  {validClips.map(({ clip, idx }) => (
+                    <option key={`${run.id}:${clip.id}`} value={`${run.id}:${clip.id}`}>
+                      #{String(idx + 1).padStart(2, "0")} {clip.title} ({formatDuration(clip.total_duration_sec)})
+                    </option>
+                  ))}
+                </optgroup>
+              );
+            })}
           </select>
 
-          <span className="ms-range-pill" title="Trecho em segundos">
-            <input
-              type="number"
-              min={0}
-              className="ms-range-input"
-              value={clipStart}
-              onChange={(e) => setClipStart(Math.max(0, Number(e.target.value)))}
-              aria-label="Início (s)"
-            />
-            <span>s →</span>
-            <input
-              type="number"
-              min={1}
-              className="ms-range-input"
-              value={clipEnd}
-              onChange={(e) => setClipEnd(Math.max(1, Number(e.target.value)))}
-              aria-label="Fim (s)"
-            />
-            <span>s</span>
-          </span>
+          {activePlanClip && (
+            <span className="ms-range-pill" title="Trecho exato do Plano de Cortes">
+              {formatDuration(activePlanClip.startSec)} → {formatDuration(activePlanClip.endSec)} ·{" "}
+              {formatDuration(activePlanClip.durationSec)}
+            </span>
+          )}
         </div>
 
         <div className="row gap-xs">
@@ -721,7 +808,7 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
             </button>
           }
         >
-          Instale o FFmpeg em Configurações → Ferramentas para que a IA assista e renderize o vídeo.
+          Instale o FFmpeg em Configurações → Ferramentas para que a IA assista e renderize o corte.
         </Callout>
       )}
 
@@ -729,7 +816,7 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
 
       {/* Minimalist 2-Zone Studio: Live 9:16 Preview + Conversational AI Editor */}
       <div className="ms-grid">
-        {/* LEFT: Clean 9:16 Live Preview (Video Choreography + Live HyperFrames HTML/CSS/SVG Overlay) */}
+        {/* LEFT: Clean 9:16 Live Preview */}
         <section className="ms-stage-col" aria-label="Preview ao vivo">
           {videoSrc && (
             <video
@@ -756,7 +843,13 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
             />
           )}
 
-          <div className="ms-phone-frame" onClick={togglePlay} role="button" tabIndex={0} aria-label={playing ? "Pausar preview" : "Reproduzir preview"}>
+          <div
+            className="ms-phone-frame"
+            onClick={togglePlay}
+            role="button"
+            tabIndex={0}
+            aria-label={playing ? "Pausar preview" : "Reproduzir preview"}
+          >
             <canvas ref={canvasRef} width={288} height={512} className="ms-video-canvas" />
             {comp && liveHtmlDoc && (
               <iframe
@@ -774,7 +867,7 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
                 <span>
                   {videoStatus === "proxy"
                     ? "Convertendo preview compatível (MKV/HEVC)…"
-                    : "Carregando vídeo…"}
+                    : "Carregando corte…"}
                 </span>
               </div>
             )}
@@ -852,20 +945,26 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
                 <span>Editora IA · HyperFrames</span>
                 {comp && <Badge tone="accent">{comp.scenes.length} cenas</Badge>}
               </div>
-              {comp?.creative_direction && (
+              {comp?.creative_direction ? (
                 <span className="ms-chat-direction" title={comp.creative_direction}>
                   {comp.creative_direction}
                 </span>
+              ) : (
+                activePlanClip && (
+                  <span className="ms-chat-direction" title={activePlanClip.clip.hook_first_5s || activePlanClip.clip.title}>
+                    {activePlanClip.clip.title}
+                  </span>
+                )
               )}
             </div>
             <button
               type="button"
               className="btn btn-sm"
-              disabled={planning || !selectedMediaId}
+              disabled={planning || !activePlanClip}
               onClick={() => void handleAutoEditWithAi()}
             >
               <BusyIcon busy={planning} icon={Sparkles} size={13} />
-              {comp ? "Reanalisar vídeo" : "Editar com IA"}
+              {comp ? "Reanalisar corte" : "Editar com IA"}
             </button>
           </div>
 
@@ -875,19 +974,20 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
                 <div className="ms-chat-welcome-icon">
                   <Sparkles size={24} aria-hidden />
                 </div>
-                <strong className="text-sm">Sua editora de vídeo em código motion</strong>
+                <strong className="text-sm">{activePlanClip?.clip.title ?? "Editora IA em código motion"}</strong>
                 <p className="secondary text-xs">
-                  Eu assisto aos frames e leio o que você fala neste vídeo para criar técnicas de edição e animações
-                  HyperFrames sob medida — ou podemos planejar juntos por aqui antes de aplicar.
+                  {activePlanClip?.clip.hook_first_5s
+                    ? `Gancho do plano: "${activePlanClip.clip.hook_first_5s}" — Eu assisto aos frames deste corte e crio técnicas de edição e animações HyperFrames sob medida, ou podemos planejar juntos por aqui.`
+                    : "Eu assisto aos frames e leio o que você fala neste corte do Plano de Cortes para aplicar técnicas de edição e animações HyperFrames sob medida."}
                 </p>
                 <button
                   type="button"
                   className="btn btn-primary"
-                  disabled={planning || !selectedMediaId}
+                  disabled={planning || !activePlanClip}
                   onClick={() => void handleAutoEditWithAi()}
                 >
                   <BusyIcon busy={planning} icon={Wand2} size={14} />
-                  {planning ? "Assistindo ao vídeo e criando edição…" : "Assistir vídeo e criar edição automática"}
+                  {planning ? "Assistindo ao corte e criando edição…" : "Assistir corte e criar edição automática"}
                 </button>
               </div>
             ) : (
@@ -899,7 +999,7 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
                 ))}
                 {(chatSending || planning) && (
                   <div className="ms-bubble" data-role="assistant">
-                    <span className="muted">Assistindo ao vídeo e preparando a edição…</span>
+                    <span className="muted">Assistindo ao corte e preparando a edição…</span>
                   </div>
                 )}
                 <div ref={chatEndRef} />
@@ -907,7 +1007,6 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
             )}
           </div>
 
-          {/* Optional hidden-by-default code peek */}
           {showCode && liveHtmlDoc && (
             <div className="ms-code-drawer">
               <div className="row row-between">
@@ -929,15 +1028,15 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
               <input
                 type="text"
                 className="ms-chat-input"
-                placeholder="Converse com a IA: planeje ideias, peça animações específicas ou melhore qualquer momento…"
+                placeholder="Converse com a IA sobre este corte: planeje ideias ou peça animações específicas…"
                 value={chatInput}
                 onChange={(e) => setChatInput(e.target.value)}
-                disabled={chatSending || planning}
+                disabled={chatSending || planning || !activePlanClip}
               />
               <button
                 type="submit"
                 className="btn btn-primary"
-                disabled={chatSending || planning || !chatInput.trim()}
+                disabled={chatSending || planning || !chatInput.trim() || !activePlanClip}
               >
                 <BusyIcon busy={chatSending || planning} icon={Send} size={14} />
               </button>

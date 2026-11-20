@@ -83,7 +83,8 @@ jobs:
           body: |
             ## Aicut ${{ steps.tag.outputs.name }} — Estúdio Modular AI-First para Windows 11
 
-            ### Novidades da v0.9.0 — Revisão Completa da Interface em Abas por Categoria (Zero Redundância)
+            ### Novidades da v0.9.1 — Interface Reorganizada em Abas Sem Redundância + Motion Studio Integrado ao Plano de Cortes
+            - **Motion Studio conectado diretamente ao Plano de Cortes:** agora o Motion Studio seleciona diretamente um corte gerado nos seus Planos de Corte (agrupados por plano, com timecode exato automático e zero campos manuais de segundos), herda automaticamente o gancho/evidência visual/arco narrativo do corte para a IA editora e carrega a composição/conversa exata de cada corte separadamente.
             - **Menu Lateral Limpo (5 abas do Estúdio + Configurações fixa embaixo):** eliminados os 4 itens duplicados do menu lateral (`Enquadramento`, `Fila de Tarefas`, `Módulos`, `Conectar IA`). Agora são apenas **Importar (`Alt+1`)**, **Biblioteca (`Alt+2`)**, **Transcrever (`Alt+3`)**, **Cortes Shorts (`Alt+4`)**, **Motion Studio (`Alt+5`)** e **Configurações (`Alt+6`)** isolada no rodapé.
             - **Topbar e Barra de Status sem menus repetidos:** removidos botões duplicados de Tema, Atalhos, Biblioteca, MCP e Ctrl+K que apareciam repetidos em múltiplos lugares, além dos cabeçalhos duplicados (`PageHeader`) em cima das abas.
             - **`Configurações` unificada em 6 abas (1 aba = 1 categoria):**

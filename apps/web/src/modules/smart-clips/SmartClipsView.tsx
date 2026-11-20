@@ -59,7 +59,14 @@ interface SmartClipsViewProps {
   onNavigate: (route: RouteId) => void;
   onOpenSettingsTab: (tab: SettingsTabId) => void;
   onSelectMedia: (mediaId: string) => void;
-  onOpenInMotionStudio?: (seed: { mediaId: string; startSec?: number; endSec?: number; title?: string }) => void;
+  onOpenInMotionStudio?: (seed: {
+    runId: string;
+    clipId: string;
+    mediaId: string;
+    startSec: number;
+    endSec: number;
+    title: string;
+  }) => void;
   onNotify: NotifyFn;
   onRefreshMedia: () => Promise<void>;
 }
@@ -238,8 +245,8 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
   const activeProvider = config?.default_provider === "local_free" ? "local_free" : "gemini";
   const providerReady = activeProvider === "gemini" ? Boolean(config?.gemini_configured) : true;
   const activeRun = runs.find((r) => r.id === activeRunId) ?? runs[0] ?? null;
-  const resolvedTranscript = mediaContext?.transcript ?? null;
-  const relatedCount = mediaContext?.related_media.length ?? 0;
+  const resolvedTranscript = mediaContext?.resolved_transcript ?? null;
+  const relatedCount = mediaContext?.related_assets.length ?? 0;
   const currentLayout = SHORTS_LAYOUTS.find((l) => l.id === layout) ?? SHORTS_LAYOUTS[0];
   const isSplit = layout === "template_split" || layout === "gaming_split";
 
@@ -343,6 +350,8 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
         icon: Layers,
         onSelect: () =>
           onOpenInMotionStudio({
+            runId: run.id,
+            clipId: clip.id,
             mediaId: run.media_id,
             startSec: clip.segments[0].start_sec,
             endSec: clip.segments[clip.segments.length - 1].end_sec,
@@ -645,6 +654,8 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
                         title="Editar layouts dinâmicos e animações no Motion Studio"
                         onClick={() =>
                           onOpenInMotionStudio({
+                            runId: activeRun.id,
+                            clipId: clip.id,
                             mediaId: activeRun.media_id,
                             startSec: clip.segments[0].start_sec,
                             endSec: clip.segments[clip.segments.length - 1].end_sec,
