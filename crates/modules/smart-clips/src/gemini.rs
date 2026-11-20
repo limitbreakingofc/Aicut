@@ -681,18 +681,19 @@ pub async fn list_ranked_gemini_models(
     rank_gemini_fallback_chain(&available, requested_director)
 }
 
+fn push_unique_model(ranked: &mut Vec<String>, id: String) {
+    if !id.is_empty() && !ranked.iter().any(|x| x == &id) {
+        ranked.push(id);
+    }
+}
+
 pub fn rank_gemini_fallback_chain(available: &[String], requested_director: &str) -> Vec<String> {
     let mut ranked: Vec<String> = Vec::new();
-    let mut push_unique = |id: String| {
-        if !id.is_empty() && !ranked.iter().any(|x| x == &id) {
-            ranked.push(id);
-        }
-    };
 
     if available.is_empty() {
         let req = requested_director.trim().trim_start_matches("models/");
         if !req.is_empty() && !req.eq_ignore_ascii_case("auto") {
-            push_unique(req.to_string());
+            push_unique_model(&mut ranked, req.to_string());
         }
         for fallback in [
             "gemini-2.5-flash",
@@ -701,7 +702,7 @@ pub fn rank_gemini_fallback_chain(available: &[String], requested_director: &str
             "gemini-3.8-pro",
             "gemini-2.5-flash-lite",
         ] {
-            push_unique(fallback.to_string());
+            push_unique_model(&mut ranked, fallback.to_string());
         }
         return ranked;
     }
@@ -709,7 +710,7 @@ pub fn rank_gemini_fallback_chain(available: &[String], requested_director: &str
     let req = requested_director.trim().trim_start_matches("models/");
     if !req.is_empty() && !req.eq_ignore_ascii_case("auto") {
         if available.iter().any(|m| m == req) {
-            push_unique(req.to_string());
+            push_unique_model(&mut ranked, req.to_string());
         }
     }
 
@@ -723,13 +724,13 @@ pub fn rank_gemini_fallback_chain(available: &[String], requested_director: &str
     // Interleave best Pro, best Flash, older stable Flash/Pro, and Flash-Lite so a 503 on
     // one tier/version immediately tries a different version/tier.
     if let Some(best_flash) = pick_best_gemini_model(&sorted, true) {
-        push_unique(best_flash);
+        push_unique_model(&mut ranked, best_flash);
     }
     if let Some(best_pro) = pick_best_gemini_model(&sorted, false) {
-        push_unique(best_pro);
+        push_unique_model(&mut ranked, best_pro);
     }
     for m in sorted {
-        push_unique(m);
+        push_unique_model(&mut ranked, m);
         if ranked.len() >= 6 {
             break;
         }

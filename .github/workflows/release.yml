@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v0.1.0)"
+        description: "Release tag (e.g. v0.9.4)"
         required: false
-        default: "v0.1.0"
+        default: "v0.9.4"
 
 permissions:
   contents: write
@@ -67,14 +67,13 @@ jobs:
           if ($env:GITHUB_REF_TYPE -eq "tag") {
             echo "name=$env:GITHUB_REF_NAME" >> $env:GITHUB_OUTPUT
           } else {
-            echo "name=${{ inputs.tag || 'v0.1.0' }}" >> $env:GITHUB_OUTPUT
+            echo "name=${{ inputs.tag || 'v0.9.4' }}" >> $env:GITHUB_OUTPUT
           }
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.name }}
-          # Manual runs: create the tag on the commit that was actually built (not the default branch)
           target_commitish: ${{ github.sha }}
           name: "Aicut ${{ steps.tag.outputs.name }} (Windows 11)"
           generate_release_notes: true
@@ -83,125 +82,15 @@ jobs:
           body: |
             ## Aicut ${{ steps.tag.outputs.name }} — Estúdio Modular AI-First para Windows 11
 
-            ### Novidades & Correções da v0.9.3 — Detector Real de Conteúdo Pausado + Zero Padronização + Gemini Anti-503 + IA Local GPU no Motion Studio
-            - **Detector automático pixel a pixel de conteúdo pausado/estático (`detect_static_content_intervals`):** analisa a área de conteúdo embaixo (mascarando a webcam em cima) para identificar os segundos exatos em que o streamer pausou o vídeo assistido e ficou falando — e envia esses intervalos exatos para a IA preencher a parte de baixo com **ilustrações vetoriais SVG e animações sob medida** ilustrando o que está sendo dito!
-            - **Zero padrões fixos antes da IA trabalhar:** removidos os layouts e barras pré-fabricados; a IA decide na hora toda a estética e animação de cada corte.
-            - **Fim das falhas por HTTP 503 (`high demand`) no Gemini:** agora o motor Gemini faz **retentativas automáticas com backoff** e **failover completo entre até 6 modelos ativos** na sua chave (ex.: `gemini-3.8-pro` → `gemini-3.8-flash` → `gemini-2.5-pro` → `gemini-2.5-flash` → `gemini-2.5-flash-lite`) em Motion Studio, Cortes Shorts e Revisão de Enquadramento!
-            - **IA Local Grátis (`llama-server` + `Qwen2.5-VL` na GPU) agora funciona no Motion Studio + Failover Cruzado Automático:**
-              - O Motion Studio respeita o motor escolhido em **Configurações → IA & Chaves** (`Gemini API` ou `Local grátis GPU`).
-              - Se o Gemini ficar indisponível/503 e você tiver a IA Local instalada, o Aicut alterna automaticamente para a sua GPU local (e vice-versa!).
-              - Novo resolvedor `resolve_any_installed_vision_model` encontra automaticamente qualquer `Qwen2.5-VL` já baixado (3B/7B), captura o log real de erro do `llama-server` e faz fallback seguro de VRAM (`-ngl 99` → `-ngl 24` → CPU) caso outro programa esteja usando VRAM.
-            - **Edição & Ilustrações Animadas 100% Sob Medida (Zero Padronização):**
-              - Removida qualquer fórmula/template fixo no Motion Studio: a IA cria paleta, ritmo e **ilustrações vetoriais SVG, gráficos animados, contadores, diagramas e tipografia cinética** preenchendo automaticamente a área de conteúdo (`.hf-content-stage`) sempre que nada relevante estiver acontecendo na tela de baixo (mantendo a webcam limpa em cima)!
-              - Runtime determinístico turbinado com `window.__aicut.interpolate(...)`, `window.__aicut.spring(...)` (estilo Remotion), barras animadas (`data-bar-to`) e animações `float`/`spin`/`draw`.
-
-            ### Novidades da v0.9.1 — Interface Reorganizada em Abas Sem Redundância + Motion Studio Integrado ao Plano de Cortes
-            - **Motion Studio conectado diretamente ao Plano de Cortes:** agora o Motion Studio seleciona diretamente um corte gerado nos seus Planos de Corte (agrupados por plano, com timecode exato automático e zero campos manuais de segundos), herda automaticamente o gancho/evidência visual/arco narrativo do corte para a IA editora e carrega a composição/conversa exata de cada corte separadamente.
-            - **Menu Lateral Limpo (5 abas do Estúdio + Configurações fixa embaixo):** eliminados os 4 itens duplicados do menu lateral (`Enquadramento`, `Fila de Tarefas`, `Módulos`, `Conectar IA`). Agora são apenas **Importar (`Alt+1`)**, **Biblioteca (`Alt+2`)**, **Transcrever (`Alt+3`)**, **Cortes Shorts (`Alt+4`)**, **Motion Studio (`Alt+5`)** e **Configurações (`Alt+6`)** isolada no rodapé.
-            - **Topbar e Barra de Status sem menus repetidos:** removidos botões duplicados de Tema, Atalhos, Biblioteca, MCP e Ctrl+K que apareciam repetidos em múltiplos lugares, além dos cabeçalhos duplicados (`PageHeader`) em cima das abas.
-            - **`Configurações` unificada em 6 abas (1 aba = 1 categoria):**
-              - **IA & Chaves:** fonte única para Chave Gemini API, modelo diretor e modelos locais `Qwen2.5-VL` + `llama-server` (usados por Cortes Shorts, Enquadramento e Motion Studio).
-              - **Ferramentas:** `FFmpeg`, `yt-dlp`, `whisper.cpp` e `llama-server`.
-              - **Sistema:** Aparência/temas, hardware/GPU CUDA e pastas do workspace.
-              - **Integrações:** MCP (Claude/Cursor), OpenAPI 3.1, CLI e feed de atividade.
-              - **Módulos:** módulos plugáveis e Action Playground.
-              - **Tarefas:** fila de progresso, logs e cancelamento.
-            - **`Cortes Shorts` reorganizada em 3 abas por categoria:** **Gerar Cortes** (vídeo + briefing limpo) · **Resultados** (cortes, pontuações, renderização e envio ao Motion Studio) · **Enquadramento** (fonte única para estilo 9:16 + editor visual da webcam/conteúdo + revisão IA).
-
-            ### Correções da v0.8.2 — Preview 100% Funcional + Motor IA/HyperFrames Confiável
-            - **Corrigido Preview Quebrado no Motion Studio (WebView2 / Windows 11):**
-              - Resolvida a tela branca/opaca do `<iframe>` HyperFrames causada por divergência de `color-scheme` (`dark` vs `light`) no Edge WebView2.
-              - Removidos `display: none` e `crossOrigin="anonymous"` do `<video>` (que suspendiam a decodificação de frames e bloqueavam HTTP Range sem `expose_headers`), além de expor headers CORS no servidor local.
-              - Adicionado **fallback automático para proxy H.264 compatível** (`/api/v1/media/{id}/preview`) caso o vídeo original seja MKV/HEVC/AV1, e preview instantâneo do vídeo selecionado já ao abrir a aba.
-              - Corrigido o loop `requestAnimationFrame` para rodar a 60fps estáveis sem reiniciar a cada frame.
-            - **Corrigido Motor de Edição IA (Gemini Vision) & Renderização HyperFrames/FFmpeg:**
-              - Modelos *thinking* do Gemini agora filtram partes `thought: true` e usam `maxOutputTokens: 16384`, evitando corte do JSON/HTML.
-              - Parser tolerante de JSON (`serde_json::Value`) + fallback automático `director_model → scan_model` (Flash) + diagnóstico claro no chat se a API falhar — nunca mais descarta silenciosamente a edição da IA!
-              - Adicionado `--remote-allow-origins=*` e espera de carregamento no Edge/Chrome headless CDP para que a captura RGBA transparente do HyperFrames funcione sempre no Windows 11.
-              - Efeitos de câmera dinâmica (`camera_zoom_end` + `impact_shake`) agora também são renderizados de verdade no MP4 final via `zoompan` no FFmpeg!
-
-            ### Novidades da v0.8.0 — Editora IA Contextual + Motor HyperFrames Real (Preview Ao Vivo & Render RGBA em NVENC)
-            - **A IA agora ASSISTE ao vídeo de verdade antes de editar:** extrai um storyboard visual (grade 4×2 de frames reais do trecho) + transcrição com timestamps e cria **técnicas de edição e motion graphics HyperFrames (HTML + CSS + SVG + contadores + setas desenhadas + flashes + cards) sob medida para o contexto específico de cada vídeo**!
-            - **Interface Ultra-Minimalista (Zero poluição de botões e formulários):**
-              - **Esquerda:** Preview 9:16 ao vivo a 60fps combinando coreografia dinâmica de câmera (*zoom-in* progressivo, tremor de impacto, vinheta, mood de cor, SMOKING33, tela cheia + PiP) + **camada HyperFrames HTML/CSS/SVG rodando ao vivo por cima do vídeo**!
-              - **Direita:** Chat livre em altura total para **conversar, planejar ideias (`discuss`) e pedir melhorias (`apply`)** diretamente com a IA editora — sem precisar mexer em dezenas de botões.
-            - **Renderização Real do HyperFrames Transparente (RGBA) no MP4 Final (Zero Node.js!):** usa o Chromium nativo já presente no Windows 11 (Microsoft Edge / Chrome em modo headless via CDP) para capturar exatamente o código HyperFrames da IA em PNG transparente 1080×1920 e compor sobre o vídeo acelerado em GPU **NVENC**!
-
-            ### Novidades da v0.7.1 — Fase 1 do Aicut Motion Studio (Layout Dinâmico em Código + Chat com IA)
-            - **Novo Módulo `Motion Studio` (`Estúdio → Motion Studio`, atalho `Alt+6`):** sistema de composição em código motion (`AicutComposition`) onde a IA controla o layout **cena a cena** conforme o que acontece de mais importante no vídeo — alternando automaticamente entre **Moldura SMOKING33**, **Conteúdo Tela Cheia + Webcam PiP flutuante**, **Foco na Câmera (gancho/reação)**, **Câmera Grande (68%)**, **100% Conteúdo** e **Zoom Destaque + Callout**!
-            - **Chat Interativo com a IA Diretora (`motion.chat_edit`):** converse em português direto na tela (*"entre 0:10 e 0:18 destaca tela cheia com minha webcam no canto superior direito"*, *"nos primeiros 4s coloca foco na câmera com título 'OLHA ISSO!'"*) e veja as cenas e o **preview 9:16 ao vivo a 60fps** atualizarem instantaneamente! (Funciona com Gemini API e inclui interpretador offline em PT-BR.)
-            - **Ponte Pronta para HyperFrames & Remotion (`motion.export_code`):** visualize e copie em 1 clique o código **HyperFrames (HTML + CSS + GSAP)**, **Remotion (`inputProps` JSON)** ou **Scene Graph JSON** gerado em tempo real a partir das suas cenas — base pronta para os renderizadores das Fases 2 e 3!
-            - **Renderização Multi-Cena em GPU NVENC (`motion.render`):** renderiza todas as trocas dinâmicas de layout, PiP com borda, zoom focal, títulos animados e legendas karaokê em segundos na sua GPU, usando automaticamente as áreas salvas da aba **Enquadramento** e acessível por qualquer IA via **MCP / REST / CLI**.
-
-            ### Novidades da v0.6.1 — Novo Design Minimalista em "Baixar & Importar"
-            - **Tela inteira como área de arrastar e soltar (Drag & Drop):** arraste qualquer vídeo, áudio ou legenda do Windows direto para toda a área escura da tela e importe instantaneamente para a Biblioteca.
-            - **Ícone central minimalista de importação:** clique no ícone central refinado para abrir o seletor de arquivos do PC (ou use o atalho discreto para importar uma pasta inteira).
-            - **Barra de link + Painel lateral deslizante (`Enter`):** cole ou digite qualquer link na barra logo abaixo do ícone e pressione **`Enter`** — o painel lateral direito desliza suavemente com a prévia do vídeo e todas as opções relevantes para personalizar o download (tipo de mídia, resolução detectada, formato, recorte de trecho, legendas, playlist, cookies do navegador, SponsorBlock e presets salvos).
-
-            ### Novidades da v0.6.0 — Nova Aba "Enquadramento" (Webcam Natural Sem Zoom + Áreas Salvas + Revisão por IA)
-            - **Webcam Natural Sem Zoom Colado no Rosto (Novo Padrão `1.0`):** corrigido o excesso de zoom automático — agora a webcam exibe **100% da área limpa interior** (rosto, ombros e setup como uma webcam real, zero bordas do OBS), só aproximando se você escolher zoom leve (`1.15×`) ou close (`1.30×`).
-            - **Nova Aba Dedicada `Enquadramento` (`Estúdio → Enquadramento`, atalho `Alt+5`):**
-              - **Editor Visual de Precisão:** carrega frames reais de qualquer instante do vídeo com caixas interativas (arrastar + 8 alças de redimensionamento + coordenadas em `0.1%`) para a **Webcam (verde)** e o **Conteúdo (azul)**, além de botões rápidos (*Detectar webcam (IA)*, *Encolher bordas -1.2%*, *Abrir +2.5%* e *Proporção exata SMOKING33 1.75:1*).
-              - **Preview 9:16 Ao Vivo:** exibe em tempo real o resultado exato na moldura `SMOKING33` conforme você ajusta as caixas.
-              - **Salvar com Precisão:** salve como **Padrão Global** (aplicado automaticamente em todos os Shorts), **Específico para Este Vídeo**, ou crie **Presets Nomeados** (ex.: *Live GTA*, *React*, *Podcast*).
-            - **Revisão Visual do Enquadramento por IA (`clips.framing_review`):** recorta exatamente a janela da webcam em 3 momentos do vídeo e revisa com **UltraFace ONNX + Detector de Bordas nas 4 extremidades + Gemini Vision** (quando configurado), retornando nota `0–100`, diagnóstico de bordas/zoom/cabeça e botão de **1 clique para aplicar o ajuste sugerido pela IA**!
-
-            ### Novidades da v0.5.3 — Detector Cirúrgico Zero-Borda na Webcam (4 Fases)
-            - **Varredura de dentro para fora nos 4 lados (inclusive bordas encostadas no canto da tela):** identifica molduras OBS finas ou grossas (até ~78 px em 1080p) emparelhando a parede externa e a interna, travando **sempre na parede interna** — nunca deixa vazar borda direita ou inferior da tela!
-            - **Descascador de bordas estáticas, brilhos e barras de nome (`temporal MAD + uniformidade`):** cruza mediana RGB de 18 frames com variância temporal pixel a pixel para descascar automaticamente bordas sólidas, gradientes neon, brilhos e banners fixos do OBS antes de enquadrar.
-            - **Detecção automática de cantos arredondados:** sonda as 4 diagonais internas da webcam para recuar além de máscaras de cantos arredondados e aplicar trava inteira estrita (`ceil/floor`), garantindo **zero pixels de borda jamais** durante todo o vídeo.
-
-            ### Novidades da v0.5.2 — IA Diretor de Conteúdo (Janela Inferior: Quem Está Falando + Ação em Destaque)
-            - **Foco Dinâmico em Quem Está Falando (`smart_focus` — novo padrão da janela de baixo):** detecta os rostos na área do conteúdo (vídeos reagidos, entrevistas, podcasts, cutscenes) e mede a atividade labial/mandibular frame a frame com histerese editorial — acompanhando quem está falando de verdade, enquadrando em *two-shot* quando duas pessoas cabem juntas ou fazendo corte limpo de câmera quando a fala muda de lado!
-            - **Rastreamento do Momento de Ação / Destaque (Gameplay, Trailers & Demos):** quando não há um orador em primeiro plano, uma grade visual 32×18 de movimento compensado por pan + contraste/saturação desliza a janela de recorte para capturar automaticamente o ponto de maior ação/destaque em cada instante.
-            - **Máscara Anti-Duplicação da Webcam:** mascara automaticamente a caixa da webcam do streamer (já exibida na janela superior) para que a janela inferior nunca persiga nem duplique a webcam do canto.
-            - **Extração Única + Dual `sendcmd` (`crop@cam` + `crop@content` a 20 Hz):** analisa as duas janelas em uma única passada de frames com física suave de câmera e 100% da aceleração NVENC da GPU.
-
-            ### Novidades da v0.5.1 — IA Cameraman: Rastreamento Facial Suave & Webcam Sem Bordas
-            - **IA Facial 100% Nativa em Rust (`tract-onnx` + `UltraFace RFB-320` ~1,2 MB, zero Python/DLL):** detecta o rosto do apresentador ao longo de todo o corte com **filtro anti-NPC** (não confunde o streamer com personagens do jogo).
-            - **Eliminação Automática de Bordas da Webcam (Mediana Temporal + Inset Anti-Borda):** identifica as 4 paredes exatas da caixa da webcam do OBS e trava matematicamente o enquadramento dentro da área limpa — **zero bordas ou vazamento da gameplay na janela de cima**!
-            - **Movimento Natural de Câmera Durante o Vídeo Todo (`FFmpeg sendcmd` + `crop@cam` dinâmico):** aplica composição na regra dos terços (olhos a 38% do topo) com física de tripé fluido (*deadzone*, velocidade máxima suave, *hold* em oclusão e corte seco em troca de cena), mantendo 100% da aceleração NVENC da GPU.
-            - **Novos controles na aba Cortes Shorts IA:** modo padrão **`Automático · IA detecta webcam, remove bordas e segue rosto`**, seletor de **Zoom do Rosto** (*Aberto / Natural / Close*) e **Margem anti-borda** (*3% / 4.5% / 8%*).
-
-            ### Correções da v0.4.6 — Gemini 3.8 Automático & Contexto 16k para Lives no Modo Local
-            - **Gemini API atualizada & à prova de futuro (`gemini-3.8-flash` / `gemini-3.8-pro` + auto-descoberta):** corrigido o HTTP 404 dos modelos antigos `gemini-2.5-*`. Agora o Aicut consulta automaticamente os modelos disponíveis na sua chave Gemini, escolhe o melhor Flash/Pro mais recente (com opção **Automático** e fallback seguro caso Pro não esteja liberado na chave) e migra configurações antigas sem precisar reconfigurar.
-            - **Modo Local Free (`llama-server`) calibrado para lives longas (zero `exceed_context_size_error`):** contexto dinâmico por VRAM (**16k tokens** em GPUs >= 10 GB como RTX 3060 12 GB, **12k** em 6–9 GB e **8k** em 4 GB/CPU), blocos de 10 min com 3 min de overlap e compactação automática segura caso algum trecho ultrapasse o limite.
-
-            ### Novidades da v0.4.5 — Nova Interface Estilo Terminal Moderno
-            - **Visual de terminal moderno, em largura total**: tipografia mono (Cascadia Code / JetBrains Mono), painéis com bordas finas e cabeçalhos estilo TUI, tabelas densas no estilo `ls -la`, barra de progresso em blocos e barra de status inferior clicável (estado do core MCP, tarefas, mídias, ferramentas e GPU).
-            - **Menus de botão direito em todo o app**: mídias (abrir, transcrever, cortes, copiar caminho/ID, mover para a Lixeira), seleção múltipla em lote, tarefas (cancelar, logs, copiar erro), transcrições (exportar em qualquer formato), falas, cortes, modelos, ferramentas, módulos, atividade e caminhos do workspace — com navegação por teclado e botões `⋯` equivalentes.
-            - **Atalhos de teclado**: `Ctrl+K` paleta de comandos, `Alt+1…8` troca de tela, `Ctrl+B` recolhe o menu lateral, `?` mostra todos os atalhos; na Biblioteca `/` busca, `↑ ↓` navega, `Espaço`/`Ctrl+clique` seleciona, `Ctrl+A` seleciona tudo e `Del` move para a Lixeira.
-            - **Biblioteca reorganizada**: lista densa com miniaturas (ou grade), colunas que se adaptam à largura, inspetor encaixado e redimensionável, abas Biblioteca/Lixeira e barra de ações em lote — mantendo toda a Lixeira e a seleção múltipla da v0.4.4.
-            - **Telas reorganizadas**: Baixar & Importar com tabela de formatos estilo `yt-dlp -F` e painel "Comando" com o JSON exato enviado ao core; Transcrever em abas (nova transcrição · transcrições · modelos); Cortes Shorts com seletor visual de enquadramento 9:16 e medidores de pontuação; Fila de Tarefas estilo monitor de processos; feed de atividade das IAs estilo `tail -f`.
-            - **4 esquemas de cor**: Noite (padrão), Fósforo, Âmbar e Claro.
-            - **Correções**: indicador de conexão não fica mais preso em "Reconectando" após recarregar a interface; ícones de carregamento agora giram; painéis da tela de Cortes que apareciam sem fundo/borda.
-
-            ### Novidades da v0.4.4 — Seleção Múltipla, "Selecionar Tudo" e Lixeira da Biblioteca
-            - **Seleção Múltipla & "Selecionar Tudo" na Biblioteca**: marque vários arquivos (ou todos os filtrados com 1 clique) para **Mover para a Lixeira** ou **Apagar Permanentemente do Disco** em lote, exibindo exatamente quantos MB/GB foram liberados.
-            - **Lixeira da Biblioteca (`media.trash_list`, `media.restore`, `media.trash_empty`, `media.bulk_delete`)**: arquivos removidos sem exclusão permanente do disco agora ficam salvos na aba **Lixeira** dentro da Biblioteca (com contador e espaço ocupado), permitindo **Restaurar** com 1 clique, **Excluir selecionados permanentemente** ou **Esvaziar Lixeira**.
-
-            ### Novidades da v0.4.3 — Acesso Total à Biblioteca & Linhagem por ID do Vídeo
-            - **Resolução Automática de Transcrição em Toda a Biblioteca (`find_best_transcript_for_media`)**: a IA de Cortes Shorts agora localiza automaticamente a transcrição do vídeo em qualquer lugar da Biblioteca — pelo `media_id` exato, por mídia irmã/pai (ex.: download de áudio e vídeo do mesmo link ou mesmo ID externo `[fPQDxLwScrA]`), por referência `transcript_id`, ou lendo diretamente arquivos `.json`, `.srt` e `.vtt` vinculados na Biblioteca/disco!
-            - **Linhagem Unificada por ID (`video_id:<id>` + `parent_media_id`)**: tudo que é gerado a partir de um vídeo (legendas, timelines, transcrições e Shorts renderizados) carrega automaticamente o ID do vídeo original para que a IA e a interface identifiquem instantaneamente todos os arquivos daquele projeto.
-            - **Nova Action `clips.media_context` + Painel na UI**: mostra o `video_id`, chave externa (`yt:...`), origem da transcrição detectada e total de arquivos vinculados na Biblioteca, além de informar à IA quais Shorts já foram gerados para evitar repetições.
-
-            ### Novidades da v0.4.2 — Moldura Shorts Padrão (Câmera em Cima + Conteúdo em Baixo)
-            - **Moldura PNG 9:16 Integrada (`SMOKING33`) como Layout Padrão (`template_split`)**: embutida direto no Aicut com recorte transparente automático de alta precisão — **Câmera na janela superior** (`1020×582`) e **Conteúdo/Gameplay na janela inferior** (`1020×889`), com bordas arredondadas e douradas perfeitas por cima do vídeo!
-            - **Suporte a qualquer Moldura PNG Personalizada**: o detector de canal alpha lê automaticamente as duas janelas transparentes de qualquer PNG 9:16 que você escolher.
-            - **Split Sem Moldura (`gaming_split`) atualizado**: agora também segue o padrão **Câmera em Cima + Conteúdo em Baixo**, com seletor de origem da webcam (4 cantos ou centro) e modo de ajuste do conteúdo (*Preencher* ou *Tela 16:9 inteira + Blur*).
-            - **Inclui a correção da v0.4.1** de compatibilidade com FFmpeg 8 (`-fps_mode vfr`).
-
-            ### Novidades da v0.4.0 — Cortes Shorts IA (Visual + Narrativa até 3 min)
-            - **Novo Módulo `Cortes Shorts IA` (`smart-clips`)**: assiste vídeos e lives usando **IA visual multimodal**, segue sua descrição editorial e encontra cortes coerentes com **Início (gancho 5s) → Meio → Fim** de até **3 minutos (180s)**, com snap cirúrgico em fronteiras de palavras.
-            - **Motor Dual-Engine (Nuvem + 100% Local Grátis)**:
-              - **Gemini API (`gemini-2.5-flash` + `gemini-2.5-pro`)**: visão + áudio nativos em janelas de 25 min com 3 min de sobreposição (0 MB de download local).
-              - **Local Free (`llama.cpp` + `Qwen2.5-VL` 7B/3B GGUF)**: o Aicut detecta automaticamente sua GPU/VRAM/CUDA, instala a melhor build do **`llama-server`** (CUDA + `cudart` / Vulkan / Metal / CPU) pelo próprio app e recomenda a melhor quantização compatível com sua placa.
-            - **Renderização Shorts 9:16 (`1080x1920`) Acelerada por Hardware (`NVENC` / `AMF` / `QSV`)**: layouts *Tela Inteira + Blur*, *Foco Central*, *Split Gameplay + Webcam* e *Original 16:9*, com opção de queimar legendas Karaokê sincronizadas e salvar direto na Biblioteca.
-            - **Inclui todas as melhorias das versões anteriores (`v0.3.0` / `v0.2.0`)**: detecção exata de CUDA, curadoria de modelos Whisper por GPU, 13 formatos de legenda/timeline e controle completo via MCP / OpenAPI / CLI.
+            ### Novidades da v0.9.4
+            - **Detector automático pixel a pixel de conteúdo pausado/estático (`detect_static_content_intervals`):** identifica exatamente quando o vídeo assistido embaixo fica pausado enquanto o streamer fala (mascarando a webcam) e envia esses trechos para a IA preencher com **ilustrações vetoriais SVG e animações sob medida**, mantendo o vídeo real visível quando está tocando.
+            - **Zero padrões fixos antes da IA trabalhar:** se nenhuma edição for aplicada no Motion Studio, o corte preserva exatamente o enquadramento original salvo (`SMOKING33` / áreas de webcam e conteúdo).
+            - **Gemini anti-503 + IA Local GPU no Motion Studio:** retentativas com backoff + failover entre até 6 modelos Gemini ativos + suporte nativo a `llama-server` (`Qwen2.5-VL` na GPU com fallback seguro de VRAM) e failover cruzado automático entre nuvem e local.
+            - **Interface reorganizada em abas sem redundância + Motion Studio dirigido pelo Plano de Cortes:** 5 abas principais + `Configurações` unificada em 6 categorias (`IA & Chaves`, `Ferramentas`, `Sistema`, `Integrações`, `Módulos`, `Tarefas`).
 
             ### Como instalar / atualizar no Windows 11
             1. Baixe e execute **`Aicut_*_x64-setup.exe`** (recomendado) ou **`.msi`** nos assets abaixo.
-            2. Em **Configurações → Ferramentas**, clique em **Instalar / Atualizar Tudo** para garantir `yt-dlp`, `FFmpeg` e `whisper.cpp` na melhor build para seu hardware/CUDA.
-            3. Na aba **Transcrever IA**, escolha a versão ideal do melhor modelo compatível com sua GPU e comece a gerar legendas e timelines!
+            2. Em **Configurações → Ferramentas**, clique em **Instalar / Atualizar Tudo**.
+            3. Em **Configurações → IA & Chaves**, configure sua chave Gemini API ou ative o modo **Local grátis (GPU)** com `Qwen2.5-VL`.
           files: |
             release-assets/*
