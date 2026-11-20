@@ -516,7 +516,7 @@ fn parse_ai_plan_response(raw: &str) -> Option<AiPlanResponse> {
 
 fn build_plan_prompt(title: &str, dur: f64, goal: &str, transcript: &str) -> String {
     format!(
-        r#"Você é o Diretor de Motion & Layout Dinâmico do Aicut (editor de Shorts 9:16 estilo motion code).
+        r##"Você é o Diretor de Motion & Layout Dinâmico do Aicut (editor de Shorts 9:16 estilo motion code).
 Crie um roteiro de cenas dinâmicas para um Short de {dur:.1} segundos ("{title}").
 Objetivo editorial do usuário: {goal}
 
@@ -553,7 +553,7 @@ Regras:
 }}
 
 Transcrição relativa (0.0s .. {dur:.1}s):
-{transcript}"#
+{transcript}"##
     )
 }
 

@@ -83,7 +83,7 @@ jobs:
           body: |
             ## Aicut ${{ steps.tag.outputs.name }} — Estúdio Modular AI-First para Windows 11
 
-            ### Novidades da v0.7.0 — Fase 1 do Aicut Motion Studio (Layout Dinâmico em Código + Chat com IA)
+            ### Novidades da v0.7.1 — Fase 1 do Aicut Motion Studio (Layout Dinâmico em Código + Chat com IA)
             - **Novo Módulo `Motion Studio` (`Estúdio → Motion Studio`, atalho `Alt+6`):** sistema de composição em código motion (`AicutComposition`) onde a IA controla o layout **cena a cena** conforme o que acontece de mais importante no vídeo — alternando automaticamente entre **Moldura SMOKING33**, **Conteúdo Tela Cheia + Webcam PiP flutuante**, **Foco na Câmera (gancho/reação)**, **Câmera Grande (68%)**, **100% Conteúdo** e **Zoom Destaque + Callout**!
             - **Chat Interativo com a IA Diretora (`motion.chat_edit`):** converse em português direto na tela (*"entre 0:10 e 0:18 destaca tela cheia com minha webcam no canto superior direito"*, *"nos primeiros 4s coloca foco na câmera com título 'OLHA ISSO!'"*) e veja as cenas e o **preview 9:16 ao vivo a 60fps** atualizarem instantaneamente! (Funciona com Gemini API e inclui interpretador offline em PT-BR.)
             - **Ponte Pronta para HyperFrames & Remotion (`motion.export_code`):** visualize e copie em 1 clique o código **HyperFrames (HTML + CSS + GSAP)**, **Remotion (`inputProps` JSON)** ou **Scene Graph JSON** gerado em tempo real a partir das suas cenas — base pronta para os renderizadores das Fases 2 e 3!
