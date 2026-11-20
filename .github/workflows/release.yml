@@ -83,6 +83,11 @@ jobs:
           body: |
             ## Aicut ${{ steps.tag.outputs.name }} — Estúdio Modular AI-First para Windows 11
 
+            ### Novidades da v0.6.1 — Novo Design Minimalista em "Baixar & Importar"
+            - **Tela inteira como área de arrastar e soltar (Drag & Drop):** arraste qualquer vídeo, áudio ou legenda do Windows direto para toda a área escura da tela e importe instantaneamente para a Biblioteca.
+            - **Ícone central minimalista de importação:** clique no ícone central refinado para abrir o seletor de arquivos do PC (ou use o atalho discreto para importar uma pasta inteira).
+            - **Barra de link + Painel lateral deslizante (`Enter`):** cole ou digite qualquer link na barra logo abaixo do ícone e pressione **`Enter`** — o painel lateral direito desliza suavemente com a prévia do vídeo e todas as opções relevantes para personalizar o download (tipo de mídia, resolução detectada, formato, recorte de trecho, legendas, playlist, cookies do navegador, SponsorBlock e presets salvos).
+
             ### Novidades da v0.6.0 — Nova Aba "Enquadramento" (Webcam Natural Sem Zoom + Áreas Salvas + Revisão por IA)
             - **Webcam Natural Sem Zoom Colado no Rosto (Novo Padrão `1.0`):** corrigido o excesso de zoom automático — agora a webcam exibe **100% da área limpa interior** (rosto, ombros e setup como uma webcam real, zero bordas do OBS), só aproximando se você escolher zoom leve (`1.15×`) ou close (`1.30×`).
             - **Nova Aba Dedicada `Enquadramento` (`Estúdio → Enquadramento`, atalho `Alt+5`):**
