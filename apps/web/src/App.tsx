@@ -328,7 +328,7 @@ export function App() {
           <span className="brand-mark">A</span>
           <span>Aicut</span>
           <span style={{ color: "var(--text-muted)", fontWeight: 400, fontSize: 12 }}>
-            v0.4.3 · Modular AI Studio
+            v0.4.4 · Modular AI Studio
           </span>
         </div>
 

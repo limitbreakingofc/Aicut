@@ -47,6 +47,62 @@ pub struct MediaDeleteInput {
 pub struct MediaDeleteOutput {
     pub deleted_id: String,
     pub file_deleted: bool,
+    pub moved_to_trash: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MediaBulkDeleteInput {
+    pub ids: Vec<String>,
+    /// When false (default), moves items to the Aicut Trash keeping files on disk.
+    /// When true, permanently deletes DB entries and removes files from disk.
+    #[serde(default)]
+    pub delete_file: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MediaBulkDeleteOutput {
+    pub processed_ids: Vec<String>,
+    pub files_deleted: usize,
+    pub freed_bytes: u64,
+    pub moved_to_trash: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TrashListOutput {
+    pub total: usize,
+    pub total_size_bytes: u64,
+    pub items: Vec<MediaAsset>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MediaRestoreInput {
+    pub ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MediaRestoreOutput {
+    pub restored_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TrashEmptyInput {
+    /// Optional subset of trashed media IDs to purge; if omitted or empty, empties the entire Trash.
+    #[serde(default)]
+    pub ids: Option<Vec<String>>,
+    /// Delete underlying files from disk as well (defaults to true when purging from Trash).
+    #[serde(default = "default_true")]
+    pub delete_files: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TrashEmptyOutput {
+    pub purged_count: usize,
+    pub files_deleted: usize,
+    pub freed_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -305,41 +361,224 @@ impl AicutModule for MediaIngestModule {
                 "media.delete",
                 "media-ingest",
                 "Remover Mídia da Biblioteca",
-                "Remove a media item from the Library. Set delete_file=true explicitly to also remove the file from disk (defaults to false for safety).",
+                "Move a media item to the Aicut Trash (when delete_file=false, default) or permanently delete it from the Library and disk (when delete_file=true).",
                 ActionAnnotations {
                     destructive: true,
                     ..Default::default()
                 },
                 |ctx, input| {
                     Box::pin(async move {
-                        let deleted = ctx
-                            .kernel
-                            .repo
-                            .delete_media(&input.id)?
-                            .ok_or_else(|| AicutError::not_found(format!("Media '{}' not found", input.id)))?;
-                        let mut file_deleted = false;
-                        if input.delete_file {
-                            let p = std::path::Path::new(&deleted.file_path);
+                        let (deleted, file_deleted, moved_to_trash) = if input.delete_file {
+                            let item = ctx
+                                .kernel
+                                .repo
+                                .delete_media(&input.id)?
+                                .ok_or_else(|| AicutError::not_found(format!("Media '{}' not found", input.id)))?;
+                            let mut removed = false;
+                            let p = std::path::Path::new(&item.file_path);
                             if p.is_file() {
-                                std::fs::remove_file(p)?;
-                                file_deleted = true;
+                                let _ = std::fs::remove_file(p);
+                                removed = true;
                             }
-                        }
-                        if let Some(ref thumb) = deleted.thumbnail_path {
-                            let _ = std::fs::remove_file(thumb);
-                        }
+                            if let Some(ref thumb) = item.thumbnail_path {
+                                let _ = std::fs::remove_file(thumb);
+                            }
+                            (item, removed, false)
+                        } else {
+                            let item = ctx
+                                .kernel
+                                .repo
+                                .trash_media(&input.id)?
+                                .ok_or_else(|| AicutError::not_found(format!("Media '{}' not found", input.id)))?;
+                            (item, false, true)
+                        };
                         ctx.kernel
                             .events
                             .publish(AicutEvent::MediaDeleted { id: input.id.clone() });
-                        let summary = if file_deleted {
-                            format!("Removed '{}' from Library and deleted file from disk", deleted.title)
+                        let summary = if moved_to_trash {
+                            format!("Moved '{}' to Trash (file kept on disk)", deleted.title)
+                        } else if file_deleted {
+                            format!("Permanently deleted '{}' and removed file from disk", deleted.title)
                         } else {
-                            format!("Removed '{}' from Library (file kept on disk)", deleted.title)
+                            format!("Permanently removed '{}' from Library", deleted.title)
                         };
                         Ok((
                             MediaDeleteOutput {
                                 deleted_id: input.id,
                                 file_deleted,
+                                moved_to_trash,
+                            },
+                            summary,
+                            vec![],
+                        ))
+                    })
+                },
+            )),
+            Arc::new(TypedAction::<MediaBulkDeleteInput, MediaBulkDeleteOutput, _>::new(
+                "media.bulk_delete",
+                "media-ingest",
+                "Remover Múltiplas Mídias",
+                "Move multiple selected media items to Trash (delete_file=false) or permanently delete them and their files from disk (delete_file=true).",
+                ActionAnnotations {
+                    destructive: true,
+                    ..Default::default()
+                },
+                |ctx, input| {
+                    Box::pin(async move {
+                        let mut processed_ids = Vec::new();
+                        let mut files_deleted = 0usize;
+                        let mut freed_bytes = 0u64;
+
+                        for id in &input.ids {
+                            if input.delete_file {
+                                if let Some(item) = ctx.kernel.repo.delete_media(id)? {
+                                    let p = std::path::Path::new(&item.file_path);
+                                    if p.is_file() {
+                                        let sz = std::fs::metadata(p).map(|m| m.len()).unwrap_or(item.file_size_bytes);
+                                        if std::fs::remove_file(p).is_ok() {
+                                            files_deleted += 1;
+                                            freed_bytes += sz;
+                                        }
+                                    }
+                                    if let Some(ref thumb) = item.thumbnail_path {
+                                        let _ = std::fs::remove_file(thumb);
+                                    }
+                                    ctx.kernel.events.publish(AicutEvent::MediaDeleted { id: id.clone() });
+                                    processed_ids.push(id.clone());
+                                }
+                            } else if ctx.kernel.repo.trash_media(id)?.is_some() {
+                                ctx.kernel.events.publish(AicutEvent::MediaDeleted { id: id.clone() });
+                                processed_ids.push(id.clone());
+                            }
+                        }
+
+                        let moved_to_trash = !input.delete_file;
+                        let summary = if moved_to_trash {
+                            format!("Moved {} item(s) to Trash", processed_ids.len())
+                        } else {
+                            format!(
+                                "Permanently deleted {} item(s) ({files_deleted} file(s) removed from disk)",
+                                processed_ids.len()
+                            )
+                        };
+                        Ok((
+                            MediaBulkDeleteOutput {
+                                processed_ids,
+                                files_deleted,
+                                freed_bytes,
+                                moved_to_trash,
+                            },
+                            summary,
+                            vec![],
+                        ))
+                    })
+                },
+            )),
+            Arc::new(TypedAction::<EmptyInput, TrashListOutput, _>::new(
+                "media.trash_list",
+                "media-ingest",
+                "Listar Lixeira da Biblioteca",
+                "List all soft-deleted media items currently in the Aicut Trash that can be restored or permanently purged.",
+                ActionAnnotations {
+                    read_only: true,
+                    idempotent: true,
+                    ..Default::default()
+                },
+                |ctx, _| {
+                    Box::pin(async move {
+                        let items = ctx.kernel.repo.list_trashed_media()?;
+                        let total = items.len();
+                        let total_size_bytes: u64 = items.iter().map(|i| i.file_size_bytes).sum();
+                        let summary = format!("{total} item(s) in Trash");
+                        Ok((
+                            TrashListOutput {
+                                total,
+                                total_size_bytes,
+                                items,
+                            },
+                            summary,
+                            vec![],
+                        ))
+                    })
+                },
+            )),
+            Arc::new(TypedAction::<MediaRestoreInput, MediaRestoreOutput, _>::new(
+                "media.restore",
+                "media-ingest",
+                "Restaurar Mídias da Lixeira",
+                "Restore one or more trashed media items back into the active Library.",
+                ActionAnnotations {
+                    idempotent: true,
+                    ..Default::default()
+                },
+                |ctx, input| {
+                    Box::pin(async move {
+                        let mut restored_ids = Vec::new();
+                        for id in &input.ids {
+                            if let Some(asset) = ctx.kernel.repo.restore_media(id)? {
+                                ctx.kernel.events.publish(AicutEvent::MediaCreated(asset));
+                                restored_ids.push(id.clone());
+                            }
+                        }
+                        let summary = format!("Restored {} item(s) from Trash", restored_ids.len());
+                        Ok((MediaRestoreOutput { restored_ids }, summary, vec![]))
+                    })
+                },
+            )),
+            Arc::new(TypedAction::<TrashEmptyInput, TrashEmptyOutput, _>::new(
+                "media.trash_empty",
+                "media-ingest",
+                "Esvaziar ou Excluir Permanentemente da Lixeira",
+                "Permanently purge selected trashed items (or the entire Trash when ids is omitted) and optionally remove their files from disk.",
+                ActionAnnotations {
+                    destructive: true,
+                    ..Default::default()
+                },
+                |ctx, input| {
+                    Box::pin(async move {
+                        let all_trashed = ctx.kernel.repo.list_trashed_media()?;
+                        let filter_set: Option<std::collections::HashSet<&String>> = input
+                            .ids
+                            .as_ref()
+                            .filter(|v| !v.is_empty())
+                            .map(|v| v.iter().collect());
+
+                        let mut purged_count = 0usize;
+                        let mut files_deleted = 0usize;
+                        let mut freed_bytes = 0u64;
+
+                        for item in all_trashed {
+                            if let Some(ref set) = filter_set {
+                                if !set.contains(&item.id) {
+                                    continue;
+                                }
+                            }
+                            if ctx.kernel.repo.delete_media(&item.id)?.is_some() {
+                                purged_count += 1;
+                                if input.delete_files {
+                                    let p = std::path::Path::new(&item.file_path);
+                                    if p.is_file() {
+                                        let sz = std::fs::metadata(p).map(|m| m.len()).unwrap_or(item.file_size_bytes);
+                                        if std::fs::remove_file(p).is_ok() {
+                                            files_deleted += 1;
+                                            freed_bytes += sz;
+                                        }
+                                    }
+                                }
+                                if let Some(ref thumb) = item.thumbnail_path {
+                                    let _ = std::fs::remove_file(thumb);
+                                }
+                            }
+                        }
+
+                        let summary = format!(
+                            "Purged {purged_count} item(s) from Trash ({files_deleted} file(s) deleted from disk)"
+                        );
+                        Ok((
+                            TrashEmptyOutput {
+                                purged_count,
+                                files_deleted,
+                                freed_bytes,
                             },
                             summary,
                             vec![],

@@ -1,5 +1,6 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import {
+  CheckSquare,
   Copy,
   Download,
   ExternalLink,
@@ -11,10 +12,12 @@ import {
   Music,
   Play,
   RefreshCw,
+  RotateCcw,
   Save,
   Scissors,
   Search,
   Sparkles,
+  Square,
   Subtitles,
   Trash2,
   Video,
@@ -63,10 +66,35 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   onSmartClipMedia,
   onNotify,
 }) => {
+  const [viewMode, setViewMode] = useState<"library" | "trash">("library");
+  const [trashedItems, setTrashedItems] = useState<MediaAsset[]>([]);
+  const [trashTotalBytes, setTrashTotalBytes] = useState(0);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [bulkBusy, setBulkBusy] = useState(false);
+
   const [sourceFilter, setSourceFilter] = useState<"all" | "download" | "local" | "generated">("all");
   const [sortBy, setSortBy] = useState("newest");
 
-  const selectedAsset = media.find((m) => m.id === selectedMediaId) ?? null;
+  const loadTrash = useCallback(async () => {
+    try {
+      const res = await runAction<{
+        total: number;
+        total_size_bytes: number;
+        items: MediaAsset[];
+      }>("media.trash_list");
+      setTrashedItems(res.data.items ?? []);
+      setTrashTotalBytes(res.data.total_size_bytes ?? 0);
+    } catch {
+      // ignore if offline
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadTrash();
+  }, [loadTrash, media.length]);
+
+  const activeList = viewMode === "trash" ? trashedItems : media;
+  const selectedAsset = activeList.find((m) => m.id === selectedMediaId) ?? null;
   const [editTitle, setEditTitle] = useState("");
   const [editTags, setEditTags] = useState("");
   const [editNotes, setEditNotes] = useState("");
@@ -93,7 +121,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     }
   }, [selectedAsset?.id]);
 
-  const filtered = media
+  const filtered = activeList
     .filter((item) => {
       if (filterKind && item.kind !== filterKind) return false;
       if (sourceFilter !== "all" && item.source_type !== sourceFilter) return false;
@@ -122,6 +150,113 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
           return b.created_at.localeCompare(a.created_at);
       }
     });
+
+  const allFilteredSelected =
+    filtered.length > 0 && filtered.every((item) => selectedIds.has(item.id));
+
+  function toggleSelectItem(id: string) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  }
+
+  function toggleSelectAllFiltered() {
+    if (allFilteredSelected) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(filtered.map((i) => i.id)));
+    }
+  }
+
+  function switchViewMode(nextMode: "library" | "trash") {
+    setViewMode(nextMode);
+    setSelectedIds(new Set());
+    onSelectMedia(null);
+    if (nextMode === "trash") {
+      void loadTrash();
+    }
+  }
+
+  async function handleBulkDelete(deleteFile: boolean) {
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0) return;
+    setBulkBusy(true);
+    try {
+      const res = await runAction<{
+        processed_ids: string[];
+        files_deleted: number;
+        freed_bytes: number;
+      }>("media.bulk_delete", {
+        ids,
+        delete_file: deleteFile,
+      });
+      setSelectedIds(new Set());
+      onRefresh();
+      await loadTrash();
+      onNotify(
+        "success",
+        deleteFile ? "Itens apagados permanentemente" : "Movidos para a Lixeira",
+        deleteFile
+          ? `${res.data.processed_ids.length} item(ns) apagado(s) (${formatBytes(res.data.freed_bytes ?? 0)} liberados no disco).`
+          : `${res.data.processed_ids.length} item(ns) movido(s) para a Lixeira (arquivos preservados no disco).`,
+      );
+    } catch (e) {
+      onNotify("error", "Erro na remoção em lote", (e as Error).message);
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
+  async function handleRestoreIds(ids: string[]) {
+    if (ids.length === 0) return;
+    setBulkBusy(true);
+    try {
+      const res = await runAction<{ restored_ids: string[] }>("media.restore", { ids });
+      setSelectedIds(new Set());
+      onRefresh();
+      await loadTrash();
+      onNotify(
+        "success",
+        "Restaurado da Lixeira",
+        `${res.data.restored_ids.length} item(ns) restaurado(s) para a Biblioteca.`,
+      );
+    } catch (e) {
+      onNotify("error", "Erro ao restaurar", (e as Error).message);
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
+  async function handlePurgeTrash(ids?: string[], deleteFiles = true) {
+    setBulkBusy(true);
+    try {
+      const res = await runAction<{
+        purged_count: number;
+        files_deleted: number;
+        freed_bytes: number;
+      }>("media.trash_empty", {
+        ids: ids && ids.length > 0 ? ids : undefined,
+        delete_files: deleteFiles,
+      });
+      setSelectedIds(new Set());
+      await loadTrash();
+      onNotify(
+        "info",
+        "Lixeira limpa",
+        `${res.data.purged_count} item(ns) excluído(s) permanentemente (${formatBytes(res.data.freed_bytes ?? 0)} liberados no disco).`,
+      );
+    } catch (e) {
+      onNotify("error", "Erro ao limpar Lixeira", (e as Error).message);
+    } finally {
+      setBulkBusy(false);
+    }
+  }
 
   async function handleSaveEdits() {
     if (!selectedAsset) return;
@@ -154,12 +289,13 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
       });
       onSelectMedia(null);
       onRefresh();
+      await loadTrash();
       onNotify(
         "success",
-        "Mídia removida",
+        deleteFileOnDisk ? "Mídia apagada permanentemente" : "Movida para a Lixeira",
         deleteFileOnDisk
           ? "Removida da Biblioteca e apagada do disco."
-          : "Removida da Biblioteca (arquivo mantido no disco).",
+          : "Movida para a Lixeira do Aicut (você pode restaurar ou apagar definitivamente por lá).",
       );
     } catch (e) {
       onNotify("error", "Erro ao remover", (e as Error).message);
@@ -221,20 +357,149 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
       <div className="page-header">
         <div>
-          <h1 className="page-title">Biblioteca</h1>
+          <h1 className="page-title">
+            {viewMode === "trash" ? "Lixeira da Biblioteca" : "Biblioteca"}
+          </h1>
           <p className="page-subtitle">
-            Vídeos e áudios baixados via yt-dlp ou importados do PC + legendas, timelines e transcrições geradas pela IA local ({media.length} item(ns)).
+            {viewMode === "trash"
+              ? `Arquivos removidos da Biblioteca mas preservados no disco (${trashedItems.length} item(ns) · ${formatBytes(trashTotalBytes)}). Restaure ou exclua permanentemente.`
+              : `Vídeos e áudios baixados via yt-dlp ou importados do PC + legendas, timelines e cortes gerados pela IA (${media.length} item(ns)).`}
           </p>
         </div>
-        <div style={{ display: "flex", gap: 8 }}>
-          <button type="button" className="btn" onClick={onRefresh}>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <button
+            type="button"
+            className={`btn ${viewMode === "library" ? "btn-primary" : ""}`}
+            onClick={() => switchViewMode("library")}
+          >
+            <Film size={14} /> Biblioteca ({media.length})
+          </button>
+          <button
+            type="button"
+            className={`btn ${viewMode === "trash" ? "btn-primary" : ""}`}
+            onClick={() => switchViewMode("trash")}
+          >
+            <Trash2 size={14} /> Lixeira
+            {trashedItems.length > 0 && (
+              <span className="nav-badge accent" style={{ marginLeft: 2 }}>
+                {trashedItems.length}
+              </span>
+            )}
+          </button>
+          <button
+            type="button"
+            className="btn"
+            onClick={() => {
+              onRefresh();
+              void loadTrash();
+            }}
+          >
             <RefreshCw size={14} /> Atualizar
           </button>
-          <button type="button" className="btn btn-primary" onClick={() => onNavigate("ingest")}>
-            <Download size={14} /> Baixar / Importar
-          </button>
+          {viewMode === "library" && (
+            <button type="button" className="btn btn-primary" onClick={() => onNavigate("ingest")}>
+              <Download size={14} /> Baixar / Importar
+            </button>
+          )}
+          {viewMode === "trash" && trashedItems.length > 0 && (
+            <button
+              type="button"
+              className="btn btn-danger"
+              disabled={bulkBusy}
+              onClick={() => handlePurgeTrash(undefined, true)}
+            >
+              <Trash2 size={14} /> Esvaziar Lixeira ({formatBytes(trashTotalBytes)})
+            </button>
+          )}
         </div>
       </div>
+
+      {/* Bulk Selection Bar */}
+      {(filtered.length > 0 || selectedIds.size > 0) && (
+        <div
+          className="panel"
+          style={{
+            display: "flex",
+            flexWrap: "wrap",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 10,
+            padding: "10px 14px",
+            borderColor: selectedIds.size > 0 ? "var(--accent-border)" : undefined,
+            background: selectedIds.size > 0 ? "var(--accent-soft)" : undefined,
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={toggleSelectAllFiltered}
+              disabled={filtered.length === 0}
+            >
+              {allFilteredSelected ? <CheckSquare size={14} /> : <Square size={14} />}
+              {allFilteredSelected
+                ? `Desmarcar todos (${filtered.length})`
+                : `Selecionar tudo (${filtered.length})`}
+            </button>
+            {selectedIds.size > 0 && (
+              <span style={{ fontSize: 12.5, fontWeight: 600 }}>
+                {selectedIds.size} item(ns) selecionado(s)
+              </span>
+            )}
+          </div>
+
+          {selectedIds.size > 0 && (
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              {viewMode === "library" ? (
+                <>
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    disabled={bulkBusy}
+                    onClick={() => handleBulkDelete(false)}
+                  >
+                    <Trash2 size={13} /> Mover p/ Lixeira ({selectedIds.size})
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-danger btn-sm"
+                    disabled={bulkBusy}
+                    onClick={() => handleBulkDelete(true)}
+                  >
+                    <Trash2 size={13} /> Apagar Permanente (Disco)
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    className="btn btn-primary btn-sm"
+                    disabled={bulkBusy}
+                    onClick={() => handleRestoreIds(Array.from(selectedIds))}
+                  >
+                    <RotateCcw size={13} /> Restaurar selecionados ({selectedIds.size})
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-danger btn-sm"
+                    disabled={bulkBusy}
+                    onClick={() => handlePurgeTrash(Array.from(selectedIds), true)}
+                  >
+                    <Trash2 size={13} /> Excluir Permanente (Disco)
+                  </button>
+                </>
+              )}
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                onClick={() => setSelectedIds(new Set())}
+              >
+                Limpar seleção
+              </button>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Filter & Search Bar */}
       <div
@@ -320,16 +585,28 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
       {/* Empty State or Media Grid */}
       {filtered.length === 0 ? (
         <div className="panel" style={{ textAlign: "center", padding: "48px 24px" }}>
-          <Film size={36} color="var(--text-muted)" style={{ marginBottom: 10 }} />
+          {viewMode === "trash" ? (
+            <Trash2 size={36} color="var(--text-muted)" style={{ marginBottom: 10 }} />
+          ) : (
+            <Film size={36} color="var(--text-muted)" style={{ marginBottom: 10 }} />
+          )}
           <div style={{ fontWeight: 600, fontSize: 16 }}>
-            {media.length === 0 ? "Sua Biblioteca está vazia" : "Nenhum resultado para o filtro atual"}
+            {viewMode === "trash"
+              ? trashedItems.length === 0
+                ? "A Lixeira está vazia"
+                : "Nenhum item na Lixeira para o filtro atual"
+              : media.length === 0
+                ? "Sua Biblioteca está vazia"
+                : "Nenhum resultado para o filtro atual"}
           </div>
           <p style={{ color: "var(--text-secondary)", margin: "6px auto 16px", maxWidth: 440 }}>
-            {media.length === 0
-              ? "Baixe um vídeo com yt-dlp ou importe arquivos do PC na primeira aba — e transcreva na aba Transcrever IA para gerar legendas e timelines."
-              : "Tente limpar a busca ou trocar os filtros de tipo e origem."}
+            {viewMode === "trash"
+              ? "Itens removidos sem apagar do disco aparecem aqui para você restaurar ou excluir definitivamente quando quiser."
+              : media.length === 0
+                ? "Baixe um vídeo com yt-dlp ou importe arquivos do PC na primeira aba — e transcreva na aba Transcrever IA para gerar legendas e timelines."
+                : "Tente limpar a busca ou trocar os filtros de tipo e origem."}
           </p>
-          {media.length === 0 && (
+          {viewMode === "library" && media.length === 0 && (
             <button type="button" className="btn btn-primary" onClick={() => onNavigate("ingest")}>
               Ir para Baixar & Importar
             </button>
@@ -337,14 +614,49 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
         </div>
       ) : (
         <div className="media-grid">
-          {filtered.map((item) => (
-            <article
-              key={item.id}
-              className={`media-card ${selectedMediaId === item.id ? "selected" : ""}`}
-              onClick={() => onSelectMedia(item.id)}
-            >
-              <div className="media-thumb">
-                {item.thumbnail_path && !isTextKind(item.kind) ? (
+          {filtered.map((item) => {
+            const isChecked = selectedIds.has(item.id);
+            return (
+              <article
+                key={item.id}
+                className={`media-card ${selectedMediaId === item.id || isChecked ? "selected" : ""}`}
+                onClick={() => {
+                  if (viewMode === "trash") {
+                    toggleSelectItem(item.id);
+                  } else {
+                    onSelectMedia(item.id);
+                  }
+                }}
+              >
+                <div className="media-thumb">
+                  <button
+                    type="button"
+                    title={isChecked ? "Desmarcar item" : "Selecionar item"}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      toggleSelectItem(item.id);
+                    }}
+                    style={{
+                      position: "absolute",
+                      top: 8,
+                      right: 8,
+                      zIndex: 4,
+                      width: 24,
+                      height: 24,
+                      borderRadius: 6,
+                      border: `1px solid ${isChecked ? "var(--accent)" : "rgba(255,255,255,0.4)"}`,
+                      background: isChecked ? "var(--accent)" : "rgba(12,14,18,0.68)",
+                      color: isChecked ? "var(--accent-fg)" : "#fff",
+                      display: "inline-flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      cursor: "pointer",
+                      padding: 0,
+                    }}
+                  >
+                    {isChecked ? <CheckSquare size={14} /> : <Square size={14} />}
+                  </button>
+                  {item.thumbnail_path && !isTextKind(item.kind) ? (
                   <img src={mediaThumbnailUrl(item.id)} alt={item.title} loading="lazy" />
                 ) : item.kind === "audio" ? (
                   <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6, color: "var(--accent)" }}>
@@ -415,9 +727,35 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                     ))}
                   </div>
                 )}
+                {viewMode === "trash" && (
+                  <div
+                    style={{ display: "flex", gap: 6, marginTop: 6 }}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <button
+                      type="button"
+                      className="btn btn-primary btn-sm"
+                      style={{ flex: 1, justifyContent: "center" }}
+                      disabled={bulkBusy}
+                      onClick={() => handleRestoreIds([item.id])}
+                    >
+                      <RotateCcw size={12} /> Restaurar
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-danger btn-sm"
+                      disabled={bulkBusy}
+                      title="Excluir permanentemente do disco"
+                      onClick={() => handlePurgeTrash([item.id], true)}
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  </div>
+                )}
               </div>
             </article>
-          ))}
+            );
+          })}
         </div>
       )}
 
@@ -688,10 +1026,11 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                       checked={deleteFileOnDisk}
                       onChange={(e) => setDeleteFileOnDisk(e.target.checked)}
                     />
-                    Também apagar o arquivo físico do disco
+                    Apagar permanentemente do disco (se desmarcado, vai para a Lixeira)
                   </label>
                   <button type="button" className="btn btn-danger" onClick={handleDelete}>
-                    <Trash2 size={14} /> Remover da Biblioteca
+                    <Trash2 size={14} />{" "}
+                    {deleteFileOnDisk ? "Apagar Permanentemente (Disco)" : "Mover para a Lixeira"}
                   </button>
                 </div>
               </div>

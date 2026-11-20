@@ -287,6 +287,7 @@ async fn import_single_file(
         notes: String::new(),
         created_at: now,
         updated_at: now,
+        deleted_at: None,
     };
 
     kernel.repo.insert_media(&asset)?;

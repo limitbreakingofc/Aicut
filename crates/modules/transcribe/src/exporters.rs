@@ -290,6 +290,7 @@ pub fn export_and_save_to_library(
         ),
         created_at: now,
         updated_at: now,
+        deleted_at: None,
     };
 
     kernel.repo.insert_media(&asset)?;

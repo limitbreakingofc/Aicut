@@ -87,6 +87,9 @@ pub struct MediaAsset {
     pub notes: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Set when the item was soft-deleted and moved to the Aicut Trash (file kept on disk).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -319,9 +322,13 @@ impl MediaRepository {
             ",
         )?;
 
-        // Safe upgrade migration for v0.1.0 databases that lacked `parent_media_id`
+        // Safe upgrade migrations for older databases
         let _ = conn.execute(
             "ALTER TABLE media_assets ADD COLUMN parent_media_id TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE media_assets ADD COLUMN deleted_at TEXT",
             [],
         );
 
@@ -448,7 +455,7 @@ impl MediaRepository {
             .query_row(
                 "SELECT id, title, kind, source_type, source_url, parent_media_id, file_path,
                         file_name, extension, file_size_bytes, fingerprint, thumbnail_path,
-                        metadata_json, tags_json, notes, created_at, updated_at
+                        metadata_json, tags_json, notes, created_at, updated_at, deleted_at
                  FROM media_assets WHERE id = ?1",
                 params![id],
                 row_to_media,
@@ -466,8 +473,8 @@ impl MediaRepository {
             .query_row(
                 "SELECT id, title, kind, source_type, source_url, parent_media_id, file_path,
                         file_name, extension, file_size_bytes, fingerprint, thumbnail_path,
-                        metadata_json, tags_json, notes, created_at, updated_at
-                 FROM media_assets WHERE fingerprint = ?1 LIMIT 1",
+                        metadata_json, tags_json, notes, created_at, updated_at, deleted_at
+                 FROM media_assets WHERE fingerprint = ?1 AND deleted_at IS NULL LIMIT 1",
                 params![fingerprint],
                 row_to_media,
             )
@@ -484,8 +491,9 @@ impl MediaRepository {
         let mut stmt = conn.prepare(
             "SELECT id, title, kind, source_type, source_url, parent_media_id, file_path,
                     file_name, extension, file_size_bytes, fingerprint, thumbnail_path,
-                    metadata_json, tags_json, notes, created_at, updated_at
+                    metadata_json, tags_json, notes, created_at, updated_at, deleted_at
              FROM media_assets
+             WHERE deleted_at IS NULL
              ORDER BY created_at DESC",
         )?;
 
@@ -601,6 +609,67 @@ impl MediaRepository {
         Ok(asset)
     }
 
+    /// Soft-deletes a media asset by moving it into the Aicut Trash (`deleted_at = now`).
+    pub fn trash_media(&self, id: &str) -> AicutResult<Option<MediaAsset>> {
+        let existing = self.get_media(id)?;
+        if let Some(mut asset) = existing {
+            let now = Utc::now();
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| AicutError::internal("DB lock poisoned"))?;
+            conn.execute(
+                "UPDATE media_assets SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2",
+                params![now.to_rfc3339(), id],
+            )?;
+            asset.deleted_at = Some(now);
+            asset.updated_at = now;
+            return Ok(Some(asset));
+        }
+        Ok(None)
+    }
+
+    /// Restores a soft-deleted media asset from the Trash back into the active Library.
+    pub fn restore_media(&self, id: &str) -> AicutResult<Option<MediaAsset>> {
+        let existing = self.get_media(id)?;
+        if let Some(mut asset) = existing {
+            let now = Utc::now();
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| AicutError::internal("DB lock poisoned"))?;
+            conn.execute(
+                "UPDATE media_assets SET deleted_at = NULL, updated_at = ?1 WHERE id = ?2",
+                params![now.to_rfc3339(), id],
+            )?;
+            asset.deleted_at = None;
+            asset.updated_at = now;
+            return Ok(Some(asset));
+        }
+        Ok(None)
+    }
+
+    /// Lists all items currently in the Aicut Trash (newest trashed first).
+    pub fn list_trashed_media(&self) -> AicutResult<Vec<MediaAsset>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AicutError::internal("DB lock poisoned"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, title, kind, source_type, source_url, parent_media_id, file_path,
+                    file_name, extension, file_size_bytes, fingerprint, thumbnail_path,
+                    metadata_json, tags_json, notes, created_at, updated_at, deleted_at
+             FROM media_assets
+             WHERE deleted_at IS NOT NULL
+             ORDER BY deleted_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_media)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Permanently deletes a media record from SQLite.
     pub fn delete_media(&self, id: &str) -> AicutResult<Option<MediaAsset>> {
         let existing = self.get_media(id)?;
         if existing.is_some() {
@@ -618,7 +687,11 @@ impl MediaRepository {
             .conn
             .lock()
             .map_err(|_| AicutError::internal("DB lock poisoned"))?;
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM media_assets", [], |r| r.get(0))?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM media_assets WHERE deleted_at IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
         Ok(count as usize)
     }
 
@@ -1191,6 +1264,7 @@ fn row_to_media(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaAsset> {
     let tags_str: String = row.get(13)?;
     let created_str: String = row.get(15)?;
     let updated_str: String = row.get(16)?;
+    let deleted_str: Option<String> = row.get(17).ok().flatten();
 
     let kind = match kind_str.as_str() {
         "video_only" => MediaKind::VideoOnly,
@@ -1228,6 +1302,11 @@ fn row_to_media(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaAsset> {
         updated_at: DateTime::parse_from_rfc3339(&updated_str)
             .map(|d| d.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now()),
+        deleted_at: deleted_str.and_then(|s| {
+            DateTime::parse_from_rfc3339(&s)
+                .map(|d| d.with_timezone(&Utc))
+                .ok()
+        }),
     })
 }
 
@@ -1517,6 +1596,7 @@ mod tests {
             notes: String::new(),
             created_at: now,
             updated_at: now,
+            deleted_at: None,
         };
         db.insert_media(&video_asset).unwrap();
 
@@ -1545,6 +1625,7 @@ mod tests {
             notes: String::new(),
             created_at: now,
             updated_at: now,
+            deleted_at: None,
         };
         db.insert_media(&srt_asset).unwrap();
 
@@ -1553,5 +1634,16 @@ mod tests {
         assert_eq!(resolved.transcript.segments.len(), 1);
         assert_eq!(resolved.transcript.segments[0].start_ms, 1000);
         assert!(resolved.transcript.segments[0].text.contains("olha esse corte"));
+
+        // Verify Trash -> Restore -> Purge lifecycle
+        assert_eq!(db.count_media().unwrap(), 2);
+        db.trash_media("sub-1").unwrap();
+        assert_eq!(db.count_media().unwrap(), 1);
+        assert_eq!(db.list_trashed_media().unwrap().len(), 1);
+        db.restore_media("sub-1").unwrap();
+        assert_eq!(db.count_media().unwrap(), 2);
+        assert!(db.list_trashed_media().unwrap().is_empty());
+        db.delete_media("sub-1").unwrap();
+        assert_eq!(db.count_media().unwrap(), 1);
     }
 }

@@ -81,6 +81,10 @@ jobs:
           body: |
             ## Aicut ${{ steps.tag.outputs.name }} — Estúdio Modular AI-First para Windows 11
 
+            ### Novidades da v0.4.4 — Seleção Múltipla, "Selecionar Tudo" e Lixeira da Biblioteca
+            - **Seleção Múltipla & "Selecionar Tudo" na Biblioteca**: marque vários arquivos (ou todos os filtrados com 1 clique) para **Mover para a Lixeira** ou **Apagar Permanentemente do Disco** em lote, exibindo exatamente quantos MB/GB foram liberados.
+            - **Lixeira da Biblioteca (`media.trash_list`, `media.restore`, `media.trash_empty`, `media.bulk_delete`)**: arquivos removidos sem exclusão permanente do disco agora ficam salvos na aba **Lixeira** dentro da Biblioteca (com contador e espaço ocupado), permitindo **Restaurar** com 1 clique, **Excluir selecionados permanentemente** ou **Esvaziar Lixeira**.
+
             ### Novidades da v0.4.3 — Acesso Total à Biblioteca & Linhagem por ID do Vídeo
             - **Resolução Automática de Transcrição em Toda a Biblioteca (`find_best_transcript_for_media`)**: a IA de Cortes Shorts agora localiza automaticamente a transcrição do vídeo em qualquer lugar da Biblioteca — pelo `media_id` exato, por mídia irmã/pai (ex.: download de áudio e vídeo do mesmo link ou mesmo ID externo `[fPQDxLwScrA]`), por referência `transcript_id`, ou lendo diretamente arquivos `.json`, `.srt` e `.vtt` vinculados na Biblioteca/disco!
             - **Linhagem Unificada por ID (`video_id:<id>` + `parent_media_id`)**: tudo que é gerado a partir de um vídeo (legendas, timelines, transcrições e Shorts renderizados) carrega automaticamente o ID do vídeo original para que a IA e a interface identifiquem instantaneamente todos os arquivos daquele projeto.

@@ -215,6 +215,7 @@ pub async fn render_clip_to_library(
         notes,
         created_at: now,
         updated_at: now,
+        deleted_at: None,
     };
 
     kernel.repo.insert_media(&asset)?;
