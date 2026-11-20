@@ -3,7 +3,7 @@ import type { RouteId } from "../lib/types";
 
 /** Single source of truth for app navigation: sidebar, breadcrumb, page headers and command palette. */
 
-export const APP_VERSION = "0.5.1";
+export const APP_VERSION = "0.5.2";
 
 export type NavGroupId = "studio" | "system";
 

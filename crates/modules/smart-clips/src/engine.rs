@@ -576,13 +576,13 @@ pub async fn start_clip_render(
                     &task_job_id,
                     JobProgress {
                         percent: pct,
-                        stage: if req.face_tracking {
-                            "face_tracking_and_rendering".into()
+                        stage: if req.face_tracking || req.content_fit == ContentFit::SmartFocus {
+                            "ai_framing_and_rendering".into()
                         } else {
                             "rendering_shorts".into()
                         },
                         message: Some(format!(
-                            "Rastreando rosto com IA e renderizando ({}/{total}): '{}' ({:.0}s)...",
+                            "IA enquadrando câmera + foco em quem fala/ação e renderizando ({}/{total}): '{}' ({:.0}s)...",
                             step + 1,
                             clip.title,
                             clip.total_duration_sec

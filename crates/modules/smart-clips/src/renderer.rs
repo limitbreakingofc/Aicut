@@ -10,7 +10,7 @@ use std::path::Path;
 use tokio::process::Command;
 use uuid::Uuid;
 
-use crate::face_track::{compute_camera_track, CameraTrackPlan};
+use crate::face_track::{compute_dual_tracks, CameraTrackPlan};
 use crate::template::{detect_template_geometry_from_path, resolve_template_png, TemplateGeometry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -55,7 +55,9 @@ impl Default for WebcamCorner {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ContentFit {
-    /// Fills the entire bottom content box cleanly (mild center crop, no black bars).
+    /// AI Director dynamically frames the active speaker (mouth/face tracking) or peak visual action/highlight on the bottom window.
+    SmartFocus,
+    /// Fills the entire bottom content box cleanly (static center crop, no black bars).
     Fill,
     /// Keeps 100% of the 16:9 screen visible inside the bottom content box over a soft blurred fill.
     FitBlur,
@@ -63,7 +65,7 @@ pub enum ContentFit {
 
 impl Default for ContentFit {
     fn default() -> Self {
-        Self::Fill
+        Self::SmartFocus
     }
 }
 
@@ -122,55 +124,95 @@ pub async fn render_clip_to_library(
         None
     };
 
-    // Run native Rust ONNX AI Face Tracking + Zero-Border Webcam Edge Detection
+    // Run unified single-pass AI tracking for BOTH top webcam (IA Cameraman) and bottom content
+    // (IA Diretor: active speaker mouth-tracking or peak visual action/highlight)
     let needs_face_track = face_tracking
         && matches!(
             layout,
             ShortsLayout::TemplateSplit | ShortsLayout::GamingSplit | ShortsLayout::CenterCrop
         );
-    let mut tmp_cmd_path: Option<std::path::PathBuf> = None;
-    let camera_track_plan: Option<CameraTrackPlan> = if needs_face_track {
-        let (src_w, src_h) = resolve_video_dimensions(ffprobe_bin, source).await;
-        let (slot_w, slot_h) = match layout {
-            ShortsLayout::TemplateSplit => {
-                let tc = resolved_template
-                    .as_ref()
-                    .map(|(_, g)| g.top_camera)
-                    .unwrap_or_else(|| TemplateGeometry::default().top_camera);
-                (tc.w, tc.h)
-            }
-            ShortsLayout::GamingSplit => (1080, 730),
-            ShortsLayout::CenterCrop => (1080, 1920),
-            _ => (1080, 730),
-        };
-        if let Ok(Some(plan)) = compute_camera_track(
-            kernel,
-            ffmpeg_bin,
-            Path::new(&source.file_path),
-            src_w,
-            src_h,
-            &clip.segments,
-            slot_w,
-            slot_h,
-            webcam_corner,
-            face_zoom,
-            border_trim_pct,
-        )
-        .await
-        {
-            if plan.keyframes.len() > 1 {
-                let p = std::env::temp_dir().join(format!("aicut-camtrack-{short_id}.cmd"));
-                if plan.write_sendcmd_file(&p).is_ok() {
-                    tmp_cmd_path = Some(p);
+    let needs_content_track = (matches!(
+        layout,
+        ShortsLayout::TemplateSplit | ShortsLayout::GamingSplit
+    ) && content_fit == ContentFit::SmartFocus)
+        || (layout == ShortsLayout::CenterCrop && face_tracking);
+
+    let mut tmp_cam_cmd_path: Option<std::path::PathBuf> = None;
+    let mut tmp_content_cmd_path: Option<std::path::PathBuf> = None;
+    let (camera_track_plan, content_track_plan): (Option<CameraTrackPlan>, Option<CameraTrackPlan>) =
+        if needs_face_track || needs_content_track {
+            let (src_w, src_h) = resolve_video_dimensions(ffprobe_bin, source).await;
+            let cam_slot = if needs_face_track {
+                let (slot_w, slot_h) = match layout {
+                    ShortsLayout::TemplateSplit => {
+                        let tc = resolved_template
+                            .as_ref()
+                            .map(|(_, g)| g.top_camera)
+                            .unwrap_or_else(|| TemplateGeometry::default().top_camera);
+                        (tc.w, tc.h)
+                    }
+                    ShortsLayout::GamingSplit => (1080, 730),
+                    ShortsLayout::CenterCrop => (1080, 1920),
+                    _ => (1080, 730),
+                };
+                Some((slot_w, slot_h, webcam_corner, face_zoom, border_trim_pct))
+            } else {
+                None
+            };
+            let content_slot = if needs_content_track {
+                let (slot_w, slot_h) = match layout {
+                    ShortsLayout::TemplateSplit => {
+                        let bc = resolved_template
+                            .as_ref()
+                            .map(|(_, g)| g.bottom_content)
+                            .unwrap_or_else(|| TemplateGeometry::default().bottom_content);
+                        (bc.w, bc.h)
+                    }
+                    ShortsLayout::GamingSplit => (1080, 1190),
+                    ShortsLayout::CenterCrop => (1080, 1920),
+                    _ => (1080, 1190),
+                };
+                Some((slot_w, slot_h))
+            } else {
+                None
+            };
+
+            if let Ok(dual) = compute_dual_tracks(
+                kernel,
+                ffmpeg_bin,
+                Path::new(&source.file_path),
+                src_w,
+                src_h,
+                &clip.segments,
+                cam_slot,
+                content_slot,
+            )
+            .await
+            {
+                if let Some(ref cam) = dual.camera {
+                    if cam.keyframes.len() > 1 {
+                        let p = std::env::temp_dir().join(format!("aicut-camtrack-{short_id}.cmd"));
+                        if cam.write_sendcmd_file(&p).is_ok() {
+                            tmp_cam_cmd_path = Some(p);
+                        }
+                    }
                 }
+                if let Some(ref cnt) = dual.content {
+                    if cnt.keyframes.len() > 1 {
+                        let p =
+                            std::env::temp_dir().join(format!("aicut-contenttrack-{short_id}.cmd"));
+                        if cnt.write_sendcmd_file(&p).is_ok() {
+                            tmp_content_cmd_path = Some(p);
+                        }
+                    }
+                }
+                (dual.camera, dual.content)
+            } else {
+                (None, None)
             }
-            Some(plan)
         } else {
-            None
-        }
-    } else {
-        None
-    };
+            (None, None)
+        };
 
     let hw_encoder = select_hw_h264_encoder(kernel.hardware.recommended_accel);
     let first_attempt = run_ffmpeg_render(
@@ -185,7 +227,10 @@ pub async fn render_clip_to_library(
             .map(|(p, g)| (p.as_path(), *g)),
         camera_track_plan
             .as_ref()
-            .map(|p| (p, tmp_cmd_path.as_deref())),
+            .map(|p| (p, tmp_cam_cmd_path.as_deref())),
+        content_track_plan
+            .as_ref()
+            .map(|p| (p, tmp_content_cmd_path.as_deref())),
         tmp_ass.as_deref(),
         hw_encoder,
         &out_path,
@@ -206,7 +251,10 @@ pub async fn render_clip_to_library(
                 .map(|(p, g)| (p.as_path(), *g)),
             camera_track_plan
                 .as_ref()
-                .map(|p| (p, tmp_cmd_path.as_deref())),
+                .map(|p| (p, tmp_cam_cmd_path.as_deref())),
+            content_track_plan
+                .as_ref()
+                .map(|p| (p, tmp_content_cmd_path.as_deref())),
             tmp_ass.as_deref(),
             "libx264",
             &out_path,
@@ -219,7 +267,10 @@ pub async fn render_clip_to_library(
     if let Some(ref p) = tmp_ass {
         let _ = std::fs::remove_file(p);
     }
-    if let Some(ref p) = tmp_cmd_path {
+    if let Some(ref p) = tmp_cam_cmd_path {
+        let _ = std::fs::remove_file(p);
+    }
+    if let Some(ref p) = tmp_content_cmd_path {
         let _ = std::fs::remove_file(p);
     }
 
@@ -348,6 +399,32 @@ fn webcam_crop_expr(corner: WebcamCorner) -> &'static str {
     }
 }
 
+fn build_tracked_crop_chain(
+    input_label: &str,
+    output_label: &str,
+    target_w: u32,
+    target_h: u32,
+    plan: &CameraTrackPlan,
+    cmd_path_opt: Option<&Path>,
+) -> String {
+    if let Some(cmd_path) = cmd_path_opt {
+        let escaped = escape_ffmpeg_filter_path(cmd_path);
+        let filter_name = if plan.filter_target.is_empty() {
+            "crop@cam"
+        } else {
+            plan.filter_target.as_str()
+        };
+        return format!(
+            "{input_label}sendcmd=f='{escaped}',{filter_name}=w={}:h={}:x={}:y={},scale={target_w}:{target_h}:flags=lanczos,setsar=1{output_label}",
+            plan.crop_w, plan.crop_h, plan.init_x, plan.init_y
+        );
+    }
+    format!(
+        "{input_label}crop=w={}:h={}:x={}:y={},scale={target_w}:{target_h}:flags=lanczos,setsar=1{output_label}",
+        plan.crop_w, plan.crop_h, plan.init_x, plan.init_y
+    )
+}
+
 fn build_camera_filter_chain(
     input_label: &str,
     output_label: &str,
@@ -357,22 +434,68 @@ fn build_camera_filter_chain(
     camera_track: Option<(&CameraTrackPlan, Option<&Path>)>,
 ) -> String {
     if let Some((plan, cmd_path_opt)) = camera_track {
-        if let Some(cmd_path) = cmd_path_opt {
-            let escaped = escape_ffmpeg_filter_path(cmd_path);
-            return format!(
-                "{input_label}sendcmd=f='{escaped}',crop@cam=w={}:h={}:x={}:y={},scale={target_w}:{target_h}:flags=lanczos,setsar=1{output_label}",
-                plan.crop_w, plan.crop_h, plan.init_x, plan.init_y
-            );
-        }
-        return format!(
-            "{input_label}crop=w={}:h={}:x={}:y={},scale={target_w}:{target_h}:flags=lanczos,setsar=1{output_label}",
-            plan.crop_w, plan.crop_h, plan.init_x, plan.init_y
+        return build_tracked_crop_chain(
+            input_label,
+            output_label,
+            target_w,
+            target_h,
+            plan,
+            cmd_path_opt,
         );
     }
     let cam_crop = webcam_crop_expr(webcam_corner);
     format!(
         "{input_label}{cam_crop},scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h},setsar=1{output_label}"
     )
+}
+
+fn push_content_filter_chain(
+    filter_parts: &mut Vec<String>,
+    input_label: &str,
+    output_label: &str,
+    prefix: &str,
+    target_w: u32,
+    target_h: u32,
+    content_fit: ContentFit,
+    content_track: Option<(&CameraTrackPlan, Option<&Path>)>,
+) {
+    match content_fit {
+        ContentFit::SmartFocus => {
+            if let Some((plan, cmd_path_opt)) = content_track {
+                filter_parts.push(build_tracked_crop_chain(
+                    input_label,
+                    output_label,
+                    target_w,
+                    target_h,
+                    plan,
+                    cmd_path_opt,
+                ));
+            } else {
+                filter_parts.push(format!(
+                    "{input_label}scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h},setsar=1{output_label}"
+                ));
+            }
+        }
+        ContentFit::Fill => {
+            filter_parts.push(format!(
+                "{input_label}scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h},setsar=1{output_label}"
+            ));
+        }
+        ContentFit::FitBlur => {
+            filter_parts.push(format!(
+                "{input_label}split=2[{prefix}_bg_in][{prefix}_fg_in]"
+            ));
+            filter_parts.push(format!(
+                "[{prefix}_bg_in]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h},boxblur=18:4[{prefix}_bg]"
+            ));
+            filter_parts.push(format!(
+                "[{prefix}_fg_in]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease[{prefix}_fg]"
+            ));
+            filter_parts.push(format!(
+                "[{prefix}_bg][{prefix}_fg]overlay=(W-w)/2:(H-h)/2,setsar=1{output_label}"
+            ));
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -385,6 +508,7 @@ async fn run_ffmpeg_render(
     content_fit: ContentFit,
     template: Option<(&Path, TemplateGeometry)>,
     camera_track: Option<(&CameraTrackPlan, Option<&Path>)>,
+    content_track: Option<(&CameraTrackPlan, Option<&Path>)>,
     ass_path: Option<&Path>,
     encoder: &str,
     out_path: &Path,
@@ -456,29 +580,17 @@ async fn run_ffmpeg_render(
                 webcam_corner,
                 camera_track,
             ));
-            // Bottom box: CONTENT
-            match content_fit {
-                ContentFit::Fill => {
-                    filter_parts.push(format!(
-                        "[content_src]scale={}:{}:force_original_aspect_ratio=increase,crop={}:{},setsar=1[content_box]",
-                        bc.w, bc.h, bc.w, bc.h
-                    ));
-                }
-                ContentFit::FitBlur => {
-                    filter_parts.push("[content_src]split=2[cb_bg_in][cb_fg_in]".to_string());
-                    filter_parts.push(format!(
-                        "[cb_bg_in]scale={}:{}:force_original_aspect_ratio=increase,crop={}:{},boxblur=18:4[cb_bg]",
-                        bc.w, bc.h, bc.w, bc.h
-                    ));
-                    filter_parts.push(format!(
-                        "[cb_fg_in]scale={}:{}:force_original_aspect_ratio=decrease[cb_fg]",
-                        bc.w, bc.h
-                    ));
-                    filter_parts.push(
-                        "[cb_bg][cb_fg]overlay=(W-w)/2:(H-h)/2,setsar=1[content_box]".to_string(),
-                    );
-                }
-            }
+            // Bottom box: CONTENT (AI Director framing active speaker / peak action when SmartFocus)
+            push_content_filter_chain(
+                &mut filter_parts,
+                "[content_src]",
+                "[content_box]",
+                "cb",
+                bc.w,
+                bc.h,
+                content_fit,
+                content_track,
+            );
             // Stack camera on top slot, content on bottom slot, and PNG template overlay on top
             filter_parts.push(format!("[canvas][cam_box]overlay={}:{}[tmp1]", tc.x, tc.y));
             filter_parts.push(format!("[tmp1][content_box]overlay={}:{}[tmp2]", bc.x, bc.y));
@@ -489,14 +601,14 @@ async fn run_ffmpeg_render(
             filter_parts.push("[vbase]scale=trunc(iw/2)*2:trunc(ih/2)*2[vlayout]".to_string());
         }
         ShortsLayout::CenterCrop => {
-            if let Some((plan, cmd_path_opt)) = camera_track {
-                filter_parts.push(build_camera_filter_chain(
+            if let Some((plan, cmd_path_opt)) = camera_track.or(content_track) {
+                filter_parts.push(build_tracked_crop_chain(
                     "[vbase]",
                     "[vlayout]",
                     1080,
                     1920,
-                    webcam_corner,
-                    Some((plan, cmd_path_opt)),
+                    plan,
+                    cmd_path_opt,
                 ));
             } else {
                 filter_parts.push(
@@ -517,7 +629,7 @@ async fn run_ffmpeg_render(
             filter_parts.push("[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[vlayout]".to_string());
         }
         ShortsLayout::GamingSplit => {
-            // Camera on TOP (1080x730, AI Face Tracked + Zero-Border) + Content on BOTTOM (1080x1190)
+            // Camera on TOP (1080x730, AI Face Tracked + Zero-Border) + Content on BOTTOM (1080x1190, AI Director)
             filter_parts.push("[vbase]split=2[cam_in][bot_in]".to_string());
             filter_parts.push(build_camera_filter_chain(
                 "[cam_in]",
@@ -527,26 +639,16 @@ async fn run_ffmpeg_render(
                 webcam_corner,
                 camera_track,
             ));
-            match content_fit {
-                ContentFit::Fill => {
-                    filter_parts.push(
-                        "[bot_in]scale=1080:1190:force_original_aspect_ratio=increase,crop=1080:1190[bot]"
-                            .to_string(),
-                    );
-                }
-                ContentFit::FitBlur => {
-                    filter_parts.push("[bot_in]split=2[gb_bg_in][gb_fg_in]".to_string());
-                    filter_parts.push(
-                        "[gb_bg_in]scale=1080:1190:force_original_aspect_ratio=increase,crop=1080:1190,boxblur=20:5[gb_bg]"
-                            .to_string(),
-                    );
-                    filter_parts.push(
-                        "[gb_fg_in]scale=1080:1190:force_original_aspect_ratio=decrease[gb_fg]"
-                            .to_string(),
-                    );
-                    filter_parts.push("[gb_bg][gb_fg]overlay=(W-w)/2:(H-h)/2[bot]".to_string());
-                }
-            }
+            push_content_filter_chain(
+                &mut filter_parts,
+                "[bot_in]",
+                "[bot]",
+                "gb",
+                1080,
+                1190,
+                content_fit,
+                content_track,
+            );
             filter_parts.push("[cam][bot]vstack=inputs=2,setsar=1[vlayout]".to_string());
         }
     }

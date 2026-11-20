@@ -83,6 +83,12 @@ jobs:
           body: |
             ## Aicut ${{ steps.tag.outputs.name }} — Estúdio Modular AI-First para Windows 11
 
+            ### Novidades da v0.5.2 — IA Diretor de Conteúdo (Janela Inferior: Quem Está Falando + Ação em Destaque)
+            - **Foco Dinâmico em Quem Está Falando (`smart_focus` — novo padrão da janela de baixo):** detecta os rostos na área do conteúdo (vídeos reagidos, entrevistas, podcasts, cutscenes) e mede a atividade labial/mandibular frame a frame com histerese editorial — acompanhando quem está falando de verdade, enquadrando em *two-shot* quando duas pessoas cabem juntas ou fazendo corte limpo de câmera quando a fala muda de lado!
+            - **Rastreamento do Momento de Ação / Destaque (Gameplay, Trailers & Demos):** quando não há um orador em primeiro plano, uma grade visual 32×18 de movimento compensado por pan + contraste/saturação desliza a janela de recorte para capturar automaticamente o ponto de maior ação/destaque em cada instante.
+            - **Máscara Anti-Duplicação da Webcam:** mascara automaticamente a caixa da webcam do streamer (já exibida na janela superior) para que a janela inferior nunca persiga nem duplique a webcam do canto.
+            - **Extração Única + Dual `sendcmd` (`crop@cam` + `crop@content` a 20 Hz):** analisa as duas janelas em uma única passada de frames com física suave de câmera e 100% da aceleração NVENC da GPU.
+
             ### Novidades da v0.5.1 — IA Cameraman: Rastreamento Facial Suave & Webcam Sem Bordas
             - **IA Facial 100% Nativa em Rust (`tract-onnx` + `UltraFace RFB-320` ~1,2 MB, zero Python/DLL):** detecta o rosto do apresentador ao longo de todo o corte com **filtro anti-NPC** (não confunde o streamer com personagens do jogo).
             - **Eliminação Automática de Bordas da Webcam (Mediana Temporal + Inset Anti-Borda):** identifica as 4 paredes exatas da caixa da webcam do OBS e trava matematicamente o enquadramento dentro da área limpa — **zero bordas ou vazamento da gameplay na janela de cima**!

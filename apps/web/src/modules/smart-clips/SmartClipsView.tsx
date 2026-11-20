@@ -87,19 +87,20 @@ const DESCRIPTION_PRESETS = [
 
 type ShortsLayout = "template_split" | "gaming_split" | "fit_blur" | "center_crop" | "original";
 type WebcamCorner = "auto_face" | "bottom_right" | "bottom_left" | "top_right" | "top_left" | "center";
+type ContentFitMode = "smart_focus" | "fill" | "fit_blur";
 
 const SHORTS_LAYOUTS: Array<{ id: ShortsLayout; short: string; label: string; desc: string }> = [
   {
     id: "template_split",
     short: "Moldura SMOKING33",
-    label: "Moldura Shorts (SMOKING33) · Câmera em cima + conteúdo em baixo",
-    desc: "Aplica sua moldura 9:16 com borda dourada: webcam na janela superior e conteúdo/gameplay na janela inferior.",
+    label: "Moldura Shorts (SMOKING33) · Câmera em cima + foco em quem fala/ação em baixo",
+    desc: "Moldura 9:16 com borda dourada: webcam sem bordas com rastreamento facial em cima e IA Diretor enquadrando quem fala ou a ação em destaque em baixo.",
   },
   {
     id: "gaming_split",
     short: "Split sem moldura",
-    label: "Split 9:16 sem moldura · Câmera em cima + conteúdo em baixo",
-    desc: "Webcam cheia na parte superior e gameplay/conteúdo na parte inferior, sem moldura.",
+    label: "Split 9:16 sem moldura · Câmera em cima + foco em quem fala/ação em baixo",
+    desc: "Webcam cheia com rastreamento facial em cima e IA Diretor enquadrando quem fala ou o momento de ação em baixo, sem moldura.",
   },
   {
     id: "fit_blur",
@@ -178,7 +179,7 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
   // Shorts rendering options
   const [layout, setLayout] = useState<ShortsLayout>("template_split");
   const [webcamCorner, setWebcamCorner] = useState<WebcamCorner>("auto_face");
-  const [contentFit, setContentFit] = useState<"fill" | "fit_blur">("fill");
+  const [contentFit, setContentFit] = useState<ContentFitMode>("smart_focus");
   const [faceTracking, setFaceTracking] = useState<boolean>(true);
   const [faceZoom, setFaceZoom] = useState<number>(1.0);
   const [borderTrimPct, setBorderTrimPct] = useState<number>(0.045);
@@ -913,9 +914,10 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
                   id="sc-fit"
                   className="select"
                   value={contentFit}
-                  onChange={(e) => setContentFit(e.target.value as "fill" | "fit_blur")}
+                  onChange={(e) => setContentFit(e.target.value as ContentFitMode)}
                 >
-                  <option value="fill">Preencher janela (sem bordas)</option>
+                  <option value="smart_focus">IA Diretor · Enquadra quem fala ou a ação em destaque (Recomendado)</option>
+                  <option value="fill">Centro fixo (preencher janela sem bordas)</option>
                   <option value="fit_blur">Tela 16:9 inteira + blur</option>
                 </select>
               </Field>
