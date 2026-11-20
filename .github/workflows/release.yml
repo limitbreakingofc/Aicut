@@ -83,7 +83,9 @@ jobs:
           body: |
             ## Aicut ${{ steps.tag.outputs.name }} — Estúdio Modular AI-First para Windows 11
 
-            ### Novidades & Correções da v0.9.2 — Gemini Anti-503 + IA Local GPU no Motion Studio + Ilustrações Animadas Sob Medida (Zero Padronização)
+            ### Novidades & Correções da v0.9.3 — Detector Real de Conteúdo Pausado + Zero Padronização + Gemini Anti-503 + IA Local GPU no Motion Studio
+            - **Detector automático pixel a pixel de conteúdo pausado/estático (`detect_static_content_intervals`):** analisa a área de conteúdo embaixo (mascarando a webcam em cima) para identificar os segundos exatos em que o streamer pausou o vídeo assistido e ficou falando — e envia esses intervalos exatos para a IA preencher a parte de baixo com **ilustrações vetoriais SVG e animações sob medida** ilustrando o que está sendo dito!
+            - **Zero padrões fixos antes da IA trabalhar:** removidos os layouts e barras pré-fabricados; a IA decide na hora toda a estética e animação de cada corte.
             - **Fim das falhas por HTTP 503 (`high demand`) no Gemini:** agora o motor Gemini faz **retentativas automáticas com backoff** e **failover completo entre até 6 modelos ativos** na sua chave (ex.: `gemini-3.8-pro` → `gemini-3.8-flash` → `gemini-2.5-pro` → `gemini-2.5-flash` → `gemini-2.5-flash-lite`) em Motion Studio, Cortes Shorts e Revisão de Enquadramento!
             - **IA Local Grátis (`llama-server` + `Qwen2.5-VL` na GPU) agora funciona no Motion Studio + Failover Cruzado Automático:**
               - O Motion Studio respeita o motor escolhido em **Configurações → IA & Chaves** (`Gemini API` ou `Local grátis GPU`).

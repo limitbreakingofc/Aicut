@@ -79,6 +79,174 @@ async fn extract_clip_storyboard_b64(
     bytes.map(|b| base64::engine::general_purpose::STANDARD.encode(b))
 }
 
+/// Mathematically detects exact timecode intervals where the bottom CONTENT area is PAUSED /
+/// STATIC (e.g., streamer paused the reacted video and is talking/explaining on webcam while
+/// the content window below stays frozen). Samples at 2fps in 160x90 grayscale (~0.3s total),
+/// excluding `webcam_rect` so streamer movement never hides a paused content screen.
+async fn detect_static_content_intervals(
+    ffmpeg_bin: &Path,
+    video_path: &Path,
+    clip_start: f64,
+    duration_sec: f64,
+    webcam_rect: NormalizedRect,
+    content_rect: Option<NormalizedRect>,
+) -> Vec<(f64, f64)> {
+    const W: usize = 160;
+    const H: usize = 90;
+    const SAMPLE_FPS: f64 = 2.0;
+
+    let dur = duration_sec.clamp(1.0, 240.0);
+    let vf = format!("fps={SAMPLE_FPS},scale={W}:{H},format=gray");
+    let mut cmd = Command::new(ffmpeg_bin);
+    configure_tokio_command(&mut cmd);
+    let out = match cmd
+        .args([
+            "-ss",
+            &format!("{clip_start:.3}"),
+            "-t",
+            &format!("{dur:.3}"),
+            "-i",
+        ])
+        .arg(video_path)
+        .args(["-vf", &vf, "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return Vec::new(),
+    };
+
+    find_static_intervals_from_luma_frames(
+        &out,
+        W,
+        H,
+        SAMPLE_FPS,
+        dur,
+        webcam_rect,
+        content_rect,
+    )
+}
+
+/// Pure function computing static/paused content windows from raw grayscale frames.
+pub fn find_static_intervals_from_luma_frames(
+    raw_gray: &[u8],
+    w: usize,
+    h: usize,
+    sample_fps: f64,
+    duration_sec: f64,
+    webcam_rect: NormalizedRect,
+    content_rect: Option<NormalizedRect>,
+) -> Vec<(f64, f64)> {
+    let frame_size = w * h;
+    if frame_size == 0 || sample_fps <= 0.0 {
+        return Vec::new();
+    }
+    let n_frames = raw_gray.len() / frame_size;
+    if n_frames < 3 {
+        return Vec::new();
+    }
+
+    let c_rect = content_rect
+        .map(NormalizedRect::clamped)
+        .unwrap_or(NormalizedRect {
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+        });
+    let w_rect = webcam_rect.clamped();
+
+    let cx0 = ((c_rect.x * w as f64).floor() as usize).min(w);
+    let cx1 = (((c_rect.x + c_rect.w) * w as f64).ceil() as usize).min(w);
+    let cy0 = ((c_rect.y * h as f64).floor() as usize).min(h);
+    let cy1 = (((c_rect.y + c_rect.h) * h as f64).ceil() as usize).min(h);
+
+    let wx0 = ((w_rect.x * w as f64).floor() as usize).min(w);
+    let wx1 = (((w_rect.x + w_rect.w) * w as f64).ceil() as usize).min(w);
+    let wy0 = ((w_rect.y * h as f64).floor() as usize).min(h);
+    let wy1 = (((w_rect.y + w_rect.h) * h as f64).ceil() as usize).min(h);
+
+    // Compute per-step mean absolute difference inside content_rect minus webcam_rect
+    let mut is_static: Vec<bool> = Vec::with_capacity(n_frames - 1);
+    for f in 1..n_frames {
+        let prev = &raw_gray[(f - 1) * frame_size..f * frame_size];
+        let curr = &raw_gray[f * frame_size..(f + 1) * frame_size];
+        let mut sum_diff: u64 = 0;
+        let mut count: u64 = 0;
+        for y in cy0..cy1 {
+            let row = y * w;
+            for x in cx0..cx1 {
+                if x >= wx0 && x < wx1 && y >= wy0 && y < wy1 {
+                    continue;
+                }
+                let idx = row + x;
+                sum_diff += (prev[idx] as i32 - curr[idx] as i32).unsigned_abs() as u64;
+                count += 1;
+            }
+        }
+        let mad = if count > 0 {
+            sum_diff as f64 / count as f64
+        } else {
+            99.0
+        };
+        // Static / paused video (including subtle compression noise or small pause icon) has MAD < 2.4
+        is_static.push(mad < 2.4);
+    }
+
+    // Bridge single-step (~0.5s) micro-blips (e.g., mouse cursor nudge or YouTube pause HUD fade)
+    if is_static.len() >= 3 {
+        let orig = is_static.clone();
+        for i in 1..(is_static.len() - 1) {
+            if !orig[i] && orig[i - 1] && orig[i + 1] {
+                is_static[i] = true;
+            }
+        }
+    }
+
+    let mut intervals: Vec<(f64, f64)> = Vec::new();
+    let mut run_start: Option<usize> = None;
+    for (i, &st) in is_static.iter().enumerate() {
+        if st && run_start.is_none() {
+            run_start = Some(i);
+        } else if !st {
+            if let Some(s_idx) = run_start.take() {
+                let t0 = s_idx as f64 / sample_fps;
+                let t1 = (i as f64 / sample_fps).min(duration_sec);
+                if t1 - t0 >= 1.5 {
+                    intervals.push((t0, t1));
+                }
+            }
+        }
+    }
+    if let Some(s_idx) = run_start {
+        let t0 = s_idx as f64 / sample_fps;
+        let t1 = duration_sec;
+        if t1 - t0 >= 1.5 {
+            intervals.push((t0, t1));
+        }
+    }
+    intervals
+}
+
+fn format_static_intervals_for_ai(intervals: &[(f64, f64)], dur: f64) -> String {
+    if intervals.is_empty() {
+        return "Análise automática de movimento na área de conteúdo (embaixo): o vídeo de baixo está em movimento na maior parte do corte. Preserve a ação real visível e crie animações/ilustrações apenas nos trechos onde o streamer estiver explicando conceitos ou onde a tela estiver mais calma.".to_string();
+    }
+    let mut lines = vec![
+        "ANÁLISE REAL PIXEL A PIXEL DA ÁREA DE CONTEÚDO (EMBAIXO) — TRECHOS ONDE O VÍDEO ESTÁ PAUSADO / ESTÁTICO:".to_string(),
+    ];
+    for (s, e) in intervals {
+        lines.push(format!(
+            "- {s:.1}s até {e:.1}s ({:.1}s estático/pausado embaixo) → PRIORIDADE MÁXIMA: substitua/cubra a janela de conteúdo parada (`class=\"hf-content-stage\"`) com ILUSTRAÇÕES VETORIAIS SVG E ANIMAÇÕES DINÂMICAS ilustrando exatamente o que está sendo dito nesse trecho, mantendo a webcam limpa em cima!",
+            (e - s).max(0.0)
+        ));
+    }
+    lines.push(format!(
+        "Nos demais intervalos (dentro de 0.0s..{dur:.1}s) o vídeo de conteúdo está tocando/em movimento — deixe o conteúdo real visível embaixo sem tampar a ação!"
+    ));
+    lines.join("\n")
+}
+
 /// Watches the video frames + reads the transcript and automatically crafts a bespoke,
 /// video-specific editing plan + dynamic camera choreography + custom HyperFrames motion code!
 pub async fn plan_composition_with_ai(
@@ -138,13 +306,23 @@ pub async fn plan_composition_with_ai(
         .map(|rt| rt.transcript);
     let transcript_excerpt = format_relative_transcript(transcript.as_ref(), start, end);
 
-    let storyboard_b64 = match ffmpeg_bin {
+    let (storyboard_b64, static_intervals) = match ffmpeg_bin {
         Some(ref bin) => {
-            extract_clip_storyboard_b64(bin, Path::new(&source.file_path), start, duration_sec)
-                .await
+            let sb = extract_clip_storyboard_b64(bin, Path::new(&source.file_path), start, duration_sec).await;
+            let st = detect_static_content_intervals(
+                bin,
+                Path::new(&source.file_path),
+                start,
+                duration_sec,
+                webcam_rect,
+                framing.content_rect,
+            )
+            .await;
+            (sb, st)
         }
-        None => None,
+        None => (None, Vec::new()),
     };
+    let static_report = format_static_intervals_for_ai(&static_intervals, duration_sec);
 
     let mut comp = AicutComposition {
         id: Uuid::new_v4().to_string(),
@@ -183,6 +361,7 @@ pub async fn plan_composition_with_ai(
         duration_sec,
         goal_str,
         &transcript_excerpt,
+        &static_report,
         storyboard_b64.is_some(),
     );
 
@@ -223,15 +402,16 @@ pub async fn plan_composition_with_ai(
     }
 
     if !used_ai {
-        comp.scenes = build_smart_default_scenes(duration_sec);
-        comp.motion_html = Some(build_default_hyperframes_motion(duration_sec, &comp.title));
-        comp.creative_direction = "Edição base local (fallback)".to_string();
+        // ZERO pre-baked templates or fake overlays before the AI actually works!
+        comp.scenes = build_clean_neutral_scenes(duration_sec);
+        comp.motion_html = None;
+        comp.creative_direction = "Aguardando IA (sem padronização fixa)".to_string();
         reply = if let Some(err) = ai_error_note {
             format!(
-                "Não consegui usar a IA agora ({err}). Apliquei uma base inicial para o preview — configure o Gemini ou baixe um modelo local (Qwen2.5-VL + llama-server) em Configurações → IA & Chaves e tente novamente!"
+                "Não consegui conectar na IA agora ({err}). Mantive o corte limpo sem aplicar nenhum padrão fixo — configure o Gemini ou a IA Local Grátis (Qwen2.5-VL) em Configurações → IA & Chaves e tente novamente!"
             )
         } else {
-            "Configure sua Gemini API Key ou ative a IA Local Grátis (Qwen2.5-VL) em Configurações → IA & Chaves para eu assistir aos frames e criar edições e ilustrações animadas 100% sob medida para este corte.".to_string()
+            "Nenhuma IA configurada ainda — mantive o corte limpo sem padrões fixos. Configure sua Gemini API Key ou baixe a IA Local Grátis (Qwen2.5-VL + llama-server) em Configurações → IA & Chaves para eu analisar os trechos pausados embaixo e criar ilustrações e animações sob medida!".to_string()
         };
     }
 
@@ -268,18 +448,29 @@ pub async fn edit_composition_via_chat(
 
     let source = kernel.repo.get_media(&comp.media_id).ok().flatten();
     let ffmpeg_bin = kernel.tools.resolve_tool("ffmpeg").ok();
-    let storyboard_b64 = match (source.as_ref(), ffmpeg_bin.as_ref()) {
+    let (storyboard_b64, static_intervals) = match (source.as_ref(), ffmpeg_bin.as_ref()) {
         (Some(src), Some(bin)) => {
-            extract_clip_storyboard_b64(
+            let sb = extract_clip_storyboard_b64(
                 bin,
                 Path::new(&src.file_path),
                 comp.clip_start_sec,
                 comp.duration_sec,
             )
-            .await
+            .await;
+            let st = detect_static_content_intervals(
+                bin,
+                Path::new(&src.file_path),
+                comp.clip_start_sec,
+                comp.duration_sec,
+                comp.webcam_rect,
+                comp.content_rect,
+            )
+            .await;
+            (sb, st)
         }
-        _ => None,
+        _ => (None, Vec::new()),
     };
+    let static_report = format_static_intervals_for_ai(&static_intervals, comp.duration_sec);
 
     let transcript = kernel
         .repo
@@ -296,6 +487,7 @@ pub async fn edit_composition_via_chat(
     let prompt = build_conversational_editor_prompt(
         &comp,
         &transcript_excerpt,
+        &static_report,
         trimmed,
         storyboard_b64.is_some(),
     );
@@ -497,106 +689,23 @@ fn insert_scene_into_timeline(scenes: &mut Vec<MotionScene>, inserted: MotionSce
     *scenes = next;
 }
 
-fn build_default_hyperframes_motion(dur: f64, title: &str) -> String {
-    let hook_end = (dur * 0.14).clamp(2.8, 4.2);
-    let safe_title: String = title
-        .chars()
-        .take(28)
-        .collect::<String>()
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
-    format!(
-        r#"<div class="hf-headline" data-start="0.15" data-end="{hook_end:.2}" data-anim="pop">{safe_title}</div>
-<div style="position:absolute;bottom:24px;left:48px;right:48px;height:6px;border-radius:99px;background:rgba(255,255,255,0.16);overflow:hidden;" data-start="0" data-end="{dur:.2}" data-anim="fade">
-  <div id="aicut-prog" style="height:100%;width:0%;background:linear-gradient(90deg,#eab308,#f97316);border-radius:99px;"></div>
-</div>
-<script>
-window.__aicutCustomSeek = function(t) {{
-  var p = document.getElementById('aicut-prog');
-  if (p) p.style.width = Math.min(100, Math.max(0, (t / {dur:.2}) * 100)).toFixed(2) + '%';
-}};
-</script>"#
-    )
-}
-
-fn build_smart_default_scenes(dur: f64) -> Vec<MotionScene> {
-    if dur <= 10.0 {
-        return vec![MotionScene {
-            id: "sc-main".into(),
-            title: "SMOKING33".into(),
-            start_sec: 0.0,
-            end_sec: dur,
-            layout: SceneLayoutPreset::SplitBranded,
-            transition_in: SceneTransition::Cut,
-            pip: PipConfig::default(),
-            content_focus: ContentFocusConfig::default(),
-            overlay: SceneOverlay::default(),
-            effects: SceneEffects { camera_zoom_end: 1.04, ..Default::default() },
-            rationale: "Clipe curto em SMOKING33.".into(),
-            custom_code: None,
-        }];
-    }
-    let hook_end = (dur * 0.14).clamp(3.0, 4.5);
-    let mid_start = (dur * 0.42).max(hook_end + 3.0);
-    let mid_end = (dur * 0.72).min(dur - 3.0).max(mid_start + 3.0);
-    vec![
-        MotionScene {
-            id: "sc-hook".into(),
-            title: "Gancho".into(),
-            start_sec: 0.0,
-            end_sec: hook_end,
-            layout: SceneLayoutPreset::CameraFocus,
-            transition_in: SceneTransition::Cut,
-            pip: PipConfig::default(),
-            content_focus: ContentFocusConfig::default(),
-            overlay: SceneOverlay::default(),
-            effects: SceneEffects { camera_zoom_end: 1.08, ..Default::default() },
-            rationale: "Punch-in natural na webcam para prender atenção no gancho.".into(),
-            custom_code: None,
-        },
-        MotionScene {
-            id: "sc-split-1".into(),
-            title: "Desenvolvimento".into(),
-            start_sec: hook_end,
-            end_sec: mid_start,
-            layout: SceneLayoutPreset::SplitBranded,
-            transition_in: SceneTransition::Fade,
-            pip: PipConfig::default(),
-            content_focus: ContentFocusConfig::default(),
-            overlay: SceneOverlay::default(),
-            effects: SceneEffects::default(),
-            rationale: "SMOKING33 natural equilibrando webcam e conteúdo.".into(),
-            custom_code: None,
-        },
-        MotionScene {
-            id: "sc-hero".into(),
-            title: "Destaque na tela".into(),
-            start_sec: mid_start,
-            end_sec: mid_end,
-            layout: SceneLayoutPreset::ContentHeroPip,
-            transition_in: SceneTransition::Fade,
-            pip: PipConfig { corner: PipCorner::TopRight, width_pct: 0.34, ..Default::default() },
-            content_focus: ContentFocusConfig::default(),
-            overlay: SceneOverlay::default(),
-            effects: SceneEffects { camera_zoom_end: 1.06, ..Default::default() },
-            rationale: "Conteúdo em tela cheia no ponto principal com reação em PiP.".into(),
-            custom_code: None,
-        },
-        MotionScene {
-            id: "sc-close".into(),
-            title: "Fechamento".into(),
-            start_sec: mid_end,
-            end_sec: dur,
-            layout: SceneLayoutPreset::SplitBranded,
-            transition_in: SceneTransition::Fade,
-            pip: PipConfig::default(),
-            content_focus: ContentFocusConfig::default(),
-            overlay: SceneOverlay::default(),
-            effects: SceneEffects::default(),
-            rationale: "Retorno limpo ao SMOKING33 para encerramento.".into(),
-            custom_code: None,
-        },
-    ]
+/// Returns a single clean unedited base scene — ZERO pre-baked layouts, fake headlines,
+/// or standardized progress bars before the AI actually designs the edit live!
+fn build_clean_neutral_scenes(dur: f64) -> Vec<MotionScene> {
+    vec![MotionScene {
+        id: "sc-base".into(),
+        title: "Original".into(),
+        start_sec: 0.0,
+        end_sec: dur.max(1.0),
+        layout: SceneLayoutPreset::SplitBranded,
+        transition_in: SceneTransition::Cut,
+        pip: PipConfig::default(),
+        content_focus: ContentFocusConfig::default(),
+        overlay: SceneOverlay::default(),
+        effects: SceneEffects::default(),
+        rationale: "Corte limpo aguardando direção da IA.".into(),
+        custom_code: None,
+    }]
 }
 
 /// Unified dual-engine AI dispatcher for Motion Studio:
@@ -933,37 +1042,37 @@ fn build_context_aware_plan_prompt(
     dur: f64,
     goal: &str,
     transcript: &str,
+    static_report: &str,
     has_storyboard: bool,
 ) -> String {
     let vis_note = if has_storyboard {
-        "VOCÊ ESTÁ VENDO O STORYBOARD VISUAL REAL (grade 4x2 de frames do corte anexada)! Analise frame a frame: em quais momentos há ação visual real na tela de conteúdo e em quais momentos a área de conteúdo está parada/vazia/monótona enquanto a pessoa fala."
+        "VOCÊ ESTÁ VENDO O STORYBOARD VISUAL REAL (grade 4x2 de frames do corte anexada)! Observe a câmera do streamer em cima e o vídeo de conteúdo embaixo."
     } else {
-        "Baseie-se profundamente na transcrição e no assunto exato deste corte."
+        "Baseie-se profundamente na transcrição, nos intervalos pausados detectados e no assunto exato deste corte."
     };
     format!(
         r##"Você é um Editor de Vídeo & Diretor Criativo de Motion Graphics / Ilustrações Animadas (estilo Remotion + HyperFrames HTML/CSS/SVG/JS).
 {vis_note}
 
+{static_report}
+
 PRINCÍPIO CENTRAL — ZERO PADRONIZAÇÃO:
 - NUNCA use uma fórmula fixa, template repetitivo ou apenas uma barrinha genérica de título!
-- Cada vídeo merece uma identidade visual, paleta de cores, tipografia, ritmo de cortes e animações **100% criados do zero para o assunto exato deste corte** de {dur:.1}s ("{title}").
-- **REGRA DE OURO PARA A ÁREA DE CONTEÚDO PARADA:** Sempre que você perceber (pelos frames ou pela fala) que **não há nada visualmente relevante acontecendo na área de conteúdo embaixo** (ex.: tela parada, lobby, menu, chat estático, pessoa apenas contando história, explicando um conceito, citando valores ou comparando ideias), **CRIE ILUSTRAÇÕES E ANIMAÇÕES VETORIAIS COMPLETAS NO `motion_html`** cobrindo a área de conteúdo (`class="hf-content-stage"` — `left:30px; top:765px; width:1020px; height:889px;` ou estilo próprio) enquanto a webcam continua 100% limpa e visível em cima!
-  * Exemplos de ilustrações/animações criativas na área de conteúdo quando estiver ociosa:
-    - Falou de números/dinheiro/crescimento → desenhe um **gráfico SVG animado / barras crescendo (`data-bar-to="82"`) / contador (`data-count-from`/`data-count-to`)** com cores do tema!
-    - Explicou uma história, processo ou ideia → desenhe uma **cena vetorial SVG ilustrativa, diagrama animado, linha do tempo com `data-anim="draw"`, ícones/personagens/objetos geométricos com movimento (`float`, `pop`, `slide-up`) e tipografia cinética** representando visualmente o que está sendo dito!
-    - Comparou duas coisas (A vs B) → anime um **duelo visual / cards lado a lado com spring physics**!
-  * E quando **HOUVER ação visual importante na tela** (jogada, vídeo reagido, detalhe visual), **NÃO tampe a ação**: destaque a tela real (`content_hero_pip`, `callout_zoom`, `split_clean` ou `split_branded`) usando apenas anotações leves (setas/círculos `data-anim="draw"` ou badges sutis)!
+- Você decide NA HORA como editar este corte específico de {dur:.1}s ("{title}"), criando paleta de cores, tipografia, ilustrações e ritmo próprios para o assunto exato do vídeo.
+- **REGRA DE OURO (VÍDEO PAUSADO / ESTÁTICO EMBAIXO):** Em reacts e lives, a câmera do streamer fica em cima e o vídeo assistido fica embaixo. Quando o streamer PAUSA o vídeo de baixo e começa a falar, a parte de baixo fica parada/estática — É EXATAMENTE NESSES MOMENTOS que o motion entra para trazer dinamismo!
+  * Cubra a área de conteúdo parada (`class="hf-content-stage"` — `left:30px; top:765px; width:1020px; height:889px;`, mantendo a webcam do streamer 100% visível em cima!) com **ILUSTRAÇÕES VETORIAIS SVG ANIMADAS, DIAGRAMAS, GRÁFICOS, CENAS EXPLICATIVAS, COMPARAÇÕES VISUAIS OU TIPOGRAFIA CINÉTICA** que ilustrem exatamente o que o streamer está falando naqueles segundos!
+  * E nos trechos em que o vídeo de baixo ESTÁ TOCANDO / EM AÇÃO, **NÃO tampe o vídeo de baixo**: deixe o conteúdo real visível (com cortes de câmera limpos e, no máximo, destaques sutis se fizer sentido)!
 
 Contexto do corte & pedido do criador:
 {goal}
 
 Você controla DUAS camadas sincronizadas:
 1. **Câmera & Ritmo (`scenes[]`, 0.0 até {dur:.1}s sem lacunas):**
-   - `layout`: escolha livremente conforme cada segundo do vídeo: "split_branded", "split_clean", "content_hero_pip", "content_fullscreen", "camera_focus", "camera_hero_pip", "callout_zoom".
+   - `layout`: escolha livremente conforme cada segundo do vídeo: "split_branded", "split_clean", "content_hero_pip", "content_fullscreen", "camera_focus", "camera_hero_pip", "callout_zoom". (Nos trechos com `hf-content-stage` ilustrando embaixo, prefira "split_branded" ou "split_clean" para a webcam ficar limpa em cima enquanto sua ilustração domina a área de baixo!)
    - `effects`: `camera_zoom_end` (1.0..1.20), `impact_shake` (0.0..0.8), `vignette` (bool), `color_mood` ("natural"|"vibrant"|"dramatic"|"cyber").
 
 2. **Ilustrações & Motion Graphics Customizados (`motion_html` — canvas transparente 1080x1920, 100% offline e determinístico):**
-   - Você tem liberdade total para escrever `<style>`, HTML rico, `<svg viewBox="...">` com ilustrações detalhadas e `<script>window.__aicutCustomSeek = function(t) {{ ... }};</script>` usando os utilitários embutidos estilo Remotion: `window.__aicut.interpolate(t, inS, inE, outS, outE, 'out'|'back'|'inout')` e `window.__aicut.spring(t, start, stiffness, damping)`.
+   - Liberdade total para escrever `<style>`, HTML rico, `<svg viewBox="...">` com ilustrações detalhadas e `<script>window.__aicutCustomSeek = function(t) {{ ... }};</script>` usando os utilitários embutidos estilo Remotion: `window.__aicut.interpolate(t, inS, inE, outS, outE, 'out'|'back'|'inout')` e `window.__aicut.spring(t, start, stiffness, damping)`.
    - Todo elemento animado por atributo usa `data-start="SEG"`, `data-end="SEG"` e `data-anim="pop|slide-up|slide-down|slide-left|slide-right|fade|scale|pulse|float|spin|draw|flash"` (opcional `data-count-from`/`data-count-to`/`data-prefix`/`data-suffix` ou `data-bar-to="80"`).
    - NÃO use URLs externas nem `<img>` externos nem CSS `@keyframes` solto (tudo deve ser guiado pelo tempo `t`!).
    - Preserve o rosto na webcam (topo) limpo e deixe a faixa inferior das legendas (`y > 1660px`) legível.
@@ -973,7 +1082,7 @@ Responda APENAS JSON válido:
   "mode": "apply",
   "title": "Título curto do corte",
   "creative_direction": "Resumo em 1 frase da direção visual e ilustrações criadas para este vídeo.",
-  "assistant_reply": "Explicação natural em PT-BR contando o que você viu no vídeo, onde criou ilustrações/animações na área de conteúdo e quais técnicas aplicou.",
+  "assistant_reply": "Explicação natural em PT-BR contando em quais segundos o conteúdo estava pausado/estático, que ilustrações/animações você criou para dar dinamismo e quais decisões de edição aplicou.",
   "burn_subtitles": true,
   "scenes": [ ... ],
   "motion_html": "<style>...</style><div ...>...</div>"
@@ -987,6 +1096,7 @@ Transcrição com tempos relativos (0.0s .. {dur:.1}s):
 fn build_conversational_editor_prompt(
     comp: &AicutComposition,
     transcript: &str,
+    static_report: &str,
     user_msg: &str,
     has_storyboard: bool,
 ) -> String {
@@ -1002,21 +1112,23 @@ fn build_conversational_editor_prompt(
         .collect::<Vec<_>>()
         .join("\n");
     let vis_note = if has_storyboard {
-        "O storyboard visual (4x2 frames reais do corte) está anexado — observe o que acontece na tela e onde a área de conteúdo está parada para criar ilustrações animadas."
+        "O storyboard visual (4x2 frames reais do corte) está anexado — observe o que acontece na tela e os momentos pausados embaixo."
     } else {
         ""
     };
 
     format!(
-        r##"Você é o Editor de Vídeo & Diretor de Ilustrações/Motion Graphics pessoal do criador no Aicut (sem padronização fixa — cada vídeo tem sua própria linguagem visual, ilustrações SVG e animações sob medida).
+        r##"Você é o Editor de Vídeo & Diretor de Ilustrações/Motion Graphics pessoal do criador no Aicut (zero padronização — cada vídeo tem sua própria identidade visual e ilustrações animadas nos trechos em que o vídeo de baixo está pausado/estático).
 {vis_note}
+
+{static_report}
 
 IMPORTANTE — Escolha `mode` conforme a intenção da mensagem do criador:
 - Use `"mode": "discuss"` quando o criador estiver **conversando, perguntando sua opinião, pedindo ideias ou planejando** ANTES de aplicar. Responda de forma criativa e específica para este vídeo sem precisar reescrever `scenes`/`motion_html`.
 - Use `"mode": "apply"` quando o criador pedir para **editar, criar ilustrações/animações, aplicar um plano, melhorar, trocar estilo ou remover algo**. Entregue `scenes` completos (0.0 .. {dur:.1}s sem lacunas) e o `motion_html` completo atualizado!
 
 Regras criativas para `motion_html` (canvas 1080x1920 transparente, zero padronização):
-- Crie ilustrações vetoriais SVG, diagramas, gráficos, cenários animados e tipografia cinética únicos para o tema do vídeo — especialmente preenchendo a área de conteúdo (`class="hf-content-stage"`, `left:30px; top:765px; width:1020px; height:889px`) quando nada relevante estiver ocorrendo no vídeo embaixo!
+- Nos trechos em que o conteúdo embaixo está pausado/estático enquanto o streamer fala, preencha a área de conteúdo (`class="hf-content-stage"`, `left:30px; top:765px; width:1020px; height:889px`) com ilustrações vetoriais SVG, diagramas, gráficos, cenários animados e tipografia cinética ilustrando o que está sendo dito!
 - Use `<style>`, HTML/SVG inline, atributos `data-start`, `data-end`, `data-anim="pop|slide-up|slide-down|slide-left|slide-right|fade|scale|pulse|float|spin|draw|flash"`, `data-count-from`/`data-count-to`, `data-bar-to`, e opcional `<script>window.__aicutCustomSeek = function(t){{...}};</script>` com `window.__aicut.interpolate(...)` e `window.__aicut.spring(...)`.
 - Sem URLs externas; mantenha a webcam limpa e a faixa das legendas (`y > 1660px`) legível.
 
@@ -1181,7 +1293,7 @@ mod tests {
             engine_preference: "hybrid_nvenc".into(),
             motion_html: None,
             creative_direction: String::new(),
-            scenes: build_smart_default_scenes(30.0),
+            scenes: build_clean_neutral_scenes(30.0),
             chat_history: vec![],
             rendered_media_id: None,
             updated_at: Utc::now().to_rfc3339(),
@@ -1193,6 +1305,37 @@ mod tests {
         comp.normalize();
         assert!(reply.contains("10.0s"));
         assert!(comp.motion_html.as_deref().unwrap_or("").contains("OLHA O PLACAR!"));
+    }
+
+    #[test]
+    fn detects_paused_content_intervals_even_while_webcam_moves() {
+        // 10 frames @ 2fps = 5.0s; frames 0..3 moving content, frames 3..9 paused content (webcam still changing!)
+        let w = 20usize;
+        let h = 10usize;
+        let mut raw = Vec::with_capacity(10 * w * h);
+        let webcam = NormalizedRect { x: 0.7, y: 0.0, w: 0.3, h: 0.4 };
+        for f in 0..10usize {
+            for y in 0..h {
+                for x in 0..w {
+                    let in_cam = x >= 14 && y < 4;
+                    let pix: u8 = if in_cam {
+                        // Webcam moves wildly every single frame!
+                        ((f * 53 + x * 11) % 250) as u8
+                    } else if f < 3 {
+                        // Content playing (changes strongly)
+                        ((f * 70 + x * 5) % 240) as u8
+                    } else {
+                        // Content paused / static!
+                        42
+                    };
+                    raw.push(pix);
+                }
+            }
+        }
+        let intervals = find_static_intervals_from_luma_frames(&raw, w, h, 2.0, 5.0, webcam, None);
+        assert_eq!(intervals.len(), 1);
+        assert!(intervals[0].0 >= 1.4 && intervals[0].0 <= 1.6);
+        assert!(intervals[0].1 >= 4.9);
     }
 
     #[test]
