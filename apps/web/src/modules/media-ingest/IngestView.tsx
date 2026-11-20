@@ -183,7 +183,7 @@ export const IngestView: React.FC<IngestViewProps> = ({ tools, jobs, onNavigate,
     [onMediaChanged, onNotify],
   );
 
-  // Native Windows 11 Tauri v2 Drag & Drop across the entire dark canvas
+  // Native Linux Tauri v2 Drag & Drop across the entire dark canvas
   useEffect(() => {
     const tauriApi = (
       window as unknown as {

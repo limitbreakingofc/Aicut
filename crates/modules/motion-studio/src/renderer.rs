@@ -63,7 +63,7 @@ pub async fn render_composition_to_library(
     };
 
     // Capture bespoke HyperFrames HTML/CSS/SVG motion layer to transparent RGBA PNG sequence
-    // using Windows 11's built-in Chromium (Edge/Chrome) via CDP — zero extra downloads!
+    // using system Chromium/Chrome/Brave/Vivaldi on Linux via headless CDP.
     let wants_hyperframes = normalized
         .motion_html
         .as_deref()

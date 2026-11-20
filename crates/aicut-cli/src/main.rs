@@ -8,7 +8,7 @@ use std::path::PathBuf;
 #[command(
     name = "aicut",
     version,
-    about = "Aicut — Modular AI-First Media Studio for Windows 11 (CLI, Daemon & MCP Server)"
+    about = "Aicut — Modular AI-First Media Studio for Linux (CLI, Daemon & MCP Server)"
 )]
 struct Cli {
     /// Optional custom workspace directory

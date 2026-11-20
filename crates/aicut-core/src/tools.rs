@@ -11,18 +11,18 @@ use crate::error::{AicutError, AicutResult};
 use crate::events::{ActorKind, AicutEvent, EventBus};
 use crate::hardware::{AccelBackend, HardwareProfile};
 use crate::jobs::{JobManager, JobProgress};
-use crate::process::configure_tokio_command;
+use crate::process::{configure_linux_gpu_env_tokio, configure_std_command};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolInstallStrategy {
-    /// Downloads the official yt-dlp standalone binary matching host OS & CPU arch.
+    /// Downloads the official yt-dlp standalone binary matching host Linux CPU arch.
     YtDlpOfficialRelease,
-    /// Downloads the optimal FFmpeg/FFprobe build (including NVENC/AMF/QSV support on Windows x64).
+    /// Downloads the optimal Linux GPL FFmpeg/FFprobe build (with NVIDIA NVENC/NVDEC & VAAPI).
     FfmpegHardwareBundle,
-    /// Downloads the official ggml-org/whisper.cpp release matching GPU/CPU hardware (CUDA 12 / Vulkan / OpenBLAS / ARM64 / Linux).
+    /// Downloads the official ggml-org/whisper.cpp Linux release matching GPU/CPU hardware.
     WhisperCppOfficialRelease,
-    /// Downloads the official ggml-org/llama.cpp release matching GPU/CPU hardware (CUDA + cudart / Vulkan / Metal / CPU).
+    /// Downloads the official ggml-org/llama.cpp Linux release matching GPU/CPU hardware (CUDA / Vulkan / CPU).
     LlamaCppOfficialRelease,
     /// Companion binary provided alongside another managed tool (e.g. ffprobe inside ffmpeg bundle).
     CompanionOf(String),
@@ -75,7 +75,7 @@ pub struct ResolvedDownload {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveKind {
     SingleBinary,
-    FfmpegZip,
+    FfmpegTarXz,
     FfmpegTarGz,
     WhisperZip,
     WhisperTarGz,
@@ -193,135 +193,96 @@ impl ToolManager {
         match &def.strategy {
             ToolInstallStrategy::YtDlpOfficialRelease => {
                 let build = match tag {
-                    "win-x64" => "yt-dlp.exe (Windows x64 Official)",
-                    "win-arm64" => "yt-dlp_arm64.exe (Windows ARM64 Official)",
-                    "linux-x64" => "yt-dlp_linux (Linux x64 Standalone)",
                     "linux-arm64" => "yt-dlp_linux_aarch64 (Linux ARM64 Standalone)",
-                    "macos-arm64" | "macos-x64" => "yt-dlp_macos (macOS Universal)",
-                    _ => "yt-dlp (Generic)",
+                    _ => "yt-dlp_linux (Linux x64 Standalone)",
                 };
                 (
                     build.to_string(),
-                    format!("Selecionado automaticamente para plataforma {tag}."),
+                    format!("Selecionado automaticamente para Linux ({tag})."),
                 )
             }
             ToolInstallStrategy::FfmpegHardwareBundle | ToolInstallStrategy::CompanionOf(_) => {
                 let build = match tag {
-                    "win-x64" => "FFmpeg Win64 GPL (NVENC + AMF + QSV)",
-                    "win-arm64" => "FFmpeg WinARM64 Native GPL",
-                    "linux-x64" => "FFmpeg Linux64 GPL (VAAPI/NVENC)",
-                    "linux-arm64" => "FFmpeg Linux ARM64 GPL",
-                    _ => "FFmpeg System/Native Build",
+                    "linux-arm64" => "FFmpeg Linux ARM64 GPL (BtbN Static)",
+                    _ => "FFmpeg Linux x64 GPL (NVENC + CUDA + VAAPI)",
                 };
                 let hw_note = match accel {
                     AccelBackend::CudaNvenc => {
-                        "GPU NVIDIA detectada: build inclui suporte NVENC/NVDEC acelerado por hardware."
+                        "GPU NVIDIA detectada: suporte NVENC/NVDEC acelerado por hardware (também aproveita `pacman -S ffmpeg` se já instalado no sistema)."
                     }
                     AccelBackend::AmfDirectml => {
-                        "GPU AMD detectada: build inclui suporte AMF/D3D11VA acelerado por hardware."
+                        "GPU AMD detectada: build Linux GPL otimizada com VAAPI/libx264."
                     }
                     AccelBackend::QsvOpenvino => {
-                        "GPU Intel detectada: build inclui suporte QuickSync (QSV) acelerado por hardware."
+                        "GPU Intel detectada: build Linux GPL otimizada com QuickSync/VAAPI."
                     }
-                    AccelBackend::Metal => "Apple Silicon detectado: suporte VideoToolbox nativo.",
-                    AccelBackend::CpuOnly => {
-                        "Modo CPU otimizado: build multithread para todos os núcleos lógicos."
+                    AccelBackend::Metal | AccelBackend::CpuOnly => {
+                        "Modo CPU otimizado: build Linux multithread para todos os núcleos lógicos."
                     }
                 };
                 (build.to_string(), hw_note.to_string())
             }
             ToolInstallStrategy::WhisperCppOfficialRelease => match (tag, accel) {
-                ("win-x64", AccelBackend::CudaNvenc) => {
+                ("linux-x64", AccelBackend::CudaNvenc) => {
                     let cuda_label = self
                         .hardware
                         .cuda_version
                         .as_deref()
                         .map(|v| format!("CUDA {v}"))
-                        .unwrap_or_else(|| "CUDA".to_string());
-                    (
-                        format!("whisper.cpp Win64 {cuda_label} (GPU NVIDIA)"),
+                        .unwrap_or_else(|| "NVIDIA".to_string());
+                    let note = if self.hardware.cuda_runtime_installed {
                         format!(
-                            "GPU NVIDIA ({cuda_label}) detectada: seleciona automaticamente a maior build CUDA compatível (≤ {cuda_label}) publicada."
-                        ),
-                    )
+                            "GPU NVIDIA ({cuda_label}) + CUDA Runtime detectados: prioriza build Linux CUDA/Vulkan (ou `whisper-cli` nativo do Arch/CachyOS no PATH)."
+                        )
+                    } else {
+                        format!(
+                            "GPU NVIDIA ({cuda_label}) detectada: usa Vulkan/Linux oficial ou `whisper.cpp-cuda` nativo do Arch/CachyOS se instalado."
+                        )
+                    };
+                    (format!("whisper.cpp Linux x64 ({cuda_label})"), note)
                 }
-                ("win-arm64", AccelBackend::CudaNvenc) => {
-                    let cuda_label = self
-                        .hardware
-                        .cuda_version
-                        .as_deref()
-                        .map(|v| format!("CUDA {v}"))
-                        .unwrap_or_else(|| "CUDA".to_string());
-                    (
-                        format!("whisper.cpp Win ARM64 {cuda_label}"),
-                        format!("Windows ARM64 com NVIDIA ({cuda_label}): seleciona a maior build CUDA compatível."),
-                    )
-                }
-                ("win-x64", AccelBackend::AmfDirectml | AccelBackend::QsvOpenvino) => (
-                    "whisper.cpp Win64 Vulkan / OpenBLAS".to_string(),
-                    "GPU AMD/Intel detectada: prefere build Vulkan se disponível ou OpenBLAS SIMD otimizado."
-                        .to_string(),
-                ),
-                ("win-x64", _) => (
-                    "whisper.cpp Win64 OpenBLAS AVX2 (CPU)".to_string(),
-                    "Build oficial OpenBLAS otimizada para múltiplos núcleos de CPU no Windows 11."
-                        .to_string(),
-                ),
-                ("win-arm64", _) => (
-                    "whisper.cpp Win ARM64 Native".to_string(),
-                    "Build oficial nativa para Windows 11 ARM64.".to_string(),
-                ),
-                ("linux-x64", _) => (
-                    "whisper.cpp Linux x64 Official".to_string(),
-                    "Build oficial pré-compilada Linux x64.".to_string(),
-                ),
                 ("linux-arm64", _) => (
                     "whisper.cpp Linux ARM64 Official".to_string(),
                     "Build oficial pré-compilada Linux ARM64.".to_string(),
                 ),
                 _ => (
-                    format!("whisper.cpp ({tag})"),
-                    "Build oficial ggml-org/whisper.cpp.".to_string(),
+                    "whisper.cpp Linux x64 Official".to_string(),
+                    "Build oficial pré-compilada Linux x64.".to_string(),
                 ),
             },
             ToolInstallStrategy::LlamaCppOfficialRelease => match (tag, accel) {
-                ("win-x64", AccelBackend::CudaNvenc) => {
+                ("linux-x64", AccelBackend::CudaNvenc) => {
                     let cuda_label = self
                         .hardware
                         .cuda_version
                         .as_deref()
                         .map(|v| format!("CUDA {v}"))
-                        .unwrap_or_else(|| "CUDA".to_string());
-                    (
-                        format!("llama.cpp Win64 {cuda_label} + cudart (GPU NVIDIA)"),
-                        format!(
-                            "GPU NVIDIA ({cuda_label}) detectada: baixa automaticamente a maior build CUDA compatível (≤ {cuda_label}) + bibliotecas cudart para rodar modelos visuais GGUF na GPU."
-                        ),
-                    )
+                        .unwrap_or_else(|| "NVIDIA".to_string());
+                    if self.hardware.cuda_runtime_installed {
+                        (
+                            format!("llama.cpp Linux x64 {cuda_label} (GPU NVIDIA)"),
+                            format!(
+                                "GPU NVIDIA ({cuda_label}) + CUDA Runtime detectados: prioriza build oficial CUDA (≤ {cuda_label}) com fallback automático para Vulkan."
+                            ),
+                        )
+                    } else {
+                        (
+                            format!("llama.cpp Linux x64 Vulkan (GPU NVIDIA {cuda_label})"),
+                            "GPU NVIDIA detectada no Linux: usa aceleração Vulkan na GPU sem precisar do toolkit CUDA completo (instale `sudo pacman -S cuda` para habilitar backend CUDA nativo).".to_string(),
+                        )
+                    }
                 }
-                ("win-x64", AccelBackend::AmfDirectml | AccelBackend::QsvOpenvino) => (
-                    "llama.cpp Win64 Vulkan (GPU AMD/Intel)".to_string(),
-                    "GPU AMD/Intel detectada: seleciona build oficial Vulkan para acelerar modelos visuais GGUF na GPU.".to_string(),
+                ("linux-x64", AccelBackend::AmfDirectml | AccelBackend::QsvOpenvino) => (
+                    "llama.cpp Linux x64 Vulkan (GPU)".to_string(),
+                    "GPU dedicada/integrada detectada: seleciona build oficial Linux Vulkan para acelerar modelos visuais GGUF.".to_string(),
                 ),
-                ("win-x64", _) => (
-                    "llama.cpp Win64 CPU AVX2".to_string(),
-                    "Build oficial CPU otimizada para Windows 11.".to_string(),
-                ),
-                ("win-arm64", _) => (
-                    "llama.cpp Win ARM64 Native".to_string(),
-                    "Build oficial nativa para Windows 11 ARM64.".to_string(),
-                ),
-                ("macos-arm64", _) => (
-                    "llama.cpp macOS ARM64 Metal".to_string(),
-                    "Apple Silicon detectado: build oficial com aceleração Metal.".to_string(),
-                ),
-                ("linux-x64", _) => (
-                    "llama.cpp Linux x64 Official".to_string(),
-                    "Build oficial pré-compilada Linux x64.".to_string(),
+                ("linux-arm64", _) => (
+                    "llama.cpp Linux ARM64 Official".to_string(),
+                    "Build oficial pré-compilada Linux ARM64.".to_string(),
                 ),
                 _ => (
-                    format!("llama.cpp ({tag})"),
-                    "Build oficial ggml-org/llama.cpp.".to_string(),
+                    "llama.cpp Linux x64 CPU".to_string(),
+                    "Build oficial Linux x64 otimizada para CPU.".to_string(),
                 ),
             },
             ToolInstallStrategy::Custom { homepage } => (
@@ -538,8 +499,8 @@ impl ToolManager {
                     replace_file(&tmp_path, &final_path)?;
                     make_executable(&final_path)?;
                 }
-                ArchiveKind::FfmpegZip => {
-                    extract_ffmpeg_from_zip(&tmp_path, &self.bin_dir)?;
+                ArchiveKind::FfmpegTarXz => {
+                    extract_ffmpeg_from_tarxz(&tmp_path, &self.bin_dir)?;
                     let _ = std::fs::remove_file(&tmp_path);
                 }
                 ArchiveKind::FfmpegTarGz => {
@@ -562,17 +523,6 @@ impl ToolManager {
                     let llama_dir = self.bin_dir.join("llama");
                     extract_llama_from_zip(&tmp_path, &llama_dir)?;
                     let _ = std::fs::remove_file(&tmp_path);
-                    if let Some(ref comp_url) = resolved.companion_url {
-                        self.jobs.append_log(
-                            &job.id,
-                            format!("Baixando bibliotecas CUDA runtime (cudart) de {comp_url}"),
-                        );
-                        let comp_tmp = self.bin_dir.join(format!(".download-{}-cudart.tmp", job.id));
-                        self.download_file(comp_url, &comp_tmp, &job.id, &cancel)
-                            .await?;
-                        extract_llama_from_zip(&comp_tmp, &llama_dir)?;
-                        let _ = std::fs::remove_file(&comp_tmp);
-                    }
                     let _ = std::fs::write(llama_dir.join(".version"), &resolved.version);
                 }
                 ArchiveKind::LlamaTarGz => {
@@ -623,12 +573,8 @@ impl ToolManager {
 
     async fn resolve_ytdlp_release(&self) -> AicutResult<ResolvedDownload> {
         let asset_name = match self.hardware.platform_tag.as_str() {
-            "win-x64" => "yt-dlp.exe",
-            "win-arm64" => "yt-dlp_arm64.exe",
-            "linux-x64" => "yt-dlp_linux",
             "linux-arm64" => "yt-dlp_linux_aarch64",
-            "macos-arm64" | "macos-x64" => "yt-dlp_macos",
-            _ => "yt-dlp",
+            _ => "yt-dlp_linux",
         };
 
         let resp = self
@@ -680,33 +626,25 @@ impl ToolManager {
     async fn resolve_ffmpeg_release(&self) -> AicutResult<ResolvedDownload> {
         let tag = self.hardware.platform_tag.as_str();
         match tag {
-            "win-x64" => Ok(ResolvedDownload {
-                url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip".to_string(),
+            "linux-arm64" => Ok(ResolvedDownload {
+                url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz".to_string(),
                 companion_url: None,
-                version: "latest-win64-gpl".to_string(),
-                build_label: "ffmpeg-master-latest-win64-gpl.zip (NVENC/AMF/QSV)".to_string(),
-                archive_kind: ArchiveKind::FfmpegZip,
+                version: "latest-linuxarm64-gpl".to_string(),
+                build_label: "ffmpeg-master-latest-linuxarm64-gpl.tar.xz".to_string(),
+                archive_kind: ArchiveKind::FfmpegTarXz,
             }),
-            "win-arm64" => Ok(ResolvedDownload {
-                url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-winarm64-gpl.zip".to_string(),
+            _ => Ok(ResolvedDownload {
+                url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz".to_string(),
                 companion_url: None,
-                version: "latest-winarm64-gpl".to_string(),
-                build_label: "ffmpeg-master-latest-winarm64-gpl.zip".to_string(),
-                archive_kind: ArchiveKind::FfmpegZip,
+                version: "latest-linux64-gpl".to_string(),
+                build_label: "ffmpeg-master-latest-linux64-gpl.tar.xz (NVENC + CUDA + VAAPI)".to_string(),
+                archive_kind: ArchiveKind::FfmpegTarXz,
             }),
-            "linux-x64" | "linux-arm64" => Err(AicutError::new(
-                "LINUX_FFMPEG_SYSTEM",
-                "On Linux, please install ffmpeg via your distribution package manager (e.g. apt/dnf/pacman) or place binaries in the Aicut bin directory.",
-            )),
-            _ => Err(AicutError::new(
-                "UNSUPPORTED_PLATFORM",
-                format!("Automatic FFmpeg download is not configured for platform '{tag}'."),
-            )),
         }
     }
 
     /// Queries the latest releases of `ggml-org/whisper.cpp` (skipping source-only tags)
-    /// and picks the optimal binary archive for the host OS/CPU/GPU profile.
+    /// and picks the optimal Linux binary archive for the host CPU/GPU profile.
     async fn resolve_whisper_release(&self) -> AicutResult<ResolvedDownload> {
         let resp = self
             .http
@@ -743,6 +681,7 @@ impl ToolManager {
                 tag,
                 accel,
                 self.hardware.cuda_major_minor(),
+                self.hardware.cuda_runtime_installed,
             ) {
                 return Ok(ResolvedDownload {
                     url,
@@ -756,12 +695,12 @@ impl ToolManager {
 
         Err(AicutError::new(
             "WHISPER_ASSET_NOT_FOUND",
-            format!("No prebuilt whisper.cpp binary found for platform '{tag}'."),
+            format!("No prebuilt whisper.cpp Linux binary found for platform '{tag}'."),
         ))
     }
 
     /// Queries the latest releases of `ggml-org/llama.cpp` and picks the highest-quality
-    /// hardware-compatible binary archive (plus matching `cudart` runtime zip for Windows CUDA).
+    /// Linux GPU/CPU binary archive (CUDA when runtime is present, Vulkan for out-of-the-box NVIDIA/AMD/Intel GPU, or CPU fallback).
     async fn resolve_llama_release(&self) -> AicutResult<ResolvedDownload> {
         let resp = self
             .http
@@ -798,6 +737,7 @@ impl ToolManager {
                 tag,
                 accel,
                 self.hardware.cuda_major_minor(),
+                self.hardware.cuda_runtime_installed,
             ) {
                 return Ok(ResolvedDownload {
                     url,
@@ -811,7 +751,7 @@ impl ToolManager {
 
         Err(AicutError::new(
             "LLAMA_ASSET_NOT_FOUND",
-            format!("No prebuilt llama.cpp binary found for platform '{tag}'."),
+            format!("No prebuilt llama.cpp Linux binary found for platform '{tag}'."),
         ))
     }
 
@@ -901,13 +841,14 @@ pub fn parse_cuda_version_from_asset(filename: &str) -> Option<(u32, u32)> {
     None
 }
 
-/// Picks the optimal `whisper.cpp` binary asset from a GitHub release's asset list based on hardware
-/// and the user's exact detected NVIDIA CUDA driver version (preferring the highest compatible CUDA <= driver_cuda).
+/// Picks the optimal `whisper.cpp` Linux binary asset from a GitHub release's asset list based on
+/// detected GPU hardware, CUDA driver version, and whether local CUDA runtime libraries exist.
 pub fn select_best_whisper_asset(
     assets: &[serde_json::Value],
     platform_tag: &str,
     accel: AccelBackend,
     driver_cuda: Option<(u32, u32)>,
+    has_cuda_runtime: bool,
 ) -> Option<(String, String, ArchiveKind)> {
     let entries: Vec<(String, String)> = assets
         .iter()
@@ -918,19 +859,30 @@ pub fn select_best_whisper_asset(
         })
         .collect();
 
-    let find_matching = |pred: &dyn Fn(&str) -> bool, kind: ArchiveKind| {
+    let kind_for = |name: &str| {
+        if name.to_lowercase().ends_with(".zip") {
+            ArchiveKind::WhisperZip
+        } else {
+            ArchiveKind::WhisperTarGz
+        }
+    };
+
+    let find_matching = |pred: &dyn Fn(&str) -> bool| {
         entries
             .iter()
             .find(|(n, _)| pred(&n.to_lowercase()))
-            .map(|(n, u)| (n.clone(), u.clone(), kind))
+            .map(|(n, u)| (n.clone(), u.clone(), kind_for(n)))
     };
 
-    let pick_best_cuda = |arch_token: &str| -> Option<(String, String, ArchiveKind)> {
+    let pick_best_linux_cuda = |arch_token: &str| -> Option<(String, String, ArchiveKind)> {
         let mut cuda_candidates: Vec<((u32, u32), &String, &String)> = entries
             .iter()
             .filter_map(|(n, u)| {
                 let lower = n.to_lowercase();
-                if lower.ends_with(".zip")
+                let is_archive = lower.ends_with(".tar.gz") || lower.ends_with(".zip");
+                let is_linux = lower.contains("ubuntu") || lower.contains("linux");
+                if is_archive
+                    && is_linux
                     && lower.contains(arch_token)
                     && (lower.contains("cuda") || lower.contains("cublas"))
                 {
@@ -945,7 +897,6 @@ pub fn select_best_whisper_asset(
         if cuda_candidates.is_empty() {
             return None;
         }
-        // Highest CUDA version first
         cuda_candidates.sort_by(|a, b| b.0.cmp(&a.0));
 
         if let Some(max_supported) = driver_cuda {
@@ -953,73 +904,68 @@ pub fn select_best_whisper_asset(
                 .iter()
                 .find(|(ver, _, _)| *ver == (0, 0) || *ver <= max_supported)
             {
-                return Some(((*n).clone(), (*u).clone(), ArchiveKind::WhisperZip));
+                return Some(((*n).clone(), (*u).clone(), kind_for(n)));
             }
-            // Driver is older than all published CUDA builds -> fall back to CPU/OpenBLAS safely
             return None;
         }
 
-        // Unknown driver version: pick the highest available CUDA build
         let (_, n, u) = cuda_candidates[0];
-        Some((n.clone(), u.clone(), ArchiveKind::WhisperZip))
+        Some((n.clone(), u.clone(), kind_for(n)))
     };
 
     match platform_tag {
-        "win-x64" => {
-            if accel == AccelBackend::CudaNvenc {
-                if let Some(m) = pick_best_cuda("x64") {
+        "linux-arm64" => find_matching(&|n| {
+            (n.ends_with(".tar.gz") || n.ends_with(".zip"))
+                && (n.contains("ubuntu") || n.contains("linux"))
+                && n.contains("arm64")
+        }),
+        _ => {
+            if accel == AccelBackend::CudaNvenc && has_cuda_runtime {
+                if let Some(m) = pick_best_linux_cuda("x64") {
                     return Some(m);
                 }
             }
-            if matches!(accel, AccelBackend::AmfDirectml | AccelBackend::QsvOpenvino) {
-                if let Some(m) = find_matching(
-                    &|n| n.ends_with(".zip") && n.contains("x64") && n.contains("vulkan"),
-                    ArchiveKind::WhisperZip,
-                ) {
+            if matches!(
+                accel,
+                AccelBackend::CudaNvenc | AccelBackend::AmfDirectml | AccelBackend::QsvOpenvino
+            ) {
+                if let Some(m) = find_matching(&|n| {
+                    (n.ends_with(".tar.gz") || n.ends_with(".zip"))
+                        && (n.contains("ubuntu") || n.contains("linux"))
+                        && n.contains("x64")
+                        && n.contains("vulkan")
+                }) {
                     return Some(m);
                 }
             }
-            find_matching(
-                &|n| n == "whisper-blas-bin-x64.zip",
-                ArchiveKind::WhisperZip,
-            )
-            .or_else(|| find_matching(&|n| n == "whisper-bin-x64.zip", ArchiveKind::WhisperZip))
+            find_matching(&|n| {
+                (n.ends_with(".tar.gz") || n.ends_with(".zip"))
+                    && (n.contains("ubuntu") || n.contains("linux"))
+                    && n.contains("x64")
+                    && !n.contains("cuda")
+                    && !n.contains("cublas")
+                    && !n.contains("vulkan")
+                    && !n.contains("rocm")
+            })
+            .or_else(|| {
+                find_matching(&|n| {
+                    (n.ends_with(".tar.gz") || n.ends_with(".zip"))
+                        && (n.contains("ubuntu") || n.contains("linux"))
+                        && n.contains("x64")
+                })
+            })
         }
-        "win-arm64" => {
-            if accel == AccelBackend::CudaNvenc {
-                if let Some(m) = pick_best_cuda("arm64") {
-                    return Some(m);
-                }
-            }
-            find_matching(
-                &|n| {
-                    n.ends_with(".zip")
-                        && n.contains("win")
-                        && n.contains("arm64")
-                        && n.contains("cpu")
-                },
-                ArchiveKind::WhisperZip,
-            )
-        }
-        "linux-x64" => find_matching(
-            &|n| n.ends_with(".tar.gz") && n.contains("ubuntu") && n.contains("x64"),
-            ArchiveKind::WhisperTarGz,
-        ),
-        "linux-arm64" => find_matching(
-            &|n| n.ends_with(".tar.gz") && n.contains("ubuntu") && n.contains("arm64"),
-            ArchiveKind::WhisperTarGz,
-        ),
-        _ => None,
     }
 }
 
-/// Picks the optimal `llama.cpp` binary asset (plus optional matching `cudart` companion zip on
-/// Windows CUDA) from a `ggml-org/llama.cpp` release's asset list based on hardware & CUDA driver.
+/// Picks the optimal `llama.cpp` Linux binary asset from a `ggml-org/llama.cpp` release's
+/// asset list based on detected GPU hardware, NVIDIA CUDA driver/runtime, and Vulkan support.
 pub fn select_best_llama_assets(
     assets: &[serde_json::Value],
     platform_tag: &str,
     accel: AccelBackend,
     driver_cuda: Option<(u32, u32)>,
+    has_cuda_runtime: bool,
 ) -> Option<(String, String, Option<String>, ArchiveKind)> {
     let entries: Vec<(String, String)> = assets
         .iter()
@@ -1030,21 +976,31 @@ pub fn select_best_llama_assets(
         })
         .collect();
 
-    let find_matching = |pred: &dyn Fn(&str) -> bool, kind: ArchiveKind| {
+    let kind_for = |name: &str| {
+        if name.to_lowercase().ends_with(".zip") {
+            ArchiveKind::LlamaZip
+        } else {
+            ArchiveKind::LlamaTarGz
+        }
+    };
+
+    let find_matching = |pred: &dyn Fn(&str) -> bool| {
         entries
             .iter()
             .find(|(n, _)| pred(&n.to_lowercase()))
-            .map(|(n, u)| (n.clone(), u.clone(), None, kind))
+            .map(|(n, u)| (n.clone(), u.clone(), None, kind_for(n)))
     };
 
-    let pick_best_win_cuda = |arch_token: &str| -> Option<(String, String, Option<String>, ArchiveKind)> {
+    let pick_best_linux_cuda = |arch_token: &str| -> Option<(String, String, Option<String>, ArchiveKind)> {
         let mut cuda_candidates: Vec<((u32, u32), &String, &String)> = entries
             .iter()
             .filter_map(|(n, u)| {
                 let lower = n.to_lowercase();
-                if lower.ends_with(".zip")
+                let is_archive = lower.ends_with(".tar.gz") || lower.ends_with(".zip");
+                let is_linux = lower.contains("bin-ubuntu") || lower.contains("bin-linux");
+                if is_archive
                     && lower.starts_with("llama-")
-                    && lower.contains("bin-win")
+                    && is_linux
                     && lower.contains("cuda")
                     && lower.contains(arch_token)
                 {
@@ -1070,119 +1026,54 @@ pub fn select_best_llama_assets(
             cuda_candidates[0]
         };
 
-        let (chosen_ver, name, url) = chosen;
-        let cudart_url = entries.iter().find_map(|(cn, cu)| {
-            let cl = cn.to_lowercase();
-            if cl.ends_with(".zip")
-                && cl.starts_with("cudart-llama-")
-                && cl.contains("win")
-                && cl.contains(arch_token)
-            {
-                let cver = parse_cuda_version_from_asset(&cl).unwrap_or((0, 0));
-                if cver == chosen_ver {
-                    return Some(cu.clone());
-                }
-            }
-            None
-        });
-
-        Some((name.clone(), url.clone(), cudart_url, ArchiveKind::LlamaZip))
+        let (_, name, url) = chosen;
+        Some((name.clone(), url.clone(), None, kind_for(name)))
     };
 
     match platform_tag {
-        "win-x64" => {
-            if accel == AccelBackend::CudaNvenc {
-                if let Some(m) = pick_best_win_cuda("x64") {
+        "linux-arm64" => find_matching(&|n| {
+            (n.ends_with(".tar.gz") || n.ends_with(".zip"))
+                && n.starts_with("llama-")
+                && (n.contains("bin-ubuntu") || n.contains("bin-linux"))
+                && n.contains("arm64")
+        }),
+        _ => {
+            // 1. NVIDIA + installed Linux CUDA runtime (`/opt/cuda` or `/usr/lib/libcudart.so`): highest compatible CUDA build.
+            if accel == AccelBackend::CudaNvenc && has_cuda_runtime {
+                if let Some(m) = pick_best_linux_cuda("x64") {
                     return Some(m);
                 }
             }
+            // 2. Any NVIDIA / AMD / Intel GPU on Linux: Vulkan build runs full GPU acceleration out-of-the-box with `nvidia-utils`/Mesa.
             if matches!(
                 accel,
                 AccelBackend::CudaNvenc | AccelBackend::AmfDirectml | AccelBackend::QsvOpenvino
             ) {
-                if let Some(m) = find_matching(
-                    &|n| {
-                        n.ends_with(".zip")
-                            && n.starts_with("llama-")
-                            && n.contains("bin-win-vulkan-x64")
-                    },
-                    ArchiveKind::LlamaZip,
-                ) {
+                if let Some(m) = find_matching(&|n| {
+                    (n.ends_with(".tar.gz") || n.ends_with(".zip"))
+                        && n.starts_with("llama-")
+                        && (n.contains("bin-ubuntu-vulkan-x64") || n.contains("bin-linux-vulkan-x64"))
+                }) {
                     return Some(m);
                 }
             }
-            find_matching(
-                &|n| {
-                    n.ends_with(".zip")
-                        && n.starts_with("llama-")
-                        && n.contains("bin-win-cpu-x64")
-                },
-                ArchiveKind::LlamaZip,
-            )
-            .or_else(|| {
-                find_matching(
-                    &|n| {
-                        n.ends_with(".zip")
-                            && n.starts_with("llama-")
-                            && n.contains("bin-win")
-                            && n.contains("x64")
-                            && (n.contains("avx2") || n.contains("openblas"))
-                    },
-                    ArchiveKind::LlamaZip,
-                )
-            })
-        }
-        "win-arm64" => find_matching(
-            &|n| {
-                n.ends_with(".zip")
-                    && n.starts_with("llama-")
-                    && n.contains("bin-win")
-                    && n.contains("arm64")
-            },
-            ArchiveKind::LlamaZip,
-        ),
-        "macos-arm64" => find_matching(
-            &|n| {
-                (n.ends_with(".zip") || n.ends_with(".tar.gz"))
-                    && n.starts_with("llama-")
-                    && n.contains("bin-macos-arm64")
-            },
-            ArchiveKind::LlamaZip,
-        )
-        .map(|(n, u, c, _)| {
-            let kind = if n.ends_with(".tar.gz") {
-                ArchiveKind::LlamaTarGz
-            } else {
-                ArchiveKind::LlamaZip
-            };
-            (n, u, c, kind)
-        }),
-        "linux-x64" => find_matching(
-            &|n| {
+            // 3. Clean CPU fallback (explicitly excluding GPU/SYCL/ROCm variants).
+            find_matching(&|n| {
                 (n.ends_with(".tar.gz") || n.ends_with(".zip"))
                     && n.starts_with("llama-")
-                    && n.contains("bin-ubuntu-x64")
-            },
-            ArchiveKind::LlamaTarGz,
-        )
-        .map(|(n, u, c, _)| {
-            let kind = if n.ends_with(".zip") {
-                ArchiveKind::LlamaZip
-            } else {
-                ArchiveKind::LlamaTarGz
-            };
-            (n, u, c, kind)
-        }),
-        _ => None,
+                    && (n.contains("bin-ubuntu-x64") || n.contains("bin-linux-x64"))
+                    && !n.contains("cuda")
+                    && !n.contains("vulkan")
+                    && !n.contains("rocm")
+                    && !n.contains("sycl")
+                    && !n.contains("opencl")
+            })
+        }
     }
 }
 
 pub fn platform_binary_name(base: &str) -> String {
-    if cfg!(windows) && !base.ends_with(".exe") {
-        format!("{base}.exe")
-    } else {
-        base.to_string()
-    }
+    base.to_string()
 }
 
 async fn probe_binary_version(path: &Path, version_args: &[String]) -> Option<String> {
@@ -1192,7 +1083,7 @@ async fn probe_binary_version(path: &Path, version_args: &[String]) -> Option<St
         version_args.iter().map(|s| s.as_str()).collect()
     };
     let mut cmd = Command::new(path);
-    configure_tokio_command(&mut cmd);
+    configure_linux_gpu_env_tokio(&mut cmd, path);
     let output = cmd.args(args).output().await.ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let first_line = stdout.lines().next()?.trim();
@@ -1215,7 +1106,7 @@ fn versions_match(installed: &str, latest: &str) -> bool {
 }
 
 fn replace_file(src: &Path, dst: &Path) -> AicutResult<()> {
-    if dst.exists() {
+    if dst.exists() || dst.symlink_metadata().is_ok() {
         let _ = std::fs::remove_file(dst);
     }
     if std::fs::rename(src, dst).is_err() {
@@ -1238,32 +1129,61 @@ fn make_executable(path: &Path) -> AicutResult<()> {
     Ok(())
 }
 
-fn extract_ffmpeg_from_zip(zip_path: &Path, bin_dir: &Path) -> AicutResult<()> {
-    let file = std::fs::File::open(zip_path)?;
-    let mut archive = zip::ZipArchive::new(file)
-        .map_err(|e| AicutError::internal(format!("Failed reading FFmpeg zip archive: {e}")))?;
+fn find_file_recursive(dir: &Path, target_name: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            if let Some(found) = find_file_recursive(&p, target_name) {
+                return Some(found);
+            }
+        } else if p.file_name().and_then(|n| n.to_str()) == Some(target_name) {
+            return Some(p);
+        }
+    }
+    None
+}
 
-    for i in 0..archive.len() {
-        let mut entry = archive
-            .by_index(i)
-            .map_err(|e| AicutError::internal(format!("Zip entry error: {e}")))?;
-        if entry.is_dir() {
-            continue;
-        }
-        let name = entry.name().replace('\\', "/");
-        let file_name = name.rsplit('/').next().unwrap_or("");
-        if matches!(
-            file_name,
-            "ffmpeg.exe" | "ffprobe.exe" | "ffmpeg" | "ffprobe"
-        ) {
-            let out_path = bin_dir.join(file_name);
-            let tmp_out = bin_dir.join(format!(".{file_name}.new"));
-            let mut out = std::fs::File::create(&tmp_out)?;
-            std::io::copy(&mut entry, &mut out)?;
-            out.flush()?;
-            replace_file(&tmp_out, &out_path)?;
+fn extract_ffmpeg_from_tarxz(archive_path: &Path, bin_dir: &Path) -> AicutResult<()> {
+    let tmp_dir = bin_dir.join(".ffmpeg-extract-tmp");
+    if tmp_dir.exists() {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+    std::fs::create_dir_all(&tmp_dir)?;
+
+    let mut cmd = std::process::Command::new("tar");
+    configure_std_command(&mut cmd);
+    let output = cmd
+        .arg("-xJf")
+        .arg(archive_path)
+        .arg("-C")
+        .arg(&tmp_dir)
+        .output()
+        .map_err(|e| AicutError::internal(format!("Failed running tar to extract FFmpeg: {e}")))?;
+
+    if !output.status.success() {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AicutError::internal(format!(
+            "tar failed extracting FFmpeg archive: {stderr}"
+        )));
+    }
+
+    let mut extracted_any = false;
+    for name in ["ffmpeg", "ffprobe"] {
+        if let Some(found) = find_file_recursive(&tmp_dir, name) {
+            let out_path = bin_dir.join(name);
+            replace_file(&found, &out_path)?;
             make_executable(&out_path)?;
+            extracted_any = true;
         }
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    if !extracted_any {
+        return Err(AicutError::internal(
+            "FFmpeg archive extracted cleanly but neither ffmpeg nor ffprobe was found inside.",
+        ));
     }
     Ok(())
 }
@@ -1291,7 +1211,7 @@ fn extract_ffmpeg_from_targz(archive_path: &Path, bin_dir: &Path) -> AicutResult
     Ok(())
 }
 
-/// Extracts whisper-cli and all companion DLLs/shared libraries into `whisper_dir`.
+/// Extracts `whisper-cli` and all companion `.so` shared libraries into `whisper_dir`.
 fn extract_whisper_from_zip(zip_path: &Path, whisper_dir: &Path) -> AicutResult<()> {
     std::fs::create_dir_all(whisper_dir)?;
     let file = std::fs::File::open(zip_path)?;
@@ -1311,11 +1231,10 @@ fn extract_whisper_from_zip(zip_path: &Path, whisper_dir: &Path) -> AicutResult<
             continue;
         }
         let lower = file_name.to_lowercase();
-        let keep = lower.ends_with(".exe")
-            || lower.ends_with(".dll")
-            || lower.ends_with(".so")
+        let keep = lower.ends_with(".so")
             || lower.contains(".so.")
-            || file_name == "whisper-cli";
+            || file_name == "whisper-cli"
+            || file_name == "whisper-server";
         if keep {
             let out_path = whisper_dir.join(file_name);
             let tmp_out = whisper_dir.join(format!(".{file_name}.new"));
@@ -1329,6 +1248,21 @@ fn extract_whisper_from_zip(zip_path: &Path, whisper_dir: &Path) -> AicutResult<
     Ok(())
 }
 
+fn create_flat_symlink(target_name: &str, out_path: &Path) -> AicutResult<()> {
+    if out_path.exists() || out_path.symlink_metadata().is_ok() {
+        let _ = std::fs::remove_file(out_path);
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target_name, out_path)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (target_name, out_path);
+    }
+    Ok(())
+}
+
 fn extract_whisper_from_targz(archive_path: &Path, whisper_dir: &Path) -> AicutResult<()> {
     std::fs::create_dir_all(whisper_dir)?;
     let file = std::fs::File::open(archive_path)?;
@@ -1336,7 +1270,8 @@ fn extract_whisper_from_targz(archive_path: &Path, whisper_dir: &Path) -> AicutR
     let mut archive = tar::Archive::new(dec);
     for entry in archive.entries()? {
         let mut entry = entry?;
-        if !entry.header().entry_type().is_file() {
+        let entry_type = entry.header().entry_type();
+        if !entry_type.is_file() && !entry_type.is_symlink() {
             continue;
         }
         let path = entry.path()?.into_owned();
@@ -1353,16 +1288,24 @@ fn extract_whisper_from_targz(archive_path: &Path, whisper_dir: &Path) -> AicutR
             || file_name.contains(".so");
         if keep {
             let out_path = whisper_dir.join(&file_name);
-            let tmp_out = whisper_dir.join(format!(".{file_name}.new"));
-            entry.unpack(&tmp_out)?;
-            replace_file(&tmp_out, &out_path)?;
-            make_executable(&out_path)?;
+            if entry_type.is_symlink() {
+                if let Ok(Some(link_target)) = entry.link_name() {
+                    if let Some(target_name) = link_target.file_name().and_then(|n| n.to_str()) {
+                        create_flat_symlink(target_name, &out_path)?;
+                    }
+                }
+            } else {
+                let tmp_out = whisper_dir.join(format!(".{file_name}.new"));
+                entry.unpack(&tmp_out)?;
+                replace_file(&tmp_out, &out_path)?;
+                make_executable(&out_path)?;
+            }
         }
     }
     Ok(())
 }
 
-/// Extracts `llama-server` and all companion DLLs/shared libraries into `llama_dir`.
+/// Extracts `llama-server` and all companion `.so` shared libraries into `llama_dir`.
 fn extract_llama_from_zip(zip_path: &Path, llama_dir: &Path) -> AicutResult<()> {
     std::fs::create_dir_all(llama_dir)?;
     let file = std::fs::File::open(zip_path)?;
@@ -1382,12 +1325,8 @@ fn extract_llama_from_zip(zip_path: &Path, llama_dir: &Path) -> AicutResult<()> 
             continue;
         }
         let lower = file_name.to_lowercase();
-        let keep = lower == "llama-server.exe"
-            || lower == "llama-server"
-            || lower == "llama-mtmd-cli.exe"
+        let keep = lower == "llama-server"
             || lower == "llama-mtmd-cli"
-            || lower.ends_with(".dll")
-            || lower.ends_with(".dylib")
             || lower.ends_with(".so")
             || lower.contains(".so.");
         if keep {
@@ -1410,7 +1349,8 @@ fn extract_llama_from_targz(archive_path: &Path, llama_dir: &Path) -> AicutResul
     let mut archive = tar::Archive::new(dec);
     for entry in archive.entries()? {
         let mut entry = entry?;
-        if !entry.header().entry_type().is_file() {
+        let entry_type = entry.header().entry_type();
+        if !entry_type.is_file() && !entry_type.is_symlink() {
             continue;
         }
         let path = entry.path()?.into_owned();
@@ -1424,14 +1364,21 @@ fn extract_llama_from_targz(archive_path: &Path, llama_dir: &Path) -> AicutResul
         }
         let keep = file_name == "llama-server"
             || file_name == "llama-mtmd-cli"
-            || file_name.contains(".so")
-            || file_name.ends_with(".dylib");
+            || file_name.contains(".so");
         if keep {
             let out_path = llama_dir.join(&file_name);
-            let tmp_out = llama_dir.join(format!(".{file_name}.new"));
-            entry.unpack(&tmp_out)?;
-            replace_file(&tmp_out, &out_path)?;
-            make_executable(&out_path)?;
+            if entry_type.is_symlink() {
+                if let Ok(Some(link_target)) = entry.link_name() {
+                    if let Some(target_name) = link_target.file_name().and_then(|n| n.to_str()) {
+                        create_flat_symlink(target_name, &out_path)?;
+                    }
+                }
+            } else {
+                let tmp_out = llama_dir.join(format!(".{file_name}.new"));
+                entry.unpack(&tmp_out)?;
+                replace_file(&tmp_out, &out_path)?;
+                make_executable(&out_path)?;
+            }
         }
     }
     Ok(())
@@ -1442,72 +1389,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn selects_best_whisper_asset_by_hardware_and_cuda_version() {
+    fn selects_best_whisper_linux_asset_by_nvidia_cuda_vulkan_and_cpu() {
         let assets = vec![
-            serde_json::json!({"name": "whisper-bin-x64.zip", "browser_download_url": "https://x/cpu.zip"}),
-            serde_json::json!({"name": "whisper-blas-bin-x64.zip", "browser_download_url": "https://x/blas.zip"}),
-            serde_json::json!({"name": "whisper-bin-win-cuda-11.8.0-x64.zip", "browser_download_url": "https://x/cuda11.zip"}),
-            serde_json::json!({"name": "whisper-bin-win-cuda-12.4.0-x64.zip", "browser_download_url": "https://x/cuda12.zip"}),
-            serde_json::json!({"name": "whisper-bin-win-cuda-13.4.0-x64.zip", "browser_download_url": "https://x/cuda13.zip"}),
-            serde_json::json!({"name": "whisper-bin-ubuntu-x64.tar.gz", "browser_download_url": "https://x/ubuntu.tar.gz"}),
+            serde_json::json!({"name": "whisper-bin-ubuntu-x64.tar.gz", "browser_download_url": "https://x/cpu.tar.gz"}),
+            serde_json::json!({"name": "whisper-bin-ubuntu-vulkan-x64.tar.gz", "browser_download_url": "https://x/vulkan.tar.gz"}),
+            serde_json::json!({"name": "whisper-bin-ubuntu-cuda-12.4-x64.tar.gz", "browser_download_url": "https://x/cuda12.tar.gz"}),
+            serde_json::json!({"name": "whisper-bin-ubuntu-cuda-13.2-x64.tar.gz", "browser_download_url": "https://x/cuda13.tar.gz"}),
+            serde_json::json!({"name": "whisper-bin-ubuntu-arm64.tar.gz", "browser_download_url": "https://x/arm64.tar.gz"}),
         ];
 
-        // CUDA 13.5 driver picks CUDA 13.4 build
-        let nv13 = select_best_whisper_asset(&assets, "win-x64", AccelBackend::CudaNvenc, Some((13, 5))).unwrap();
-        assert_eq!(nv13.0, "whisper-bin-win-cuda-13.4.0-x64.zip");
+        // NVIDIA with CUDA runtime + driver 13.5 picks CUDA 13.2
+        let nv13 = select_best_whisper_asset(&assets, "linux-x64", AccelBackend::CudaNvenc, Some((13, 5)), true).unwrap();
+        assert_eq!(nv13.0, "whisper-bin-ubuntu-cuda-13.2-x64.tar.gz");
 
-        // CUDA 13.2 driver picks CUDA 12.4 build (never picks incompatible 13.4!)
-        let nv132 = select_best_whisper_asset(&assets, "win-x64", AccelBackend::CudaNvenc, Some((13, 2))).unwrap();
-        assert_eq!(nv132.0, "whisper-bin-win-cuda-12.4.0-x64.zip");
+        // NVIDIA with driver 12.8 picks CUDA 12.4 (never incompatible 13.2!)
+        let nv12 = select_best_whisper_asset(&assets, "linux-x64", AccelBackend::CudaNvenc, Some((12, 8)), true).unwrap();
+        assert_eq!(nv12.0, "whisper-bin-ubuntu-cuda-12.4-x64.tar.gz");
 
-        // CUDA 12.0 driver picks CUDA 11.8 build
-        let nv120 = select_best_whisper_asset(&assets, "win-x64", AccelBackend::CudaNvenc, Some((12, 0))).unwrap();
-        assert_eq!(nv120.0, "whisper-bin-win-cuda-11.8.0-x64.zip");
+        // NVIDIA without CUDA toolkit falls back cleanly to Vulkan GPU build
+        let nv_vk = select_best_whisper_asset(&assets, "linux-x64", AccelBackend::CudaNvenc, Some((13, 0)), false).unwrap();
+        assert_eq!(nv_vk.0, "whisper-bin-ubuntu-vulkan-x64.tar.gz");
 
-        let cpu = select_best_whisper_asset(&assets, "win-x64", AccelBackend::CpuOnly, None).unwrap();
-        assert_eq!(cpu.0, "whisper-blas-bin-x64.zip");
+        // CPU-only picks standard ubuntu-x64
+        let cpu = select_best_whisper_asset(&assets, "linux-x64", AccelBackend::CpuOnly, None, false).unwrap();
+        assert_eq!(cpu.0, "whisper-bin-ubuntu-x64.tar.gz");
 
-        let lin = select_best_whisper_asset(&assets, "linux-x64", AccelBackend::CpuOnly, None).unwrap();
-        assert_eq!(lin.0, "whisper-bin-ubuntu-x64.tar.gz");
+        // ARM64 picks ubuntu-arm64
+        let arm = select_best_whisper_asset(&assets, "linux-arm64", AccelBackend::CpuOnly, None, false).unwrap();
+        assert_eq!(arm.0, "whisper-bin-ubuntu-arm64.tar.gz");
     }
 
     #[test]
-    fn selects_best_llama_assets_with_cudart_and_fallbacks() {
+    fn selects_best_llama_linux_assets_for_nvidia_cuda_vulkan_and_cpu() {
         let assets = vec![
-            serde_json::json!({"name": "llama-b5500-bin-win-cpu-x64.zip", "browser_download_url": "https://x/cpu.zip"}),
-            serde_json::json!({"name": "llama-b5500-bin-win-vulkan-x64.zip", "browser_download_url": "https://x/vulkan.zip"}),
-            serde_json::json!({"name": "llama-b5500-bin-win-cuda-12.4-x64.zip", "browser_download_url": "https://x/cuda12.zip"}),
-            serde_json::json!({"name": "cudart-llama-bin-win-cuda-12.4-x64.zip", "browser_download_url": "https://x/cudart12.zip"}),
-            serde_json::json!({"name": "llama-b5500-bin-win-cuda-13.1-x64.zip", "browser_download_url": "https://x/cuda13.zip"}),
-            serde_json::json!({"name": "cudart-llama-bin-win-cuda-13.1-x64.zip", "browser_download_url": "https://x/cudart13.zip"}),
-            serde_json::json!({"name": "llama-b5500-bin-ubuntu-x64.zip", "browser_download_url": "https://x/ubuntu.zip"}),
+            serde_json::json!({"name": "llama-b5500-bin-ubuntu-x64.tar.gz", "browser_download_url": "https://x/cpu.tar.gz"}),
+            serde_json::json!({"name": "llama-b5500-bin-ubuntu-vulkan-x64.tar.gz", "browser_download_url": "https://x/vulkan.tar.gz"}),
+            serde_json::json!({"name": "llama-b5500-bin-ubuntu-cuda-12.4-x64.tar.gz", "browser_download_url": "https://x/cuda12.tar.gz"}),
+            serde_json::json!({"name": "llama-b5500-bin-ubuntu-cuda-13.1-x64.tar.gz", "browser_download_url": "https://x/cuda13.tar.gz"}),
         ];
 
-        // NVIDIA CUDA 13.5 driver picks CUDA 13.1 + matching cudart 13.1
-        let nv13 = select_best_llama_assets(&assets, "win-x64", AccelBackend::CudaNvenc, Some((13, 5))).unwrap();
-        assert_eq!(nv13.0, "llama-b5500-bin-win-cuda-13.1-x64.zip");
-        assert_eq!(nv13.2.as_deref(), Some("https://x/cudart13.zip"));
+        // NVIDIA CUDA 13.5 + CUDA runtime picks CUDA 13.1
+        let nv13 = select_best_llama_assets(&assets, "linux-x64", AccelBackend::CudaNvenc, Some((13, 5)), true).unwrap();
+        assert_eq!(nv13.0, "llama-b5500-bin-ubuntu-cuda-13.1-x64.tar.gz");
+        assert_eq!(nv13.3, ArchiveKind::LlamaTarGz);
 
-        // NVIDIA CUDA 12.6 driver picks CUDA 12.4 + matching cudart 12.4
-        let nv12 = select_best_llama_assets(&assets, "win-x64", AccelBackend::CudaNvenc, Some((12, 6))).unwrap();
-        assert_eq!(nv12.0, "llama-b5500-bin-win-cuda-12.4-x64.zip");
-        assert_eq!(nv12.2.as_deref(), Some("https://x/cudart12.zip"));
+        // NVIDIA CUDA 12.6 + CUDA runtime picks CUDA 12.4
+        let nv12 = select_best_llama_assets(&assets, "linux-x64", AccelBackend::CudaNvenc, Some((12, 6)), true).unwrap();
+        assert_eq!(nv12.0, "llama-b5500-bin-ubuntu-cuda-12.4-x64.tar.gz");
 
-        // Old NVIDIA driver (CUDA 11.2) safely falls back to Vulkan
-        let old_nv = select_best_llama_assets(&assets, "win-x64", AccelBackend::CudaNvenc, Some((11, 2))).unwrap();
-        assert_eq!(old_nv.0, "llama-b5500-bin-win-vulkan-x64.zip");
-        assert!(old_nv.2.is_none());
+        // NVIDIA without CUDA runtime (typical fresh CachyOS with `nvidia-utils`) picks Vulkan GPU build immediately!
+        let nv_vk = select_best_llama_assets(&assets, "linux-x64", AccelBackend::CudaNvenc, Some((13, 0)), false).unwrap();
+        assert_eq!(nv_vk.0, "llama-b5500-bin-ubuntu-vulkan-x64.tar.gz");
 
         // AMD picks Vulkan
-        let amd = select_best_llama_assets(&assets, "win-x64", AccelBackend::AmfDirectml, None).unwrap();
-        assert_eq!(amd.0, "llama-b5500-bin-win-vulkan-x64.zip");
+        let amd = select_best_llama_assets(&assets, "linux-x64", AccelBackend::AmfDirectml, None, false).unwrap();
+        assert_eq!(amd.0, "llama-b5500-bin-ubuntu-vulkan-x64.tar.gz");
 
-        // CPU picks win-cpu-x64
-        let cpu = select_best_llama_assets(&assets, "win-x64", AccelBackend::CpuOnly, None).unwrap();
-        assert_eq!(cpu.0, "llama-b5500-bin-win-cpu-x64.zip");
-
-        // Linux picks ubuntu-x64
-        let lin = select_best_llama_assets(&assets, "linux-x64", AccelBackend::CpuOnly, None).unwrap();
-        assert_eq!(lin.0, "llama-b5500-bin-ubuntu-x64.zip");
+        // CPU picks ubuntu-x64
+        let cpu = select_best_llama_assets(&assets, "linux-x64", AccelBackend::CpuOnly, None, false).unwrap();
+        assert_eq!(cpu.0, "llama-b5500-bin-ubuntu-x64.tar.gz");
     }
 }

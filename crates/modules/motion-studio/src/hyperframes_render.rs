@@ -79,7 +79,7 @@ pub fn build_live_hyperframes_document(comp: &AicutComposition) -> String {
       overflow: hidden;
       background: transparent !important;
       background-color: rgba(0, 0, 0, 0) !important;
-      font-family: 'Segoe UI', Inter, system-ui, -apple-system, sans-serif;
+      font-family: 'Inter', 'Noto Sans', 'Liberation Sans', system-ui, sans-serif;
       color: #ffffff;
       -webkit-font-smoothing: antialiased;
     }}
@@ -323,35 +323,45 @@ pub fn build_live_hyperframes_document(comp: &AicutComposition) -> String {
     )
 }
 
-/// Finds a built-in Chromium browser on Windows 11 (Microsoft Edge is pre-installed on every
-/// Windows 11 machine!), macOS, or Linux — zero extra downloads needed!
+/// Finds an installed Chromium-based browser on Linux (Arch / CachyOS / Ubuntu / Flatpak)
+/// for deterministic headless RGBA HyperFrames rendering via CDP.
 pub fn find_system_chromium() -> Option<PathBuf> {
-    let candidates: Vec<PathBuf> = vec![
-        PathBuf::from(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
-        PathBuf::from(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
-        PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-        PathBuf::from(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
-        PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-        PathBuf::from("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
-    ];
-    for p in candidates {
+    if let Ok(env_bin) = std::env::var("AICUT_CHROMIUM_BIN") {
+        let p = PathBuf::from(env_bin.trim());
         if p.is_file() {
             return Some(p);
         }
     }
-    if let Ok(local_app) = std::env::var("LOCALAPPDATA") {
-        let p = PathBuf::from(&local_app).join(r"Google\Chrome\Application\chrome.exe");
-        if p.is_file() {
-            return Some(p);
-        }
-        let p2 = PathBuf::from(&local_app).join(r"Microsoft\Edge\Application\msedge.exe");
-        if p2.is_file() {
-            return Some(p2);
-        }
-    }
-    for bin in ["msedge", "google-chrome", "chromium", "chromium-browser"] {
+    for bin in [
+        "chromium",
+        "google-chrome-stable",
+        "google-chrome",
+        "brave",
+        "brave-browser",
+        "vivaldi-stable",
+        "vivaldi",
+        "ungoogled-chromium",
+        "thorium-browser",
+        "chromium-browser",
+        "microsoft-edge-stable",
+        "msedge",
+    ] {
         if let Ok(found) = which::which(bin) {
             return Some(found);
+        }
+    }
+    for candidate in [
+        "/usr/bin/chromium",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome",
+        "/usr/bin/brave",
+        "/usr/bin/vivaldi-stable",
+        "/opt/google/chrome/chrome",
+        "/opt/brave-bin/brave",
+    ] {
+        let p = PathBuf::from(candidate);
+        if p.is_file() {
+            return Some(p);
         }
     }
     None
@@ -393,6 +403,7 @@ pub async fn capture_hyperframes_rgba_sequence(
     configure_tokio_command(&mut cmd);
     cmd.args([
         "--headless=new",
+        "--ozone-platform=headless",
         "--disable-gpu",
         "--no-sandbox",
         "--disable-dev-shm-usage",

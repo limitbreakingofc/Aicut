@@ -379,10 +379,8 @@ pub async fn render_clip_to_library(
 pub fn select_hw_h264_encoder(accel: AccelBackend) -> &'static str {
     match accel {
         AccelBackend::CudaNvenc => "h264_nvenc",
-        AccelBackend::AmfDirectml => "h264_amf",
         AccelBackend::QsvOpenvino => "h264_qsv",
-        AccelBackend::Metal => "h264_videotoolbox",
-        AccelBackend::CpuOnly => "libx264",
+        AccelBackend::AmfDirectml | AccelBackend::Metal | AccelBackend::CpuOnly => "libx264",
     }
 }
 

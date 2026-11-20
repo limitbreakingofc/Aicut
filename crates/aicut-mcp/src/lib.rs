@@ -106,7 +106,7 @@ pub async fn handle_mcp_request(
                         "name": "aicut",
                         "version": env!("CARGO_PKG_VERSION")
                     },
-                    "instructions": "Aicut is a modular Windows 11 media & AI studio. You have full human-parity control over downloads (yt-dlp), local video/audio imports, the Media Library, background jobs, hardware/tool updates, and live desktop UI navigation."
+                    "instructions": "Aicut is a modular native Linux media & AI studio (Arch/CachyOS & NVIDIA CUDA/NVENC). You have full human-parity control over downloads (yt-dlp), local video/audio imports, the Media Library, transcription, Smart Clips, Motion Studio, background jobs, hardware/tool updates, and live desktop UI navigation."
                 }),
             )
         }
@@ -350,7 +350,7 @@ pub async fn handle_mcp_request(
     }
 }
 
-/// Runs an MCP stdio server. If `remote_mcp_url` is reachable (e.g., the live Windows 11 desktop
+/// Runs an MCP stdio server. If `remote_mcp_url` is reachable (e.g., the live Linux desktop
 /// app at `http://127.0.0.1:43210/mcp`), requests are transparently proxied to the open GUI so
 /// humans see every AI action live. Otherwise, requests execute against the embedded `kernel`.
 pub async fn run_stdio_server(

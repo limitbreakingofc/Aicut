@@ -203,8 +203,8 @@
 }
 
 :root {
-  /* Typography — mono-first (Windows Terminal's Cascadia, then common coding fonts) */
-  --font-mono: "Cascadia Code", "Cascadia Mono", "JetBrains Mono", "Fira Code", Consolas, ui-monospace,
+  /* Typography — mono-first (JetBrains Mono / CachyOS / Arch Linux coding fonts) */
+  --font-mono: "JetBrains Mono", "Fira Code", "Cascadia Code", "Noto Sans Mono", ui-monospace,
     SFMono-Regular, Menlo, monospace;
   --font-sans: var(--font-mono);
 

@@ -1,56 +1,59 @@
-# Aicut — Estúdio Modular AI-First para Windows 11
+# Aicut — Estúdio Modular AI-First para Linux (Arch / CachyOS & NVIDIA)
 
-**Aicut** é um aplicativo desktop para **Windows 11** com **core em Rust**, interface moderna e fluida em **Tauri v2 + React/TypeScript**, arquitetura **100% modular** e controle completo para que **qualquer chat ou agente de IA** opere o app com a mesma paridade que um humano.
+**Aicut** é um aplicativo desktop nativo para **Linux** (com foco em **Arch Linux / CachyOS** e aceleração **NVIDIA CUDA / NVENC / Vulkan**), com **core em Rust**, interface moderna em **Tauri v2 + React/TypeScript**, arquitetura **100% modular** e paridade total para qualquer chat ou agente de IA operar via **MCP / OpenAPI / CLI**.
 
-## Principais Recursos (v0.1.0)
+## Principais Recursos
 
-- **Aba 1 — Baixar & Importar**:
-  - **yt-dlp completo e visual**: analise URLs (`Probe`), escolha entre **Vídeo + Áudio**, **Só Vídeo** ou **Só Áudio**, qualidade/resolução ou stream exato (`format_id`), codec, container, qualidade de áudio, legendas (manuais, automáticas, embutidas), recorte de trecho (`--download-sections`), capítulos, playlists, cookies do navegador, SponsorBlock, fragmentos concorrentes, limite de velocidade, proxy e **presets salváveis**.
-  - **Importação do PC**: importe vídeos e áudios locais (arquivo único, múltiplos arquivos ou pastas inteiras) em modo **Referência** (instantâneo) ou **Cópia para Workspace**.
-- **Aba 2 — Biblioteca**:
-  - Unifica tudo o que foi baixado via `yt-dlp` e todos os vídeos e áudios importados do PC em todos os formatos suportados pelo `yt-dlp`/FFmpeg.
-  - Player integrado de vídeo e áudio com streaming HTTP Range, metadados técnicos (`ffprobe`), busca, filtros, tags e notas.
-- **Configurações — Hardware & Atualizador Extensível de Ferramentas**:
-  - Detecta automaticamente CPU, arquitetura, RAM e GPU (NVIDIA/AMD/Intel) para baixar e atualizar as **melhores versões e builds** do `yt-dlp`, `FFmpeg`, `FFprobe` e futuras ferramentas declaradas por novos módulos.
-- **Qualquer Chat de IA com Paridade Humana**:
-  - **MCP (Model Context Protocol)**: Streamable HTTP (`http://127.0.0.1:43210/mcp`), SSE (`/mcp/sse`) e `stdio` (`aicut mcp` — com ponte automática para a janela aberta!).
-  - **OpenAPI 3.1 + REST + WebSocket**: `http://127.0.0.1:43210/openapi.json`, `/api/v1/tools/openai`, `/api/v1/tools/anthropic`.
-  - **CLI estruturada**: `aicut run <action> --json '{...}'`.
-  - **Sincronização bidirecional de UI**: a IA vê em qual aba/vídeo você está e pode navegar, abrir vídeos na tela e notificar você ao vivo.
+- **Importar & Baixar**: `yt-dlp` visual completo (presets, cortes por trecho, legendas, SponsorBlock, cookies) + importação local em lote.
+- **Biblioteca**: player integrado com streaming HTTP Range, proxy H.264/NVENC automático para preview suave no WebKitGTK, metadados (`ffprobe`), busca, tags e lixeira.
+- **Transcrever IA**: `whisper.cpp` local com modelos GGML selecionados por VRAM/CUDA/CPU e exportação `.srt`, `.vtt`, `.json` e FCPXML.
+- **Cortes Shorts IA**: detecção viral com Gemini ou IA local na GPU (`Qwen2.5-VL` via `llama-server`), rastreamento facial ONNX (UltraFace), calibração visual de enquadramento 9:16 e renderização via **NVIDIA NVENC**.
+- **Motion Studio**: editora IA conversacional + detector pixel a pixel de conteúdo pausado/estático + animações vetoriais HyperFrames renderizadas via Chromium CDP em RGBA transparente.
+- **Configurações — Hardware NVIDIA & Gerenciador de Ferramentas**: detecta distro Linux, GPU NVIDIA (`nvidia-smi`), CUDA Runtime (`/opt/cuda`), Vulkan ICD e gerencia `ffmpeg`, `yt-dlp`, `whisper.cpp` e `llama.cpp`.
+- **Paridade Humana + IA**: MCP (`stdio` + Streamable HTTP/SSE em `127.0.0.1:43210/mcp`), OpenAPI 3.1 (`/openapi.json`) e CLI JSON (`aicut run ...`).
 
-## Interface (v0.4.5)
+## Instalação no CachyOS / Arch Linux
 
-- **Estilo terminal moderno, em largura total**: fonte mono, painéis com bordas finas, tabelas densas e barra de status inferior clicável (core MCP, tarefas, mídias, ferramentas, GPU).
-- **Menus de botão direito** em mídias, seleções em lote, tarefas, transcrições, cortes, modelos, ferramentas e módulos (também via botões `⋯` e `Shift+F10`).
-- **Atalhos**: `Ctrl+K` paleta · `Alt+1…8` telas · `Ctrl+B` menu lateral · `?` lista completa · Biblioteca: `/` busca, `↑ ↓`, `Espaço`, `Ctrl+A`, `Del`.
-- **Esquemas de cor**: Noite, Fósforo, Âmbar e Claro (Configurações → Aparência ou botão de paleta no topo).
+### Opção 1 — AppImage (sem instalação)
+```bash
+chmod +x Aicut_*_amd64.AppImage
+./Aicut_*_amd64.AppImage
+```
+*(No Arch/CachyOS, se `fuse2` não estiver instalado, rode com `--appimage-extract-and-run` ou instale `sudo pacman -S fuse2`.)*
+
+### Opção 2 — Pacote nativo Arch / CachyOS (`PKGBUILD`)
+```bash
+cd packaging/arch
+makepkg -si
+```
+
+### Dependências recomendadas para NVIDIA máxima no CachyOS / Arch
+```bash
+sudo pacman -S ffmpeg yt-dlp chromium nvidia-utils vulkan-icd-loader
+# Opcional para backend CUDA nativo no llama.cpp / whisper.cpp:
+sudo pacman -S cuda
+```
 
 ## Arquitetura do Monorepo
 
-- `crates/aicut-core` — Microkernel modular, `AicutModule` trait, `ActionRegistry` (JSON Schema), `EventBus`, `JobManager`, `HardwareProfiler`, `ToolManager`, SQLite `MediaRepository`, `UiStateStore`.
-- `crates/modules/media-ingest` — Módulo #1 (`yt-dlp`, importação local, `ffprobe`, thumbnails, Biblioteca, presets).
-- `crates/aicut-runtime` — Kernel padrão + módulos built-in (`system`, `tools`, `jobs`, `ui`).
+- `crates/aicut-core` — Microkernel modular, `AicutModule`, `ActionRegistry`, `EventBus`, `JobManager`, `HardwareProfiler` (Linux/NVIDIA), `ToolManager`, SQLite `MediaRepository`, `UiStateStore`.
+- `crates/modules/*` — Módulos `media-ingest`, `transcribe`, `smart-clips` e `motion-studio`.
+- `crates/aicut-runtime` — Kernel padrão + módulos built-in.
 - `crates/aicut-mcp` — Servidor nativo MCP JSON-RPC 2.0 (`stdio` + HTTP/SSE).
-- `crates/aicut-server` — Daemon local Axum (REST, OpenAPI 3.1, WebSocket, Media Streaming, MCP).
+- `crates/aicut-server` — Daemon local Axum (REST, OpenAPI 3.1, WebSocket, Media Streaming + NVENC preview proxy, MCP).
 - `crates/aicut-cli` — Binário unificado `aicut`.
-- `apps/web` — Interface estilo terminal moderno (React 19 + TypeScript + Vite): shell em `src/app`, kit de componentes em `src/components`, design tokens em `src/styles` e uma pasta por módulo em `src/modules`.
-- `apps/desktop` — Shell nativo Windows 11 (Tauri v2).
+- `apps/web` — Interface React 19 + TypeScript + Vite.
+- `apps/desktop` — Shell nativo Linux (Tauri v2 + proteção automática Wayland/NVIDIA WebKitGTK).
+- `packaging/arch/PKGBUILD` — Receita nativa para Arch Linux / CachyOS.
 
-## Desenvolvimento Local
+## Desenvolvimento Local (Linux)
 
 ```bash
-# Testes do backend Rust
 cargo test --workspace
-
-# Rodar daemon local (porta 43210)
 cargo run -p aicut-cli -- serve
-
-# Rodar interface web em modo dev (outro terminal)
 pnpm install
 pnpm dev:web
-
-# Build do app Windows 11 (em máquina Windows 11)
-pnpm tauri:build
+NO_STRIP=true pnpm tauri:build
 ```
 
 Veja também:

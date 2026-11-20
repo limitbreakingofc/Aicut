@@ -1,6 +1,7 @@
 use aicut_core::{
-    configure_tokio_command, ActorKind, AicutError, AicutEvent, AicutKernel, AicutResult,
-    JobProgress, MediaAsset, TranscriptRecord, TranscriptSegment, TranscriptWord,
+    configure_linux_gpu_env_tokio, configure_tokio_command, ActorKind, AicutError, AicutEvent,
+    AicutKernel, AicutResult, JobProgress, MediaAsset, TranscriptRecord, TranscriptSegment,
+    TranscriptWord,
 };
 use chrono::Utc;
 use schemars::JsonSchema;
@@ -227,10 +228,7 @@ async fn execute_transcription_task(
             .append_log(&job_id, format!("Executando whisper-cli ({})", whisper_bin.display()));
 
         let mut cmd = Command::new(&whisper_bin);
-        configure_tokio_command(&mut cmd);
-        if let Some(parent) = whisper_bin.parent() {
-            cmd.current_dir(parent);
-        }
+        configure_linux_gpu_env_tokio(&mut cmd, &whisper_bin);
         let mut child = cmd
             .args(&args)
             .stdout(Stdio::piped())

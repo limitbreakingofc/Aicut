@@ -35,6 +35,28 @@ async fn pick_media_paths(app: tauri::AppHandle, directory: bool) -> Result<Vec<
     .map_err(|e| e.to_string())
 }
 
+/// Protects WebKitGTK on Linux (especially Arch Linux / CachyOS with NVIDIA proprietary or
+/// open-kernel drivers on Wayland/XWayland) against blank windows and GBM/EGL protocol crashes.
+/// Users can explicitly override by setting `WEBKIT_DISABLE_DMABUF_RENDERER=0` in their shell.
+fn configure_linux_webkit_env() {
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+            let has_nvidia = std::path::Path::new("/dev/nvidia0").exists()
+                || std::path::Path::new("/proc/driver/nvidia/version").exists();
+            let is_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+            if has_nvidia || is_wayland {
+                std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+                tracing::info!(
+                    has_nvidia,
+                    is_wayland,
+                    "Configured WEBKIT_DISABLE_DMABUF_RENDERER=1 for stable Linux/NVIDIA WebKitGTK rendering"
+                );
+            }
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _ = tracing_subscriber::fmt()
@@ -43,6 +65,8 @@ pub fn run() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .try_init();
+
+    configure_linux_webkit_env();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

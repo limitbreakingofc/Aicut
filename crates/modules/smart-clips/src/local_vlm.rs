@@ -1,6 +1,6 @@
 use aicut_core::{
-    configure_std_command, AccelBackend, AicutError, AicutKernel, AicutResult, HardwareProfile,
-    JobProgress, TranscriptRecord,
+    configure_linux_gpu_env_std, AccelBackend, AicutError, AicutKernel, AicutResult,
+    HardwareProfile, JobProgress, TranscriptRecord,
 };
 use base64::Engine;
 use serde_json::Value;
@@ -77,10 +77,7 @@ impl LlamaServerGuard {
             .unwrap_or_else(|_| Stdio::null());
 
         let mut cmd = Command::new(llama_bin);
-        configure_std_command(&mut cmd);
-        if let Some(parent) = llama_bin.parent() {
-            cmd.current_dir(parent);
-        }
+        configure_linux_gpu_env_std(&mut cmd, llama_bin);
         cmd.args([
             "-m",
             &model_path.to_string_lossy(),

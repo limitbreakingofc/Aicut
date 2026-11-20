@@ -1,4 +1,4 @@
-use aicut_core::{configure_tokio_command, ActorKind, AicutKernel, UiState};
+use aicut_core::{configure_tokio_command, AccelBackend, ActorKind, AicutKernel, UiState};
 use aicut_mcp::{action_id_to_mcp_name, handle_mcp_request, JsonRpcRequest};
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -341,7 +341,7 @@ async fn openapi_handler(State(state): State<ServerState>) -> impl IntoResponse 
         "info": {
             "title": "Aicut Local AI & Media API",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "Modular Windows 11 media studio API with full human-parity AI control over yt-dlp downloads, local video/audio imports, Library, Jobs, Tools/Hardware, and live UI."
+            "description": "Modular native Linux media studio API (Arch/CachyOS & NVIDIA CUDA/NVENC) with full human-parity AI control over yt-dlp downloads, local video/audio imports, Library, Jobs, Tools/Hardware, and live UI."
         },
         "servers": [{ "url": state.base_url }],
         "paths": paths
@@ -360,9 +360,9 @@ async fn stream_media_handler(
     stream_file_with_ranges(&PathBuf::from(&asset.file_path), &headers, None).await
 }
 
-/// Streams a guaranteed WebView2/Chromium-playable H.264/AAC MP4 preview proxy on demand.
-/// Used automatically as fallback when the original video uses an unsupported container/codec
-/// (e.g. MKV, AV1, HEVC, ProRes) so Motion Studio preview NEVER breaks.
+/// Streams a guaranteed WebKitGTK/GStreamer-playable H.264/AAC MP4 preview proxy on demand.
+/// Uses NVIDIA NVENC when available (with automatic `libx264` fallback) when the original video
+/// uses an unsupported container/codec (e.g. MKV, AV1, HEVC, ProRes) so Motion Studio preview NEVER breaks.
 async fn stream_preview_media_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -391,34 +391,69 @@ async fn stream_preview_media_handler(
                 return stream_file_with_ranges(&src_path, &headers, None).await;
             };
             let tmp_path = cache_dir.join(format!("{safe_id}.building.mp4"));
-            let mut cmd = tokio::process::Command::new(&ffmpeg_bin);
-            configure_tokio_command(&mut cmd);
-            let ok = cmd
-                .args(["-y", "-i"])
-                .arg(&src_path)
-                .args([
-                    "-vf",
-                    "scale='min(960,iw)':-2",
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "ultrafast",
-                    "-crf",
-                    "26",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "128k",
-                    "-movflags",
-                    "+faststart",
-                ])
-                .arg(&tmp_path)
-                .output()
-                .await
-                .map(|o| o.status.success() && tmp_path.is_file())
-                .unwrap_or(false);
+            let try_nvenc = state.kernel.hardware.recommended_accel == AccelBackend::CudaNvenc;
+            let mut ok = false;
+            if try_nvenc {
+                let mut cmd = tokio::process::Command::new(&ffmpeg_bin);
+                configure_tokio_command(&mut cmd);
+                ok = cmd
+                    .args(["-y", "-i"])
+                    .arg(&src_path)
+                    .args([
+                        "-vf",
+                        "scale='min(960,iw)':-2",
+                        "-c:v",
+                        "h264_nvenc",
+                        "-preset",
+                        "p1",
+                        "-cq",
+                        "26",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "128k",
+                        "-movflags",
+                        "+faststart",
+                    ])
+                    .arg(&tmp_path)
+                    .output()
+                    .await
+                    .map(|o| o.status.success() && tmp_path.is_file())
+                    .unwrap_or(false);
+            }
+            if !ok {
+                let _ = std::fs::remove_file(&tmp_path);
+                let mut cmd = tokio::process::Command::new(&ffmpeg_bin);
+                configure_tokio_command(&mut cmd);
+                ok = cmd
+                    .args(["-y", "-i"])
+                    .arg(&src_path)
+                    .args([
+                        "-vf",
+                        "scale='min(960,iw)':-2",
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "ultrafast",
+                        "-crf",
+                        "26",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "128k",
+                        "-movflags",
+                        "+faststart",
+                    ])
+                    .arg(&tmp_path)
+                    .output()
+                    .await
+                    .map(|o| o.status.success() && tmp_path.is_file())
+                    .unwrap_or(false);
+            }
             if ok {
                 let _ = std::fs::rename(&tmp_path, &proxy_path);
             } else {

@@ -212,6 +212,8 @@ export interface HardwareProfile {
   available_memory_mb: number;
   gpus: GpuInfo[];
   cuda_version?: string;
+  cuda_runtime_installed?: boolean;
+  vulkan_available?: boolean;
   recommended_accel: "cuda_nvenc" | "amf_directml" | "qsv_openvino" | "metal" | "cpu_only";
   recommendation_summary: string;
 }

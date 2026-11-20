@@ -81,9 +81,9 @@ interface SettingsViewProps {
 
 const ACCEL_LABEL: Record<string, string> = {
   cuda_nvenc: "NVIDIA CUDA / NVENC",
-  amf_directml: "AMD AMF / DirectML",
-  qsv_openvino: "Intel QuickSync / OpenVINO",
-  metal: "Apple Silicon Metal",
+  amf_directml: "AMD Vulkan / VAAPI",
+  qsv_openvino: "Intel QuickSync / Vulkan",
+  metal: "Hardware GPU",
   cpu_only: "CPU Nativa Multithread",
 };
 

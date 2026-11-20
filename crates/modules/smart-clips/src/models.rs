@@ -678,10 +678,10 @@ mod tests {
 
     fn fake_hw(accel: AccelBackend, vram_mb: Option<u64>, ram_mb: u64) -> HardwareProfile {
         HardwareProfile {
-            os: "windows".into(),
-            os_version: "Windows 11".into(),
+            os: "linux".into(),
+            os_version: "CachyOS Linux".into(),
             arch: "x86_64".into(),
-            platform_tag: "win-x64".into(),
+            platform_tag: "linux-x64".into(),
             cpu_brand: "Test CPU".into(),
             physical_cores: 8,
             logical_cores: 16,
@@ -698,6 +698,8 @@ mod tests {
                 })
                 .unwrap_or_default(),
             cuda_version: Some("13.5".into()),
+            cuda_runtime_installed: true,
+            vulkan_available: true,
             recommended_accel: accel,
             recommendation_summary: "test".into(),
         }

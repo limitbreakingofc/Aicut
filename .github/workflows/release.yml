@@ -1,4 +1,4 @@
-name: Release Windows 11 Build
+name: Release Linux Build (AppImage & Arch/CachyOS)
 
 on:
   push:
@@ -7,19 +7,43 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v0.9.4)"
+        description: "Release tag (e.g. v0.10.0)"
         required: false
-        default: "v0.9.4"
+        default: "v0.10.0"
 
 permissions:
   contents: write
 
 jobs:
-  build-windows:
-    name: Build & Publish Windows 11 Installers
-    runs-on: windows-latest
+  build-linux:
+    name: Build & Publish Native Linux AppImage (Arch/CachyOS & NVIDIA)
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Linux Tauri v2, GStreamer & FFmpeg Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ffmpeg \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            patchelf \
+            squashfs-tools \
+            libxdo-dev \
+            libssl-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-libav
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -43,54 +67,61 @@ jobs:
           pnpm typecheck:web
           pnpm build:web
 
-      - name: Build Aicut CLI & MCP Binary (Windows x64)
+      - name: Build Aicut CLI & MCP Binary (Linux x86_64)
         run: |
           cargo build --release -p aicut-cli
-          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
-          Copy-Item target\release\aicut.exe release-assets\aicut-cli-windows-x86_64.exe
+          mkdir -p release-assets
+          cp target/release/aicut release-assets/aicut-cli-linux-x86_64
+          chmod +x release-assets/aicut-cli-linux-x86_64
 
-      - name: Build Aicut Desktop App (Tauri v2 NSIS + MSI)
+      - name: Build Aicut Desktop App (Tauri v2 Linux AppImage)
+        env:
+          NO_STRIP: "true"
+          APPIMAGE_EXTRACT_AND_RUN: "1"
         run: pnpm tauri:build
 
-      - name: Collect Windows 11 Installer Assets
-        shell: pwsh
+      - name: Collect Linux Release Assets
         run: |
-          Get-ChildItem -Path "apps/desktop/src-tauri/target/release/bundle" -Recurse -Include *.exe,*.msi | ForEach-Object {
-            Copy-Item $_.FullName -Destination "release-assets/$($_.Name)"
-          }
-          Get-ChildItem release-assets
+          find apps/desktop/src-tauri/target/release/bundle -type f -name "*.AppImage" -exec cp {} release-assets/ \;
+          cp packaging/arch/PKGBUILD release-assets/PKGBUILD
+          ls -lh release-assets
 
       - name: Determine Release Tag
         id: tag
-        shell: pwsh
         run: |
-          if ($env:GITHUB_REF_TYPE -eq "tag") {
-            echo "name=$env:GITHUB_REF_NAME" >> $env:GITHUB_OUTPUT
-          } else {
-            echo "name=${{ inputs.tag || 'v0.9.4' }}" >> $env:GITHUB_OUTPUT
-          }
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "name=${GITHUB_REF_NAME}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "name=${{ inputs.tag || 'v0.10.0' }}" >> "${GITHUB_OUTPUT}"
+          fi
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.name }}
           target_commitish: ${{ github.sha }}
-          name: "Aicut ${{ steps.tag.outputs.name }} (Windows 11)"
-          generate_release_notes: true
+          name: "Aicut ${{ steps.tag.outputs.name }} (Linux · Arch/CachyOS & NVIDIA)"
+          generate_release_notes: false
           draft: false
           prerelease: false
           body: |
-            ## Aicut ${{ steps.tag.outputs.name }} — Estúdio Modular AI-First para Windows 11
+            ## Novidades da ${{ steps.tag.outputs.name }} — Migração Nativa para Linux (Arch / CachyOS & NVIDIA)
 
-            ### Novidades da v0.9.4
-            - **Detector automático pixel a pixel de conteúdo pausado/estático (`detect_static_content_intervals`):** identifica exatamente quando o vídeo assistido embaixo fica pausado enquanto o streamer fala (mascarando a webcam) e envia esses trechos para a IA preencher com **ilustrações vetoriais SVG e animações sob medida**, mantendo o vídeo real visível quando está tocando.
-            - **Zero padrões fixos antes da IA trabalhar:** se nenhuma edição for aplicada no Motion Studio, o corte preserva exatamente o enquadramento original salvo (`SMOKING33` / áreas de webcam e conteúdo).
-            - **Gemini anti-503 + IA Local GPU no Motion Studio:** retentativas com backoff + failover entre até 6 modelos Gemini ativos + suporte nativo a `llama-server` (`Qwen2.5-VL` na GPU com fallback seguro de VRAM) e failover cruzado automático entre nuvem e local.
-            - **Interface reorganizada em abas sem redundância + Motion Studio dirigido pelo Plano de Cortes:** 5 abas principais + `Configurações` unificada em 6 categorias (`IA & Chaves`, `Ferramentas`, `Sistema`, `Integrações`, `Módulos`, `Tarefas`).
+            - **Migração completa para Linux nativo (suporte a Windows encerrado):** build, CI e distribuição 100% focados em Linux com **AppImage universal** (base glibc 2.35 compatível com CachyOS / Arch Linux rolling, com GStreamer embutido para preview de vídeo) + **`PKGBUILD`** nativo para Arch/CachyOS.
+            - **Compatibilidade total com NVIDIA no Linux (CUDA, NVENC e Vulkan):**
+              - Proteção automática contra tela preta / erro GBM no WebKitGTK em sessões **Wayland + NVIDIA** (`WEBKIT_DISABLE_DMABUF_RENDERER=1` automático no boot, sobrescrevível via env).
+              - Sanitização automática de `LD_LIBRARY_PATH` dentro do AppImage + suporte nativo a `/opt/cuda/lib64` (Arch/CachyOS) e preservação de symlinks `.so` para `llama-server` e `whisper-cli`.
+              - Seleção inteligente de aceleração GPU: prioriza **CUDA** quando o CUDA Runtime está instalado (`pacman -S cuda`) ou **Vulkan** imediatamente out-of-the-box com `nvidia-utils`, além de **NVENC** em cortes, Motion Studio e proxy de preview.
+            - **Download automático do FFmpeg Linux GPL (BtbN Static NVENC/CUDA/VAAPI)** e suporte nativo a `ffmpeg` do sistema (`pacman -S ffmpeg`), além de detecção automática de navegadores Chromium/Chrome/Brave/Vivaldi no Linux para o Motion Studio.
 
-            ### Como instalar / atualizar no Windows 11
-            1. Baixe e execute **`Aicut_*_x64-setup.exe`** (recomendado) ou **`.msi`** nos assets abaixo.
-            2. Em **Configurações → Ferramentas**, clique em **Instalar / Atualizar Tudo**.
-            3. Em **Configurações → IA & Chaves**, configure sua chave Gemini API ou ative o modo **Local grátis (GPU)** com `Qwen2.5-VL`.
+            ### Como rodar no CachyOS / Arch Linux
+            - **Via AppImage (recomendado, sem instalação):**
+              ```bash
+              chmod +x Aicut_*_amd64.AppImage
+              ./Aicut_*_amd64.AppImage
+              ```
+              *(Se não tiver `fuse2` instalado no Arch/CachyOS, execute com `--appimage-extract-and-run` ou instale `sudo pacman -S fuse2`.)*
+            - **Ou nativo via `PKGBUILD` (opcional, compilado com flags do CachyOS):**
+              Baixe o `PKGBUILD` abaixo e execute `makepkg -si`.
           files: |
             release-assets/*

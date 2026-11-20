@@ -46,6 +46,13 @@ pub struct HardwareProfile {
     /// Maximum CUDA version supported by the installed NVIDIA driver (e.g. "13.2", "12.8").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cuda_version: Option<String>,
+    /// True when the local Linux host has a CUDA runtime library (`libcudart.so*`) installed
+    /// (e.g. `sudo pacman -S cuda` on Arch/CachyOS).
+    #[serde(default)]
+    pub cuda_runtime_installed: bool,
+    /// True when a Linux Vulkan ICD / loader is available (installed by default with `nvidia-utils` on CachyOS).
+    #[serde(default)]
+    pub vulkan_available: bool,
     pub recommended_accel: AccelBackend,
     pub recommendation_summary: String,
 }
@@ -55,26 +62,24 @@ impl HardwareProfile {
         self.cuda_version.as_deref().and_then(parse_major_minor)
     }
 
-    /// Detects the host OS, CPU architecture, memory, GPUs, and CUDA version to select
-    /// the optimal builds for yt-dlp, FFmpeg, whisper.cpp, and future AI modules.
+    /// Detects the host Linux distribution, CPU architecture, memory, NVIDIA/AMD/Intel GPUs,
+    /// CUDA driver/runtime, and Vulkan support to select optimal builds for FFmpeg, yt-dlp,
+    /// whisper.cpp, and llama.cpp.
     pub fn detect() -> Self {
         let mut sys = System::new_all();
         sys.refresh_all();
 
         let os = std::env::consts::OS.to_string();
         let arch = std::env::consts::ARCH.to_string();
-        let os_version = System::long_os_version()
+        let os_version = detect_linux_distro_name()
+            .or_else(System::long_os_version)
             .or_else(System::os_version)
             .unwrap_or_else(|| os.clone());
 
         let platform_tag = match (os.as_str(), arch.as_str()) {
-            ("windows", "x86_64") => "win-x64",
-            ("windows", "aarch64") => "win-arm64",
             ("linux", "x86_64") => "linux-x64",
             ("linux", "aarch64") => "linux-arm64",
-            ("macos", "aarch64") => "macos-arm64",
-            ("macos", "x86_64") => "macos-x64",
-            _ => "unknown",
+            _ => "linux-x64",
         }
         .to_string();
 
@@ -90,15 +95,23 @@ impl HardwareProfile {
         let total_memory_mb = sys.total_memory() / (1024 * 1024);
         let available_memory_mb = sys.available_memory() / (1024 * 1024);
 
-        let gpus = detect_gpus(&os);
+        let gpus = detect_gpus();
         let cuda_version = if gpus.iter().any(|g| g.vendor == GpuVendor::Nvidia) {
             detect_cuda_version()
         } else {
             None
         };
-        let recommended_accel = pick_recommended_accel(&os, &gpus);
-        let recommendation_summary =
-            build_summary(&platform_tag, recommended_accel, &gpus, cuda_version.as_deref());
+        let cuda_runtime_installed = detect_linux_cuda_runtime();
+        let vulkan_available = detect_linux_vulkan_available();
+        let recommended_accel = pick_recommended_accel(&gpus);
+        let recommendation_summary = build_summary(
+            &platform_tag,
+            recommended_accel,
+            &gpus,
+            cuda_version.as_deref(),
+            cuda_runtime_installed,
+            vulkan_available,
+        );
 
         Self {
             os,
@@ -112,12 +125,63 @@ impl HardwareProfile {
             available_memory_mb,
             gpus,
             cuda_version,
+            cuda_runtime_installed,
+            vulkan_available,
             recommended_accel,
             recommendation_summary,
         }
     }
 }
 
+fn detect_linux_distro_name() -> Option<String> {
+    let raw = std::fs::read_to_string("/etc/os-release").ok()?;
+    for line in raw.lines() {
+        if let Some(val) = line.strip_prefix("PRETTY_NAME=") {
+            let clean = val.trim().trim_matches('"').trim_matches('\'').trim();
+            if !clean.is_empty() {
+                return Some(clean.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Checks Arch/CachyOS (`/opt/cuda`) and standard Linux paths for `libcudart.so*`.
+pub fn detect_linux_cuda_runtime() -> bool {
+    let dirs = [
+        "/opt/cuda/lib64",
+        "/opt/cuda/targets/x86_64-linux/lib",
+        "/usr/local/cuda/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        "/usr/lib/x86_64-linux-gnu",
+    ];
+    for dir in dirs {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with("libcudart.so") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Checks whether a Linux Vulkan ICD / loader is available (present out-of-the-box with NVIDIA drivers on CachyOS/Arch).
+pub fn detect_linux_vulkan_available() -> bool {
+    let paths = [
+        "/usr/lib/libvulkan.so.1",
+        "/usr/lib64/libvulkan.so.1",
+        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1",
+        "/usr/share/vulkan/icd.d/nvidia_icd.json",
+    ];
+    paths.iter().any(|p| std::path::Path::new(p).exists())
+}
+
+#[allow(dead_code)]
 fn classify_vendor(name: &str) -> GpuVendor {
     let lower = name.to_lowercase();
     if lower.contains("nvidia") || lower.contains("geforce") || lower.contains("rtx") || lower.contains("gtx") || lower.contains("quadro") {
@@ -133,10 +197,10 @@ fn classify_vendor(name: &str) -> GpuVendor {
     }
 }
 
-fn detect_gpus(os: &str) -> Vec<GpuInfo> {
+fn detect_gpus() -> Vec<GpuInfo> {
     let mut gpus = Vec::new();
 
-    // 1. Try nvidia-smi (cross-platform: Windows & Linux) for accurate NVIDIA VRAM & driver info.
+    // 1. Primary: `nvidia-smi` for exact NVIDIA GPU name, VRAM (MB), and driver version on Linux.
     let mut nv_cmd = Command::new("nvidia-smi");
     crate::process::configure_std_command(&mut nv_cmd);
     if let Ok(output) = nv_cmd
@@ -164,101 +228,39 @@ fn detect_gpus(os: &str) -> Vec<GpuInfo> {
         }
     }
 
-    // 2. Windows: query Win32_VideoController via PowerShell CIM (covers AMD, Intel, and NVIDIA fallback).
-    if os == "windows" {
-        let mut ps_cmd = Command::new("powershell");
-        crate::process::configure_std_command(&mut ps_cmd);
-        if let Ok(output) = ps_cmd
-            .args([
-                "-NoProfile",
-                "-Command",
-                "Get-CimInstance Win32_VideoController | Select-Object Name,AdapterRAM,DriverVersion | ConvertTo-Json -Compress",
-            ])
-            .output()
-        {
-            if output.status.success() {
-                let raw = String::from_utf8_lossy(&output.stdout);
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw.trim()) {
-                    let items = match val {
-                        serde_json::Value::Array(arr) => arr,
-                        obj @ serde_json::Value::Object(_) => vec![obj],
-                        _ => vec![],
-                    };
-                    for item in items {
-                        let Some(name) = item.get("Name").and_then(|v| v.as_str()) else {
-                            continue;
-                        };
-                        let name_trimmed = name.trim();
-                        if name_trimmed.is_empty()
-                            || gpus
-                                .iter()
-                                .any(|g| g.name.eq_ignore_ascii_case(name_trimmed))
-                        {
-                            continue;
-                        }
-                        let vram_mb = item
-                            .get("AdapterRAM")
-                            .and_then(|v| v.as_u64())
-                            .map(|b| b / (1024 * 1024))
-                            .filter(|&mb| mb > 0);
-                        let driver_version = item
-                            .get("DriverVersion")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                        gpus.push(GpuInfo {
-                            name: name_trimmed.to_string(),
-                            vendor: classify_vendor(name_trimmed),
-                            vram_mb,
-                            driver_version,
-                        });
-                    }
+    // 2. Linux sysfs fallback: inspect `/sys/class/drm` PCI vendor IDs (NVIDIA / AMD / Intel).
+    if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
+        for entry in entries.flatten() {
+            let vendor_path = entry.path().join("device/vendor");
+            if let Ok(vendor_hex) = std::fs::read_to_string(vendor_path) {
+                let (vendor, label) = match vendor_hex.trim() {
+                    "0x10de" => (GpuVendor::Nvidia, "NVIDIA GPU"),
+                    "0x1002" => (GpuVendor::Amd, "AMD Radeon GPU"),
+                    "0x8086" => (GpuVendor::Intel, "Intel Integrated/Arc GPU"),
+                    _ => continue,
+                };
+                if !gpus.iter().any(|g| g.vendor == vendor) {
+                    gpus.push(GpuInfo {
+                        name: label.to_string(),
+                        vendor,
+                        vram_mb: None,
+                        driver_version: None,
+                    });
                 }
             }
         }
-    } else if os == "linux" && gpus.is_empty() {
-        // 3. Linux fallback: inspect /sys/class/drm vendor IDs if available.
-        if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
-            for entry in entries.flatten() {
-                let vendor_path = entry.path().join("device/vendor");
-                if let Ok(vendor_hex) = std::fs::read_to_string(vendor_path) {
-                    let (vendor, label) = match vendor_hex.trim() {
-                        "0x10de" => (GpuVendor::Nvidia, "NVIDIA GPU"),
-                        "0x1002" => (GpuVendor::Amd, "AMD Radeon GPU"),
-                        "0x8086" => (GpuVendor::Intel, "Intel Integrated/Arc GPU"),
-                        _ => continue,
-                    };
-                    if !gpus.iter().any(|g| g.vendor == vendor) {
-                        gpus.push(GpuInfo {
-                            name: label.to_string(),
-                            vendor,
-                            vram_mb: None,
-                            driver_version: None,
-                        });
-                    }
-                }
-            }
-        }
-    } else if os == "macos" && std::env::consts::ARCH == "aarch64" && gpus.is_empty() {
-        gpus.push(GpuInfo {
-            name: "Apple Silicon GPU".to_string(),
-            vendor: GpuVendor::Apple,
-            vram_mb: None,
-            driver_version: None,
-        });
     }
 
     gpus
 }
 
-fn pick_recommended_accel(os: &str, gpus: &[GpuInfo]) -> AccelBackend {
+fn pick_recommended_accel(gpus: &[GpuInfo]) -> AccelBackend {
     if gpus.iter().any(|g| g.vendor == GpuVendor::Nvidia) {
         AccelBackend::CudaNvenc
     } else if gpus.iter().any(|g| g.vendor == GpuVendor::Amd) {
         AccelBackend::AmfDirectml
     } else if gpus.iter().any(|g| g.vendor == GpuVendor::Intel) {
         AccelBackend::QsvOpenvino
-    } else if os == "macos" && gpus.iter().any(|g| g.vendor == GpuVendor::Apple) {
-        AccelBackend::Metal
     } else {
         AccelBackend::CpuOnly
     }
@@ -277,21 +279,23 @@ fn detect_cuda_version() -> Option<String> {
         }
     }
 
-    // 2. Fallback: `nvcc --version` (CUDA Toolkit version if installed on PATH)
-    let mut nvcc = Command::new("nvcc");
-    crate::process::configure_std_command(&mut nvcc);
-    if let Ok(output) = nvcc.arg("--version").output() {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if let Some(idx) = stdout.find("release ") {
-                let rest = &stdout[idx + "release ".len()..];
-                let token = rest
-                    .split(|c: char| !c.is_ascii_digit() && c != '.')
-                    .next()
-                    .unwrap_or("")
-                    .trim_end_matches('.');
-                if parse_major_minor(token).is_some() {
-                    return Some(token.to_string());
+    // 2. Fallback: `nvcc --version` on PATH or Arch/CachyOS (`/opt/cuda/bin/nvcc`) / standard Linux path
+    for nvcc_bin in ["nvcc", "/opt/cuda/bin/nvcc", "/usr/local/cuda/bin/nvcc"] {
+        let mut nvcc = Command::new(nvcc_bin);
+        crate::process::configure_std_command(&mut nvcc);
+        if let Ok(output) = nvcc.arg("--version").output() {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if let Some(idx) = stdout.find("release ") {
+                    let rest = &stdout[idx + "release ".len()..];
+                    let token = rest
+                        .split(|c: char| !c.is_ascii_digit() && c != '.')
+                        .next()
+                        .unwrap_or("")
+                        .trim_end_matches('.');
+                    if parse_major_minor(token).is_some() {
+                        return Some(token.to_string());
+                    }
                 }
             }
         }
@@ -322,31 +326,40 @@ fn build_summary(
     accel: AccelBackend,
     gpus: &[GpuInfo],
     cuda_version: Option<&str>,
+    cuda_runtime_installed: bool,
+    vulkan_available: bool,
 ) -> String {
     let gpu_label = gpus
         .first()
         .map(|g| g.name.as_str())
-        .unwrap_or("No dedicated GPU detected");
+        .unwrap_or("Nenhuma GPU dedicada detectada");
     match accel {
         AccelBackend::CudaNvenc => {
             let cuda_tag = cuda_version
                 .map(|v| format!(" · CUDA {v}"))
                 .unwrap_or_default();
+            let runtime_note = if cuda_runtime_installed {
+                "CUDA Runtime + NVENC + Vulkan ativos"
+            } else if vulkan_available {
+                "NVENC + Vulkan GPU ativos (instale o pacote `cuda` para backend CUDA nativo)"
+            } else {
+                "NVENC ativo"
+            };
             format!(
-                "Profile {platform_tag} with NVIDIA GPU ({gpu_label}{cuda_tag}): automatically picks the highest compatible CUDA/NVENC tool builds."
+                "Perfil {platform_tag} com GPU NVIDIA ({gpu_label}{cuda_tag}): {runtime_note}."
             )
         }
         AccelBackend::AmfDirectml => format!(
-            "Profile {platform_tag} with AMD GPU ({gpu_label}): prefers AMF/DirectML/Vulkan-compatible tool builds."
+            "Perfil {platform_tag} com GPU AMD ({gpu_label}): aceleração Vulkan para IA local e FFmpeg otimizado."
         ),
         AccelBackend::QsvOpenvino => format!(
-            "Profile {platform_tag} with Intel GPU ({gpu_label}): prefers QuickSync/OpenVINO/Vulkan-compatible tool builds."
+            "Perfil {platform_tag} com GPU Intel ({gpu_label}): aceleração Vulkan/QuickSync para IA local e vídeo."
         ),
         AccelBackend::Metal => format!(
-            "Profile {platform_tag} with Apple Silicon ({gpu_label}): prefers native ARM64/Metal builds."
+            "Perfil {platform_tag} ({gpu_label}): aceleração por hardware."
         ),
         AccelBackend::CpuOnly => format!(
-            "Profile {platform_tag} (CPU mode): selects optimized native CPU tool builds."
+            "Perfil {platform_tag} (modo CPU): seleciona binários Linux nativos multithread."
         ),
     }
 }
