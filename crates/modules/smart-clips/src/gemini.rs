@@ -463,10 +463,73 @@ async fn delete_gemini_file(http: &reqwest::Client, api_key: &str, name: &str) -
     Ok(())
 }
 
+/// Sends an inline JPEG image + prompt to an active Gemini model and returns raw JSON text.
+pub(crate) async fn generate_with_inline_image(
+    http: &reqwest::Client,
+    api_key: &str,
+    model: &str,
+    jpeg_b64: &str,
+    prompt: &str,
+) -> AicutResult<String> {
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    );
+    let body = serde_json::json!({
+        "contents": [{
+            "role": "user",
+            "parts": [
+                {
+                    "inline_data": {
+                        "mime_type": "image/jpeg",
+                        "data": jpeg_b64
+                    }
+                },
+                { "text": prompt }
+            ]
+        }],
+        "generationConfig": {
+            "temperature": 0.15,
+            "responseMimeType": "application/json",
+            "maxOutputTokens": 1200
+        }
+    });
+
+    let resp = http
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| AicutError::internal(format!("Gemini framing review request failed: {e}")))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err_txt = resp.text().await.unwrap_or_default();
+        return Err(AicutError::new(
+            "GEMINI_API_ERROR",
+            format!("Gemini API ({model}) retornou HTTP {status}: {err_txt}"),
+        ));
+    }
+
+    let val: Value = resp
+        .json()
+        .await
+        .map_err(|e| AicutError::internal(format!("Failed parsing Gemini framing review JSON: {e}")))?;
+    let text = val
+        .get("candidates")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("content"))
+        .and_then(|c| c.get("parts"))
+        .and_then(|p| p.as_array())
+        .and_then(|arr| arr.iter().find_map(|part| part.get("text").and_then(|t| t.as_str())))
+        .ok_or_else(|| AicutError::internal("Gemini framing review returned empty text"))?;
+    Ok(text.to_string())
+}
+
 /// Queries the user's Gemini API key for currently available `generateContent` models so deprecated
 /// model IDs (like `gemini-2.5-flash` / `gemini-2.5-pro`) automatically upgrade to the newest
 /// compatible Gemini Flash & Pro models (e.g. `gemini-3.8-flash` / `gemini-3.8-pro`).
-async fn resolve_active_gemini_models(
+pub(crate) async fn resolve_active_gemini_models(
     http: &reqwest::Client,
     api_key: &str,
     requested_scan: &str,

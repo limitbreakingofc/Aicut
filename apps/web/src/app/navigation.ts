@@ -1,9 +1,9 @@
-import { Activity, Blocks, Bot, Download, Film, Mic, Scissors, Settings, type LucideIcon } from "lucide-react";
+import { Activity, Blocks, Bot, Crop, Download, Film, Mic, Scissors, Settings, type LucideIcon } from "lucide-react";
 import type { RouteId } from "../lib/types";
 
 /** Single source of truth for app navigation: sidebar, breadcrumb, page headers and command palette. */
 
-export const APP_VERSION = "0.5.3";
+export const APP_VERSION = "0.6.0";
 
 export type NavGroupId = "studio" | "system";
 
@@ -74,6 +74,17 @@ export const ROUTES: RouteMeta[] = [
     group: "studio",
     step: 4,
     keywords: "shorts reels tiktok cortes clips gemini qwen 9:16 vertical renderizar",
+  },
+  {
+    id: "framing",
+    label: "Enquadramento",
+    title: "Enquadramento · Webcam & Conteúdo",
+    description:
+      "Ajuste com precisão a área limpa da webcam (sem bordas e sem zoom colado no rosto) e a área do conteúdo, salve perfis e peça para a IA revisar o enquadramento.",
+    icon: Crop,
+    group: "studio",
+    step: 5,
+    keywords: "webcam bordas enquadramento crop area conteudo revisao ia framing moldura",
   },
   {
     id: "jobs",

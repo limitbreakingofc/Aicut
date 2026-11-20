@@ -243,6 +243,83 @@ pub async fn ensure_face_detector_model(kernel: &AicutKernel) -> AicutResult<Pat
     )))
 }
 
+/// Configuration for top webcam slot tracking inside `compute_dual_tracks`.
+#[derive(Debug, Clone, Copy)]
+pub struct CameraSlotSpec {
+    pub target_w: u32,
+    pub target_h: u32,
+    pub corner_hint: WebcamCorner,
+    pub face_zoom: f32,
+    pub border_trim_pct: f32,
+    /// Optional user-saved precision webcam box (normalized 0..1). When set, overrides auto detection.
+    pub custom_rect: Option<PixelRect>,
+    /// When true with `custom_rect`, locks 100% cleanly to the saved area with zero zoom/pan drift.
+    pub lock_static: bool,
+}
+
+/// Configuration for bottom content slot framing inside `compute_dual_tracks`.
+#[derive(Debug, Clone, Copy)]
+pub struct ContentSlotSpec {
+    pub target_w: u32,
+    pub target_h: u32,
+    /// Optional user-saved precision content region (normalized 0..1).
+    pub custom_rect: Option<PixelRect>,
+    /// When true with `custom_rect`, shows the exact saved content region statically without panning.
+    pub lock_static: bool,
+}
+
+/// Builds a crisp static `CameraTrackPlan` fitting the maximum `target_aspect` crop centered inside
+/// `rect_norm` (normalized 0..1) with zero border leak and zero zoom glued to the face.
+pub fn build_static_rect_plan(
+    rect_norm: PixelRect,
+    src_w: u32,
+    src_h: u32,
+    target_aspect: f64,
+    filter_target: &str,
+    is_pip_webcam: bool,
+) -> CameraTrackPlan {
+    let rx0 = (rect_norm.x * src_w as f64)
+        .ceil()
+        .clamp(0.0, src_w.saturating_sub(32) as f64);
+    let ry0 = (rect_norm.y * src_h as f64)
+        .ceil()
+        .clamp(0.0, src_h.saturating_sub(32) as f64);
+    let rx1 = (rect_norm.right() * src_w as f64)
+        .floor()
+        .clamp(rx0 + 32.0, src_w as f64);
+    let ry1 = (rect_norm.bottom() * src_h as f64)
+        .floor()
+        .clamp(ry0 + 32.0, src_h as f64);
+    let rw = (rx1 - rx0).max(32.0);
+    let rh = (ry1 - ry0).max(32.0);
+
+    let (cw_f, ch_f) = if rw / rh.max(1.0) >= target_aspect {
+        (rh * target_aspect, rh)
+    } else {
+        (rw, rw / target_aspect)
+    };
+    let max_even_w = ((rw.floor() as u32) & !1).clamp(32, src_w & !1);
+    let max_even_h = ((rh.floor() as u32) & !1).clamp(32, src_h & !1);
+    let crop_w = ((cw_f.floor() as u32) & !1).clamp(32.min(max_even_w), max_even_w);
+    let crop_h = ((ch_f.floor() as u32) & !1).clamp(32.min(max_even_h), max_even_h);
+
+    let x = ((rx0 + (rw - crop_w as f64) * 0.5).round() as i32)
+        .clamp(rx0 as i32, (rx1 as i32 - crop_w as i32).max(rx0 as i32));
+    let y = ((ry0 + (rh - crop_h as f64) * 0.5).round() as i32)
+        .clamp(ry0 as i32, (ry1 as i32 - crop_h as i32).max(ry0 as i32));
+
+    CameraTrackPlan {
+        crop_w,
+        crop_h,
+        init_x: x,
+        init_y: y,
+        keyframes: vec![(0.0, x, y)],
+        filter_target: filter_target.to_string(),
+        detected_faces_count: 0,
+        is_pip_webcam,
+    }
+}
+
 /// Runs full 2-stage AI face tracking & zero-border webcam edge detection across a clip.
 /// Returns `Ok(Some(CameraTrackPlan))` on success, or `Ok(None)` if no face could be detected
 /// (so the renderer can fall back cleanly to the static crop).
@@ -267,7 +344,15 @@ pub async fn compute_camera_track(
         src_w,
         src_h,
         segments,
-        Some((target_w, target_h, corner_hint, face_zoom, border_trim_pct)),
+        Some(CameraSlotSpec {
+            target_w,
+            target_h,
+            corner_hint,
+            face_zoom,
+            border_trim_pct,
+            custom_rect: None,
+            lock_static: false,
+        }),
         None,
     )
     .await?;
@@ -275,8 +360,8 @@ pub async fn compute_camera_track(
 }
 
 /// Runs unified single-pass AI tracking for BOTH Short windows in one frame extraction:
-/// - `camera_slot`: `(target_w, target_h, corner_hint, face_zoom, border_trim_pct)` for the top webcam
-/// - `content_slot`: `(target_w, target_h)` for the bottom content window (active speaker or peak action)
+/// - `camera_slot`: top webcam cameraman (`crop@cam`) — respects user-saved precision rect if set
+/// - `content_slot`: bottom content director (`crop@content`) — active speaker or peak action
 #[allow(clippy::too_many_arguments)]
 pub async fn compute_dual_tracks(
     kernel: &AicutKernel,
@@ -285,8 +370,8 @@ pub async fn compute_dual_tracks(
     src_w: u32,
     src_h: u32,
     segments: &[SmartClipSegment],
-    camera_slot: Option<(u32, u32, WebcamCorner, f32, f32)>,
-    content_slot: Option<(u32, u32)>,
+    camera_slot: Option<CameraSlotSpec>,
+    content_slot: Option<ContentSlotSpec>,
 ) -> AicutResult<DualTrackPlan> {
     if (camera_slot.is_none() && content_slot.is_none())
         || src_w < 64
@@ -296,12 +381,45 @@ pub async fn compute_dual_tracks(
         return Ok(DualTrackPlan::default());
     }
 
-    // Download UltraFace (~1.2 MB) once if missing. If offline/unreachable, content action tracking
-    // can still proceed using pure visual motion + saliency without failing the render.
-    let model_path = ensure_face_detector_model(kernel).await.ok();
-    if model_path.is_none() && content_slot.is_none() {
-        return Ok(DualTrackPlan::default());
+    // Fast path: if BOTH requested slots are static user-saved precision boxes, zero frame
+    // extraction or ONNX inference is needed!
+    let cam_is_pure_static = camera_slot
+        .map(|c| c.custom_rect.is_some() && c.lock_static)
+        .unwrap_or(true);
+    let content_is_pure_static = content_slot
+        .map(|c| c.custom_rect.is_some() && c.lock_static)
+        .unwrap_or(true);
+    if cam_is_pure_static && content_is_pure_static {
+        let camera = camera_slot.and_then(|c| {
+            c.custom_rect.map(|r| {
+                build_static_rect_plan(
+                    r,
+                    src_w,
+                    src_h,
+                    c.target_w as f64 / c.target_h.max(1) as f64,
+                    "crop@cam",
+                    true,
+                )
+            })
+        });
+        let content = content_slot.and_then(|c| {
+            c.custom_rect.map(|r| {
+                build_static_rect_plan(
+                    r,
+                    src_w,
+                    src_h,
+                    c.target_w as f64 / c.target_h.max(1) as f64,
+                    "crop@content",
+                    false,
+                )
+            })
+        });
+        return Ok(DualTrackPlan { camera, content });
     }
+
+    // Download UltraFace (~1.2 MB) once if missing. If offline/unreachable, content action tracking
+    // or static custom rects can still proceed cleanly without failing the render.
+    let model_path = ensure_face_detector_model(kernel).await.ok();
 
     let tmp_dir = std::env::temp_dir().join(format!("aicut-facetrack-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&tmp_dir)?;
@@ -339,57 +457,148 @@ pub async fn compute_dual_tracks(
         let mut camera_plan: Option<CameraTrackPlan> = None;
         let mut webcam_exclude_norm: Option<PixelRect> = None;
 
-        // ---- PART 1: Top Webcam Cameraman (Zero-Border + Smooth Face Tracking) ----
-        if let (Some((cam_w, cam_h, corner_hint, face_zoom, border_trim_pct)), Some(det)) =
-            (camera_slot, detector.as_ref())
-        {
-            let target_aspect = cam_w as f64 / cam_h.max(1) as f64;
-            let zoom = face_zoom.clamp(0.75, 1.50) as f64;
-            let trim = border_trim_pct.clamp(0.01, 0.12) as f64;
+        // ---- PART 1: Top Webcam Cameraman (User-Saved Precision Rect OR Zero-Border Auto) ----
+        if let Some(cam) = camera_slot {
+            let target_aspect = cam.target_w as f64 / cam.target_h.max(1) as f64;
+            let zoom = cam.face_zoom.clamp(0.75, 1.50) as f64;
+            let trim = cam.border_trim_pct.clamp(0.01, 0.12) as f64;
 
-            // PASS 1: Detect faces across clip & identify dominant human speaker (anti-NPC)
-            let stride = (loaded.len() / 45).max(1);
-            let mut pass1_faces: Vec<FaceBox> = Vec::new();
-            for (idx, (_, rgb)) in loaded.iter().enumerate() {
-                if idx % stride != 0 {
-                    continue;
+            if let Some(saved_rect) = cam.custom_rect {
+                // User saved exact webcam interior in the Framing Studio tab!
+                webcam_exclude_norm = Some(expand_norm_rect(saved_rect, 0.018));
+                if cam.lock_static || detector.is_none() {
+                    camera_plan = Some(build_static_rect_plan(
+                        saved_rect,
+                        src_w,
+                        src_h,
+                        target_aspect,
+                        "crop@cam",
+                        true,
+                    ));
+                } else if let Some(det) = detector.as_ref() {
+                    let safe_box_px = PixelRect {
+                        x: saved_rect.x * src_w as f64,
+                        y: saved_rect.y * src_h as f64,
+                        w: saved_rect.w * src_w as f64,
+                        h: saved_rect.h * src_h as f64,
+                    };
+                    let mut tracked_samples: Vec<(f64, Option<FaceBox>)> =
+                        Vec::with_capacity(loaded.len());
+                    let mut prev_cx = (saved_rect.x + saved_rect.w * 0.5) as f32;
+                    let mut prev_cy = (saved_rect.y + saved_rect.h * 0.45) as f32;
+                    let mut detected_faces_count = 0usize;
+
+                    for (t, rgb) in &loaded {
+                        let fw = rgb.width() as f64;
+                        let fh = rgb.height() as f64;
+                        let cx0 = (saved_rect.x * fw).floor().clamp(0.0, fw - 2.0) as u32;
+                        let cy0 = (saved_rect.y * fh).floor().clamp(0.0, fh - 2.0) as u32;
+                        let cw = (saved_rect.w * fw)
+                            .round()
+                            .clamp(16.0, fw - cx0 as f64) as u32;
+                        let ch = (saved_rect.h * fh)
+                            .round()
+                            .clamp(16.0, fh - cy0 as f64) as u32;
+
+                        let cropped = imageops::crop_imm(rgb, cx0, cy0, cw, ch).to_image();
+                        let picked = det.detect(&cropped, 0.55).ok().and_then(|faces| {
+                            faces
+                                .into_iter()
+                                .map(|f| FaceBox {
+                                    x1: (cx0 as f32 + f.x1 * cw as f32) / fw as f32,
+                                    y1: (cy0 as f32 + f.y1 * ch as f32) / fh as f32,
+                                    x2: (cx0 as f32 + f.x2 * cw as f32) / fw as f32,
+                                    y2: (cy0 as f32 + f.y2 * ch as f32) / fh as f32,
+                                    score: f.score,
+                                })
+                                .max_by(|a, b| {
+                                    let sa = track_continuity_score(*a, prev_cx, prev_cy);
+                                    let sb = track_continuity_score(*b, prev_cx, prev_cy);
+                                    sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+                                })
+                        });
+                        if let Some(f) = picked {
+                            prev_cx = f.cx();
+                            prev_cy = f.cy();
+                            detected_faces_count += 1;
+                        }
+                        tracked_samples.push((*t, picked));
+                    }
+
+                    if detected_faces_count > 0 {
+                        camera_plan = Some(build_natural_camera_track(
+                            &tracked_samples,
+                            safe_box_px,
+                            src_w,
+                            src_h,
+                            target_aspect,
+                            zoom,
+                            total_clip_dur,
+                            true,
+                        ));
+                    } else {
+                        camera_plan = Some(build_static_rect_plan(
+                            saved_rect,
+                            src_w,
+                            src_h,
+                            target_aspect,
+                            "crop@cam",
+                            true,
+                        ));
+                    }
                 }
-                if let Ok(found) = det.detect(rgb, 0.62) {
-                    for f in found {
-                        if matches_corner_hint(f, corner_hint) {
-                            pass1_faces.push(f);
+            } else if let Some(det) = detector.as_ref() {
+                // PASS 1: Detect faces across clip & identify dominant human speaker (anti-NPC)
+                let stride = (loaded.len() / 45).max(1);
+                let mut pass1_faces: Vec<FaceBox> = Vec::new();
+                for (idx, (_, rgb)) in loaded.iter().enumerate() {
+                    if idx % stride != 0 {
+                        continue;
+                    }
+                    if let Ok(found) = det.detect(rgb, 0.62) {
+                        for f in found {
+                            if matches_corner_hint(f, cam.corner_hint) {
+                                pass1_faces.push(f);
+                            }
                         }
                     }
                 }
-            }
 
-            if let Some(anchor_face) = select_dominant_face_cluster(&pass1_faces) {
-                let force_pip = matches!(
-                    corner_hint,
-                    WebcamCorner::BottomRight
-                        | WebcamCorner::BottomLeft
-                        | WebcamCorner::TopRight
-                        | WebcamCorner::TopLeft
-                );
-                let maybe_pip = match corner_hint {
-                    WebcamCorner::Center => false,
-                    WebcamCorner::AutoFace => {
-                        let near_edge = anchor_face.cx() < 0.36
-                            || anchor_face.cx() > 0.64
-                            || anchor_face.cy() < 0.34
-                            || anchor_face.cy() > 0.66;
-                        // Any face smaller than 32% of frame width could be inside a PiP OBS webcam
-                        anchor_face.w() < 0.32 && (near_edge || anchor_face.w() < 0.22)
-                    }
-                    _ => true,
-                };
+                if let Some(anchor_face) = select_dominant_face_cluster(&pass1_faces) {
+                    let force_pip = matches!(
+                        cam.corner_hint,
+                        WebcamCorner::BottomRight
+                            | WebcamCorner::BottomLeft
+                            | WebcamCorner::TopRight
+                            | WebcamCorner::TopLeft
+                    );
+                    let maybe_pip = match cam.corner_hint {
+                        WebcamCorner::Center => false,
+                        WebcamCorner::AutoFace => {
+                            let near_edge = anchor_face.cx() < 0.36
+                                || anchor_face.cx() > 0.64
+                                || anchor_face.cy() < 0.34
+                                || anchor_face.cy() > 0.66;
+                            anchor_face.w() < 0.32 && (near_edge || anchor_face.w() < 0.22)
+                        }
+                        _ => true,
+                    };
 
-                let (is_pip_webcam, safe_box_norm, outer_box_norm) = if maybe_pip {
-                    let det_box =
-                        detect_pip_webcam_zero_border(&loaded, anchor_face, trim, force_pip);
-                    let confirmed_pip = force_pip || det_box.walls_detected >= 2;
-                    if confirmed_pip {
-                        (true, det_box.safe_rect, det_box.outer_rect)
+                    let (is_pip_webcam, safe_box_norm, outer_box_norm) = if maybe_pip {
+                        let det_box =
+                            detect_pip_webcam_zero_border(&loaded, anchor_face, trim, force_pip);
+                        let confirmed_pip = force_pip || det_box.walls_detected >= 2;
+                        if confirmed_pip {
+                            (true, det_box.safe_rect, det_box.outer_rect)
+                        } else {
+                            let full = PixelRect {
+                                x: 0.005,
+                                y: 0.005,
+                                w: 0.99,
+                                h: 0.99,
+                            };
+                            (false, full, full)
+                        }
                     } else {
                         let full = PixelRect {
                             x: 0.005,
@@ -398,92 +607,106 @@ pub async fn compute_dual_tracks(
                             h: 0.99,
                         };
                         (false, full, full)
-                    }
-                } else {
-                    let full = PixelRect {
-                        x: 0.005,
-                        y: 0.005,
-                        w: 0.99,
-                        h: 0.99,
                     };
-                    (false, full, full)
-                };
 
-                if is_pip_webcam {
-                    // Mask out the streamer's corner webcam + OBS border from bottom content analysis
-                    webcam_exclude_norm = Some(expand_norm_rect(outer_box_norm, 0.018));
-                }
-
-                let safe_box_px = PixelRect {
-                    x: safe_box_norm.x * src_w as f64,
-                    y: safe_box_norm.y * src_h as f64,
-                    w: safe_box_norm.w * src_w as f64,
-                    h: safe_box_norm.h * src_h as f64,
-                };
-
-                // PASS 2: High-precision zoomed face tracking INSIDE clean safe_box on EVERY frame
-                let mut tracked_samples: Vec<(f64, Option<FaceBox>)> =
-                    Vec::with_capacity(loaded.len());
-                let mut prev_cx = anchor_face.cx();
-                let mut prev_cy = anchor_face.cy();
-                let mut detected_faces_count = 0usize;
-
-                for (t, rgb) in &loaded {
-                    let fw = rgb.width() as f64;
-                    let fh = rgb.height() as f64;
-                    let cx0 = (safe_box_norm.x * fw).floor().clamp(0.0, fw - 2.0) as u32;
-                    let cy0 = (safe_box_norm.y * fh).floor().clamp(0.0, fh - 2.0) as u32;
-                    let cw = (safe_box_norm.w * fw)
-                        .round()
-                        .clamp(16.0, fw - cx0 as f64) as u32;
-                    let ch = (safe_box_norm.h * fh)
-                        .round()
-                        .clamp(16.0, fh - cy0 as f64) as u32;
-
-                    let cropped = imageops::crop_imm(rgb, cx0, cy0, cw, ch).to_image();
-                    let picked = det.detect(&cropped, 0.58).ok().and_then(|faces| {
-                        faces
-                            .into_iter()
-                            .map(|f| FaceBox {
-                                x1: (cx0 as f32 + f.x1 * cw as f32) / fw as f32,
-                                y1: (cy0 as f32 + f.y1 * ch as f32) / fh as f32,
-                                x2: (cx0 as f32 + f.x2 * cw as f32) / fw as f32,
-                                y2: (cy0 as f32 + f.y2 * ch as f32) / fh as f32,
-                                score: f.score,
-                            })
-                            .max_by(|a, b| {
-                                let sa = track_continuity_score(*a, prev_cx, prev_cy);
-                                let sb = track_continuity_score(*b, prev_cx, prev_cy);
-                                sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
-                            })
-                    });
-
-                    if let Some(f) = picked {
-                        prev_cx = f.cx();
-                        prev_cy = f.cy();
-                        detected_faces_count += 1;
+                    if is_pip_webcam {
+                        webcam_exclude_norm = Some(expand_norm_rect(outer_box_norm, 0.018));
                     }
-                    tracked_samples.push((*t, picked));
-                }
 
-                if detected_faces_count > 0 {
-                    camera_plan = Some(build_natural_camera_track(
-                        &tracked_samples,
-                        safe_box_px,
-                        src_w,
-                        src_h,
-                        target_aspect,
-                        zoom,
-                        total_clip_dur,
-                        is_pip_webcam,
-                    ));
+                    let safe_box_px = PixelRect {
+                        x: safe_box_norm.x * src_w as f64,
+                        y: safe_box_norm.y * src_h as f64,
+                        w: safe_box_norm.w * src_w as f64,
+                        h: safe_box_norm.h * src_h as f64,
+                    };
+
+                    // PASS 2: High-precision face tracking INSIDE clean safe_box on EVERY frame
+                    let mut tracked_samples: Vec<(f64, Option<FaceBox>)> =
+                        Vec::with_capacity(loaded.len());
+                    let mut prev_cx = anchor_face.cx();
+                    let mut prev_cy = anchor_face.cy();
+                    let mut detected_faces_count = 0usize;
+
+                    for (t, rgb) in &loaded {
+                        let fw = rgb.width() as f64;
+                        let fh = rgb.height() as f64;
+                        let cx0 = (safe_box_norm.x * fw).floor().clamp(0.0, fw - 2.0) as u32;
+                        let cy0 = (safe_box_norm.y * fh).floor().clamp(0.0, fh - 2.0) as u32;
+                        let cw = (safe_box_norm.w * fw)
+                            .round()
+                            .clamp(16.0, fw - cx0 as f64) as u32;
+                        let ch = (safe_box_norm.h * fh)
+                            .round()
+                            .clamp(16.0, fh - cy0 as f64) as u32;
+
+                        let cropped = imageops::crop_imm(rgb, cx0, cy0, cw, ch).to_image();
+                        let picked = det.detect(&cropped, 0.58).ok().and_then(|faces| {
+                            faces
+                                .into_iter()
+                                .map(|f| FaceBox {
+                                    x1: (cx0 as f32 + f.x1 * cw as f32) / fw as f32,
+                                    y1: (cy0 as f32 + f.y1 * ch as f32) / fh as f32,
+                                    x2: (cx0 as f32 + f.x2 * cw as f32) / fw as f32,
+                                    y2: (cy0 as f32 + f.y2 * ch as f32) / fh as f32,
+                                    score: f.score,
+                                })
+                                .max_by(|a, b| {
+                                    let sa = track_continuity_score(*a, prev_cx, prev_cy);
+                                    let sb = track_continuity_score(*b, prev_cx, prev_cy);
+                                    sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+                                })
+                        });
+
+                        if let Some(f) = picked {
+                            prev_cx = f.cx();
+                            prev_cy = f.cy();
+                            detected_faces_count += 1;
+                        }
+                        tracked_samples.push((*t, picked));
+                    }
+
+                    if detected_faces_count > 0 {
+                        camera_plan = Some(build_natural_camera_track(
+                            &tracked_samples,
+                            safe_box_px,
+                            src_w,
+                            src_h,
+                            target_aspect,
+                            zoom,
+                            total_clip_dur,
+                            is_pip_webcam,
+                        ));
+                    }
                 }
             }
         }
 
-        // ---- PART 2: Bottom Content Director (Active Speaker + Visual Action / Highlight) ----
-        let content_plan = content_slot.map(|(cnt_w, cnt_h)| {
-            let content_aspect = cnt_w as f64 / cnt_h.max(1) as f64;
+        // ---- PART 2: Bottom Content Director (User-Saved Region OR Active Speaker + Action) ----
+        let content_plan = content_slot.map(|cnt| {
+            let content_aspect = cnt.target_w as f64 / cnt.target_h.max(1) as f64;
+            if let Some(saved_content) = cnt.custom_rect {
+                if cnt.lock_static {
+                    return build_static_rect_plan(
+                        saved_content,
+                        src_w,
+                        src_h,
+                        content_aspect,
+                        "crop@content",
+                        false,
+                    );
+                }
+                // Run AI Content Director strictly inside the user's saved content region
+                return compute_content_director_track_in_region(
+                    &loaded,
+                    detector.as_ref(),
+                    webcam_exclude_norm,
+                    Some(saved_content),
+                    src_w,
+                    src_h,
+                    content_aspect,
+                    total_clip_dur,
+                );
+            }
             compute_content_director_track(
                 &loaded,
                 detector.as_ref(),
@@ -603,7 +826,7 @@ fn matches_corner_hint(face: FaceBox, hint: WebcamCorner) -> bool {
 
 /// Anti-NPC spatial clustering: groups detections on a coarse 6x6 grid and picks the most
 /// persistent, high-confidence cluster (the real streamer rather than fleeting game NPCs).
-fn select_dominant_face_cluster(faces: &[FaceBox]) -> Option<FaceBox> {
+pub(crate) fn select_dominant_face_cluster(faces: &[FaceBox]) -> Option<FaceBox> {
     if faces.is_empty() {
         return None;
     }
@@ -648,10 +871,10 @@ fn track_continuity_score(face: FaceBox, prev_cx: f32, prev_cy: f32) -> f32 {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PipWebcamDetection {
-    safe_rect: PixelRect,
-    outer_rect: PixelRect,
-    walls_detected: usize,
+pub(crate) struct PipWebcamDetection {
+    pub safe_rect: PixelRect,
+    pub outer_rect: PixelRect,
+    pub walls_detected: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -668,7 +891,7 @@ struct WallScanResult {
 /// 3. Runs an iterative inward static-border / nameplate / glow peeler on all 4 sides.
 /// 4. Probes all 4 diagonals for rounded-corner masks + applies a hard zero-border safety inset
 ///    so 0 pixels of OBS border, glow, rounded corner, or gameplay ever appear in the top window.
-fn detect_pip_webcam_zero_border(
+pub(crate) fn detect_pip_webcam_zero_border(
     frames: &[(f64, RgbImage)],
     anchor_face: FaceBox,
     trim_pct: f64,
@@ -1248,12 +1471,15 @@ pub fn build_natural_camera_track(
         (cw, cw / target_aspect)
     };
 
-    // Ideal crop height puts the face at ~38% of frame height (scaled by face_zoom),
-    // leaving natural pan travel inside `safe_box_px` while never zooming in overly tight.
-    let desired_ch = (median_fh / (0.38 * face_zoom)).clamp(
-        max_ch * if is_pip_webcam { 0.62 } else { 0.35 },
-        max_ch * if is_pip_webcam { 0.92 } else { 0.88 },
-    );
+    // For PiP webcams, show the FULL clean interior (no zoom glued to the face!) by default
+    // (`face_zoom == 1.0` -> 100% of `max_ch`, only sliding gently within spare aspect margin).
+    // Only zoom closer when the user explicitly requests `face_zoom > 1.0` (e.g. 1.15 / 1.30).
+    let desired_ch = if is_pip_webcam {
+        let zoom_divisor = face_zoom.clamp(1.0, 1.45);
+        (max_ch / zoom_divisor).clamp(max_ch * 0.72, max_ch)
+    } else {
+        (median_fh / (0.28 * face_zoom)).clamp(max_ch * 0.55, max_ch * 0.96)
+    };
     let desired_cw = (desired_ch * target_aspect).min(max_cw);
     let desired_ch = (desired_cw / target_aspect).min(max_ch);
 
@@ -1689,9 +1915,51 @@ pub fn compute_content_director_track(
     content_aspect: f64,
     total_duration_sec: f64,
 ) -> CameraTrackPlan {
-    let (crop_w, crop_h) = compute_content_crop_dims(src_w, src_h, content_aspect);
-    let max_x = src_w.saturating_sub(crop_w) as f64;
-    let max_y = src_h.saturating_sub(crop_h) as f64;
+    compute_content_director_track_in_region(
+        loaded,
+        detector,
+        exclude_rect,
+        None,
+        src_w,
+        src_h,
+        content_aspect,
+        total_duration_sec,
+    )
+}
+
+/// Runs the AI Content Director optionally bounded inside a user-saved `region_rect` (normalized 0..1).
+#[allow(clippy::too_many_arguments)]
+pub fn compute_content_director_track_in_region(
+    loaded: &[(f64, RgbImage)],
+    detector: Option<&FaceDetector>,
+    exclude_rect: Option<PixelRect>,
+    region_rect: Option<PixelRect>,
+    src_w: u32,
+    src_h: u32,
+    content_aspect: f64,
+    total_duration_sec: f64,
+) -> CameraTrackPlan {
+    let bounds_px = region_rect.map(|r| PixelRect {
+        x: (r.x * src_w as f64).ceil().clamp(0.0, src_w.saturating_sub(64) as f64),
+        y: (r.y * src_h as f64).ceil().clamp(0.0, src_h.saturating_sub(64) as f64),
+        w: (r.w * src_w as f64).floor().clamp(64.0, src_w as f64),
+        h: (r.h * src_h as f64).floor().clamp(64.0, src_h as f64),
+    });
+    let eff_w = bounds_px
+        .map(|b| (b.w as u32).min(src_w))
+        .unwrap_or(src_w);
+    let eff_h = bounds_px
+        .map(|b| (b.h as u32).min(src_h))
+        .unwrap_or(src_h);
+    let (crop_w, crop_h) = compute_content_crop_dims(eff_w, eff_h, content_aspect);
+    let min_x = bounds_px.map(|b| b.x).unwrap_or(0.0);
+    let min_y = bounds_px.map(|b| b.y).unwrap_or(0.0);
+    let max_x = bounds_px
+        .map(|b| (b.right() - crop_w as f64).clamp(min_x, src_w.saturating_sub(crop_w) as f64))
+        .unwrap_or(src_w.saturating_sub(crop_w) as f64);
+    let max_y = bounds_px
+        .map(|b| (b.bottom() - crop_h as f64).clamp(min_y, src_h.saturating_sub(crop_h) as f64))
+        .unwrap_or(src_h.saturating_sub(crop_h) as f64);
     let crop_w_norm = crop_w as f64 / src_w.max(1) as f64;
 
     let mut ema_grid = [0.0f64; SALIENCY_CELLS];
@@ -1744,7 +2012,10 @@ pub fn compute_content_director_track(
                         let inside_cam = exclude_rect
                             .map(|ex| rect_contains_point(ex, f.cx() as f64, f.cy() as f64))
                             .unwrap_or(false);
-                        !too_small && !inside_cam
+                        let inside_region = region_rect
+                            .map(|rg| rect_contains_point(rg, f.cx() as f64, f.cy() as f64))
+                            .unwrap_or(true);
+                        !too_small && !inside_cam && inside_region
                     })
                     .collect();
             }
@@ -1832,8 +2103,8 @@ pub fn compute_content_director_track(
                 focus_eye_y = spk.eye_y() as f64 * 0.65 + co.eye_y() as f64 * 0.35;
             }
 
-            let tx = (focus_cx * src_w as f64 - crop_w as f64 * 0.5).clamp(0.0, max_x);
-            let ty = (focus_eye_y * src_h as f64 - crop_h as f64 * 0.36).clamp(0.0, max_y);
+            let tx = (focus_cx * src_w as f64 - crop_w as f64 * 0.5).clamp(min_x, max_x);
+            let ty = (focus_eye_y * src_h as f64 - crop_h as f64 * 0.36).clamp(min_y, max_y);
             targets.push(ContentTarget {
                 t: *t,
                 target_x: tx,
@@ -1845,8 +2116,8 @@ pub fn compute_content_director_track(
             active_speaker_pos = None;
             targets.push(ContentTarget {
                 t: *t,
-                target_x: action_tx.clamp(0.0, max_x),
-                target_y: action_ty.clamp(0.0, max_y),
+                target_x: action_tx.clamp(min_x, max_x),
+                target_y: action_ty.clamp(min_y, max_y),
                 hard_cut: is_scene_cut,
                 has_speaker: false,
             });
@@ -2024,7 +2295,14 @@ mod tests {
 
         assert!(plan.crop_w as f64 <= safe.w);
         assert!(plan.crop_h as f64 <= safe.h);
-        assert!(plan.keyframes.len() >= 2);
+        // At default zoom=1.0 on a PiP webcam, show the FULL clean webcam width (no tight face zoom!)
+        assert!(
+            plan.crop_w as f64 >= safe.w - 4.0,
+            "expected full clean webcam without forced tight face zoom, got crop_w={} vs safe.w={}",
+            plan.crop_w,
+            safe.w
+        );
+        assert!(!plan.keyframes.is_empty());
 
         for &(_, x, y) in &plan.keyframes {
             assert!(x as f64 >= safe.x.floor());

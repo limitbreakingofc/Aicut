@@ -10,7 +10,10 @@ use std::path::Path;
 use tokio::process::Command;
 use uuid::Uuid;
 
-use crate::face_track::{compute_dual_tracks, CameraTrackPlan};
+use crate::face_track::{
+    compute_dual_tracks, CameraSlotSpec, CameraTrackPlan, ContentSlotSpec,
+};
+use crate::framing::{ContentRegionMode, NormalizedRect};
 use crate::template::{detect_template_geometry_from_path, resolve_template_png, TemplateGeometry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -84,6 +87,10 @@ pub async fn render_clip_to_library(
     face_tracking: bool,
     face_zoom: f32,
     border_trim_pct: f32,
+    custom_webcam_rect: Option<NormalizedRect>,
+    webcam_lock_static: bool,
+    custom_content_rect: Option<NormalizedRect>,
+    content_region_mode: ContentRegionMode,
     burn_subtitles: bool,
 ) -> AicutResult<MediaAsset> {
     if clip.segments.is_empty() {
@@ -124,17 +131,29 @@ pub async fn render_clip_to_library(
         None
     };
 
-    // Run unified single-pass AI tracking for BOTH top webcam (IA Cameraman) and bottom content
-    // (IA Diretor: active speaker mouth-tracking or peak visual action/highlight)
-    let needs_face_track = face_tracking
-        && matches!(
-            layout,
-            ShortsLayout::TemplateSplit | ShortsLayout::GamingSplit | ShortsLayout::CenterCrop
-        );
+    // Effective content fit respects a saved ContentRegionMode when custom_content_rect is set
+    let effective_content_fit = if custom_content_rect.is_some() {
+        match content_region_mode {
+            ContentRegionMode::FitBlurRegion => ContentFit::FitBlur,
+            ContentRegionMode::FixedRegion | ContentRegionMode::AiDirectorInRegion => {
+                ContentFit::SmartFocus
+            }
+        }
+    } else {
+        content_fit
+    };
+
+    // Run unified single-pass AI tracking for BOTH top webcam (user-saved rect OR IA Cameraman)
+    // and bottom content (user-saved rect OR IA Diretor: active speaker / peak visual action)
+    let is_split_or_center = matches!(
+        layout,
+        ShortsLayout::TemplateSplit | ShortsLayout::GamingSplit | ShortsLayout::CenterCrop
+    );
+    let needs_face_track = is_split_or_center && (face_tracking || custom_webcam_rect.is_some());
     let needs_content_track = (matches!(
         layout,
         ShortsLayout::TemplateSplit | ShortsLayout::GamingSplit
-    ) && content_fit == ContentFit::SmartFocus)
+    ) && (effective_content_fit == ContentFit::SmartFocus || custom_content_rect.is_some()))
         || (layout == ShortsLayout::CenterCrop && face_tracking);
 
     let mut tmp_cam_cmd_path: Option<std::path::PathBuf> = None;
@@ -155,7 +174,15 @@ pub async fn render_clip_to_library(
                     ShortsLayout::CenterCrop => (1080, 1920),
                     _ => (1080, 730),
                 };
-                Some((slot_w, slot_h, webcam_corner, face_zoom, border_trim_pct))
+                Some(CameraSlotSpec {
+                    target_w: slot_w,
+                    target_h: slot_h,
+                    corner_hint: webcam_corner,
+                    face_zoom,
+                    border_trim_pct,
+                    custom_rect: custom_webcam_rect.map(|r| r.to_pixel_rect()),
+                    lock_static: webcam_lock_static || !face_tracking,
+                })
             } else {
                 None
             };
@@ -172,7 +199,16 @@ pub async fn render_clip_to_library(
                     ShortsLayout::CenterCrop => (1080, 1920),
                     _ => (1080, 1190),
                 };
-                Some((slot_w, slot_h))
+                Some(ContentSlotSpec {
+                    target_w: slot_w,
+                    target_h: slot_h,
+                    custom_rect: custom_content_rect.map(|r| r.to_pixel_rect()),
+                    lock_static: custom_content_rect.is_some()
+                        && matches!(
+                            content_region_mode,
+                            ContentRegionMode::FixedRegion | ContentRegionMode::FitBlurRegion
+                        ),
+                })
             } else {
                 None
             };
@@ -221,7 +257,7 @@ pub async fn render_clip_to_library(
         &clip.segments,
         layout,
         webcam_corner,
-        content_fit,
+        effective_content_fit,
         resolved_template
             .as_ref()
             .map(|(p, g)| (p.as_path(), *g)),
@@ -245,7 +281,7 @@ pub async fn render_clip_to_library(
             &clip.segments,
             layout,
             webcam_corner,
-            content_fit,
+            effective_content_fit,
             resolved_template
                 .as_ref()
                 .map(|(p, g)| (p.as_path(), *g)),

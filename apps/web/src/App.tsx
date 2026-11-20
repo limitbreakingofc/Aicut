@@ -35,6 +35,7 @@ import { IngestView } from "./modules/media-ingest/IngestView";
 import { LibraryView } from "./modules/media-ingest/LibraryView";
 import { TranscribeView } from "./modules/transcribe/TranscribeView";
 import { SmartClipsView } from "./modules/smart-clips/SmartClipsView";
+import { FramingStudioView } from "./modules/smart-clips/FramingStudioView";
 import { JobsView } from "./modules/core/JobsView";
 import { ModulesView } from "./modules/core/ModulesView";
 import { AiConnectView } from "./modules/core/AiConnectView";
@@ -531,6 +532,16 @@ function AicutApp() {
               onNotify={pushToast}
               onRefreshTools={refreshTools}
               onRefreshMedia={refreshMedia}
+            />
+          )}
+
+          {route === "framing" && (
+            <FramingStudioView
+              media={media}
+              tools={tools}
+              preselectedMediaId={smartClipsTargetId ?? selectedMediaId}
+              onNavigate={navigate}
+              onNotify={pushToast}
             />
           )}
 

@@ -571,11 +571,11 @@ impl AicutModule for UiModule {
                 "ui.navigate",
                 "ui",
                 "Navegar para Aba",
-                "Switch the visible tab in the Aicut desktop window ('ingest', 'library', 'transcribe', 'smart-clips', 'jobs', 'modules', 'ai-connect', 'settings').",
+                "Switch the visible tab in the Aicut desktop window ('ingest', 'library', 'transcribe', 'smart-clips', 'framing', 'jobs', 'modules', 'ai-connect', 'settings').",
                 ActionAnnotations { idempotent: true, ..Default::default() },
                 |ctx, input| {
                     Box::pin(async move {
-                        let allowed = ["ingest", "library", "transcribe", "smart-clips", "jobs", "modules", "ai-connect", "settings"];
+                        let allowed = ["ingest", "library", "transcribe", "smart-clips", "framing", "jobs", "modules", "ai-connect", "settings"];
                         if !allowed.contains(&input.route.as_str()) {
                             return Err(AicutError::invalid_input(format!(
                                 "Unknown route '{}'. Valid routes: {}",

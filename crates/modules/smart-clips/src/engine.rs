@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::framing::{resolve_effective_framing, ContentRegionMode, NormalizedRect};
 use crate::frames::probe_duration_sec;
 use crate::gemini::{analyze_with_gemini, GeminiConfig};
 use crate::local_vlm::analyze_with_local_vlm;
@@ -118,6 +119,15 @@ pub struct RenderClipRequest {
     /// Inner border trim fraction to eliminate OBS borders/gameplay bleed (default 0.045 = 4.5%).
     #[serde(default = "default_border_trim")]
     pub border_trim_pct: f32,
+    /// Optional explicit normalized webcam area (0..1). Overrides saved Framing Studio profile if set.
+    #[serde(default)]
+    pub webcam_rect: Option<NormalizedRect>,
+    /// Optional explicit normalized content area (0..1). Overrides saved Framing Studio profile if set.
+    #[serde(default)]
+    pub content_rect: Option<NormalizedRect>,
+    /// Automatically apply the precision framing saved in the Enquadramento tab (default true).
+    #[serde(default = "default_true")]
+    pub use_saved_framing: bool,
     #[serde(default = "default_true")]
     pub burn_subtitles: bool,
     #[serde(default)]
@@ -556,6 +566,26 @@ pub async fn start_clip_render(
                 .filter(|s| !s.trim().is_empty())
         });
 
+    let saved_framing = if req.use_saved_framing {
+        Some(resolve_effective_framing(&kernel, Some(&source.id)).0)
+    } else {
+        None
+    };
+    let effective_webcam_rect = req
+        .webcam_rect
+        .or_else(|| saved_framing.as_ref().and_then(|f| f.webcam_rect));
+    let effective_content_rect = req
+        .content_rect
+        .or_else(|| saved_framing.as_ref().and_then(|f| f.content_rect));
+    let effective_webcam_lock_static = saved_framing
+        .as_ref()
+        .map(|f| f.webcam_lock_static)
+        .unwrap_or(false);
+    let effective_content_mode = saved_framing
+        .as_ref()
+        .map(|f| f.content_mode)
+        .unwrap_or(ContentRegionMode::AiDirectorInRegion);
+
     let wait = req.wait;
     let task_kernel = kernel.clone();
     let task_job_id = job_id.clone();
@@ -605,6 +635,10 @@ pub async fn start_clip_render(
                     req.face_tracking,
                     req.face_zoom,
                     req.border_trim_pct,
+                    effective_webcam_rect,
+                    effective_webcam_lock_static,
+                    effective_content_rect,
+                    effective_content_mode,
                     req.burn_subtitles,
                 )
                 .await?;

@@ -5,6 +5,7 @@ import {
   Cloud,
   Copy,
   Cpu,
+  Crop,
   Download,
   Eye,
   Film,
@@ -926,7 +927,7 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
 
           {(isSplit || layout === "center_crop") && (
             <div className="grid-2">
-              <Field label="Enquadramento / Zoom do rosto (IA)" htmlFor="sc-zoom">
+              <Field label="Enquadramento da webcam (topo)" htmlFor="sc-zoom">
                 <select
                   id="sc-zoom"
                   className="select"
@@ -934,12 +935,12 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
                   onChange={(e) => setFaceZoom(Number(e.target.value))}
                   disabled={!faceTracking}
                 >
-                  <option value={0.85}>Mais aberto (mostra mais ombros/ambiente)</option>
-                  <option value={1.0}>Natural de câmera · Recomendado</option>
-                  <option value={1.2}>Close no rosto (foco máximo nas expressões)</option>
+                  <option value={1.0}>Webcam inteira sem bordas · Sem zoom no rosto (Recomendado)</option>
+                  <option value={1.15}>Zoom leve no rosto (1.15×)</option>
+                  <option value={1.3}>Close no rosto (1.30×)</option>
                 </select>
               </Field>
-              <Field label="Margem anti-borda da webcam" htmlFor="sc-trim">
+              <Field label="Margem anti-borda (modo automático)" htmlFor="sc-trim">
                 <select
                   id="sc-trim"
                   className="select"
@@ -952,6 +953,17 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
                   <option value={0.08}>Forte (8% — remove molduras grossas / overlays)</option>
                 </select>
               </Field>
+            </div>
+          )}
+
+          {isSplit && (
+            <div className="row row-between wrap gap-xs">
+              <span className="secondary text-xs">
+                Quer travar a área exata da webcam (sem bordas e sem zoom) e pedir para a IA revisar antes de renderizar?
+              </span>
+              <button type="button" className="btn btn-sm" onClick={() => onNavigate("framing")}>
+                <Crop size={13} aria-hidden /> Abrir aba Enquadramento (Webcam & Conteúdo)
+              </button>
             </div>
           )}
 

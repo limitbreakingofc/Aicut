@@ -10,6 +10,7 @@ export type RouteId =
   | "library"
   | "transcribe"
   | "smart-clips"
+  | "framing"
   | "jobs"
   | "modules"
   | "ai-connect"
@@ -333,6 +334,62 @@ export interface ClipsConfig {
   gemini_director_model: string;
   local_vision_model: string;
   template_path?: string | null;
+}
+
+export interface NormalizedRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export type ContentRegionMode = "ai_director_in_region" | "fixed_region" | "fit_blur_region";
+
+export interface FramingProfile {
+  id: string;
+  name: string;
+  webcam_rect?: NormalizedRect | null;
+  content_rect?: NormalizedRect | null;
+  webcam_lock_static: boolean;
+  content_mode: ContentRegionMode;
+  border_trim_pct: number;
+  face_zoom: number;
+  updated_at: string;
+}
+
+export interface FramingGetOutput {
+  active_profile: FramingProfile;
+  has_media_override: boolean;
+  default_profile: FramingProfile;
+  presets: FramingProfile[];
+}
+
+export interface FramingPreviewOutput {
+  media_id: string;
+  timestamp_sec: number;
+  duration_sec: number;
+  width: number;
+  height: number;
+  image_data_url: string;
+  detected_webcam_rect?: NormalizedRect | null;
+  detected_content_rect?: NormalizedRect | null;
+  detected_face_rect?: NormalizedRect | null;
+}
+
+export interface FramingReviewOutput {
+  approved: boolean;
+  score: number;
+  verdict: "otimo" | "ajustar" | "problema" | string;
+  reviewer_engine: string;
+  has_border_leak: boolean;
+  border_sides: string[];
+  zoom_assessment: "ideal" | "muito_perto" | "muito_longe" | "sem_rosto" | string;
+  head_or_face_clipped: boolean;
+  face_height_pct?: number | null;
+  summary: string;
+  suggestions: string[];
+  cropped_webcam_preview_data_url: string;
+  suggested_webcam_rect?: NormalizedRect | null;
 }
 
 export interface SmartClipSegment {

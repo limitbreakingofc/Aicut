@@ -1,6 +1,7 @@
 pub mod engine;
 pub mod face_track;
 pub mod frames;
+pub mod framing;
 pub mod gemini;
 pub mod local_vlm;
 pub mod models;
@@ -24,6 +25,12 @@ use crate::engine::{
     AnalyzeClipsResponse, RenderClipRequest, RenderClipResponse, SETTING_DEFAULT_PROVIDER,
     SETTING_GEMINI_API_KEY, SETTING_GEMINI_DIRECTOR_MODEL, SETTING_GEMINI_SCAN_MODEL,
     SETTING_LOCAL_VISION_MODEL, SETTING_TEMPLATE_PATH,
+};
+use crate::framing::{
+    delete_framing_entry, extract_framing_preview, load_framing_store, resolve_effective_framing,
+    review_webcam_framing, save_framing_profile, FramingDeleteInput, FramingGetInput,
+    FramingGetOutput, FramingPreviewInput, FramingPreviewOutput, FramingReviewInput,
+    FramingReviewOutput, FramingSaveInput,
 };
 use crate::models::{
     delete_vision_model, download_vision_model, list_vision_models, recommended_vision_model_id,
@@ -552,6 +559,105 @@ impl AicutModule for SmartClipsModule {
                             summary,
                             vec!["View rendered Shorts in Library with ui.navigate {\"route\":\"library\"}".into()],
                         ))
+                    })
+                },
+            )),
+            Arc::new(TypedAction::<FramingGetInput, FramingGetOutput, _>::new(
+                "clips.framing_get",
+                "smart-clips",
+                "Obter Enquadramento Salvo (Webcam & Conteúdo)",
+                "Load the active precision webcam & content framing profile (global default, per-video override, and named presets).",
+                ActionAnnotations { read_only: true, idempotent: true, ..Default::default() },
+                |ctx, input| {
+                    Box::pin(async move {
+                        let store = load_framing_store(&ctx.kernel);
+                        let (active_profile, has_media_override) =
+                            resolve_effective_framing(&ctx.kernel, input.media_id.as_deref());
+                        let summary = format!(
+                            "Loaded framing '{}' (webcam_saved={}, content_saved={}, {} presets)",
+                            active_profile.name,
+                            active_profile.webcam_rect.is_some(),
+                            active_profile.content_rect.is_some(),
+                            store.presets.len()
+                        );
+                        Ok((
+                            FramingGetOutput {
+                                active_profile,
+                                has_media_override,
+                                default_profile: store.default_profile,
+                                presets: store.presets,
+                            },
+                            summary,
+                            vec![],
+                        ))
+                    })
+                },
+            )),
+            Arc::new(TypedAction::<FramingSaveInput, FramingGetOutput, _>::new(
+                "clips.framing_save",
+                "smart-clips",
+                "Salvar Área da Webcam & Conteúdo com Precisão",
+                "Save exact normalized webcam & content boxes as the global default, a per-video override, or a named preset.",
+                ActionAnnotations { idempotent: true, ..Default::default() },
+                |ctx, input| {
+                    Box::pin(async move {
+                        let scope = input.scope.clone();
+                        let out = save_framing_profile(&ctx.kernel, input)?;
+                        let summary = format!(
+                            "Saved framing profile '{}' (scope={scope})",
+                            out.active_profile.name
+                        );
+                        Ok((out, summary, vec![]))
+                    })
+                },
+            )),
+            Arc::new(TypedAction::<FramingDeleteInput, FramingGetOutput, _>::new(
+                "clips.framing_delete",
+                "smart-clips",
+                "Remover Preset / Override de Enquadramento",
+                "Delete a named framing preset or clear a per-video framing override.",
+                ActionAnnotations { destructive: true, ..Default::default() },
+                |ctx, input| {
+                    Box::pin(async move {
+                        let out = delete_framing_entry(&ctx.kernel, input)?;
+                        Ok((out, "Framing entry removed".to_string(), vec![]))
+                    })
+                },
+            )),
+            Arc::new(TypedAction::<FramingPreviewInput, FramingPreviewOutput, _>::new(
+                "clips.framing_preview_frame",
+                "smart-clips",
+                "Extrair Frame para Ajuste Visual da Webcam & Conteúdo",
+                "Extract a crisp video frame JPEG at any timestamp for interactive webcam/content box editing, optionally auto-detecting the borderless webcam interior with AI.",
+                ActionAnnotations { read_only: true, ..Default::default() },
+                |ctx, input| {
+                    Box::pin(async move {
+                        let out = extract_framing_preview(&ctx.kernel, input).await?;
+                        let summary = format!(
+                            "Extracted {}x{} preview frame at {:.1}s (auto_webcam={})",
+                            out.width,
+                            out.height,
+                            out.timestamp_sec,
+                            out.detected_webcam_rect.is_some()
+                        );
+                        Ok((out, summary, vec![]))
+                    })
+                },
+            )),
+            Arc::new(TypedAction::<FramingReviewInput, FramingReviewOutput, _>::new(
+                "clips.framing_review",
+                "smart-clips",
+                "Revisar Enquadramento da Webcam com IA",
+                "Inspect the exact cropped webcam window with AI (UltraFace + 4-edge border leak QA + Gemini Vision when configured) to check for OBS borders, face zoom level, and head clipping, returning a score and 1-click suggested adjustment.",
+                ActionAnnotations { read_only: true, ..Default::default() },
+                |ctx, input| {
+                    Box::pin(async move {
+                        let out = review_webcam_framing(&ctx.kernel, input).await?;
+                        let summary = format!(
+                            "AI Framing Review: {} ({}/100) via {} — {}",
+                            out.verdict, out.score, out.reviewer_engine, out.summary
+                        );
+                        Ok((out, summary, vec![]))
                     })
                 },
             )),
