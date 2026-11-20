@@ -364,23 +364,41 @@ pub async fn compute_dual_tracks(
             }
 
             if let Some(anchor_face) = select_dominant_face_cluster(&pass1_faces) {
-                let is_pip_webcam = match corner_hint {
+                let force_pip = matches!(
+                    corner_hint,
                     WebcamCorner::BottomRight
-                    | WebcamCorner::BottomLeft
-                    | WebcamCorner::TopRight
-                    | WebcamCorner::TopLeft => true,
+                        | WebcamCorner::BottomLeft
+                        | WebcamCorner::TopRight
+                        | WebcamCorner::TopLeft
+                );
+                let maybe_pip = match corner_hint {
                     WebcamCorner::Center => false,
                     WebcamCorner::AutoFace => {
-                        let near_edge = anchor_face.cx() < 0.34
-                            || anchor_face.cx() > 0.66
-                            || anchor_face.cy() < 0.30
-                            || anchor_face.cy() > 0.70;
-                        anchor_face.w() < 0.18 && near_edge
+                        let near_edge = anchor_face.cx() < 0.36
+                            || anchor_face.cx() > 0.64
+                            || anchor_face.cy() < 0.34
+                            || anchor_face.cy() > 0.66;
+                        // Any face smaller than 32% of frame width could be inside a PiP OBS webcam
+                        anchor_face.w() < 0.32 && (near_edge || anchor_face.w() < 0.22)
                     }
+                    _ => true,
                 };
 
-                let (safe_box_norm, outer_box_norm) = if is_pip_webcam {
-                    detect_pip_webcam_safe_box(&loaded, anchor_face, trim)
+                let (is_pip_webcam, safe_box_norm, outer_box_norm) = if maybe_pip {
+                    let det_box =
+                        detect_pip_webcam_zero_border(&loaded, anchor_face, trim, force_pip);
+                    let confirmed_pip = force_pip || det_box.walls_detected >= 2;
+                    if confirmed_pip {
+                        (true, det_box.safe_rect, det_box.outer_rect)
+                    } else {
+                        let full = PixelRect {
+                            x: 0.005,
+                            y: 0.005,
+                            w: 0.99,
+                            h: 0.99,
+                        };
+                        (false, full, full)
+                    }
                 } else {
                     let full = PixelRect {
                         x: 0.005,
@@ -388,12 +406,12 @@ pub async fn compute_dual_tracks(
                         w: 0.99,
                         h: 0.99,
                     };
-                    (full, full)
+                    (false, full, full)
                 };
 
                 if is_pip_webcam {
                     // Mask out the streamer's corner webcam + OBS border from bottom content analysis
-                    webcam_exclude_norm = Some(expand_norm_rect(outer_box_norm, 0.015));
+                    webcam_exclude_norm = Some(expand_norm_rect(outer_box_norm, 0.018));
                 }
 
                 let safe_box_px = PixelRect {
@@ -629,17 +647,34 @@ fn track_continuity_score(face: FaceBox, prev_cx: f32, prev_cy: f32) -> f32 {
     face.score * 0.55 + proximity * 0.35 + (face.w() * 2.0).min(0.2)
 }
 
-/// Uses a temporal median image across the clip to locate the static 4 rectangular borders
-/// of an OBS PiP webcam surrounding `anchor_face`.
-/// Returns `(safe_box_norm, outer_box_norm)`:
-/// - `safe_box_norm` shrinks inward by `trim_pct` so 0 pixels of OBS border leak into the top Short window.
-/// - `outer_box_norm` is the full outer OBS webcam box so the bottom content director can mask it out.
-fn detect_pip_webcam_safe_box(
+#[derive(Debug, Clone, Copy)]
+struct PipWebcamDetection {
+    safe_rect: PixelRect,
+    outer_rect: PixelRect,
+    walls_detected: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WallScanResult {
+    inner: usize,
+    outer: usize,
+    detected: bool,
+}
+
+/// Surgical 4-phase Zero-Border OBS PiP Webcam Detector:
+/// 1. Builds 3-channel RGB temporal median + per-pixel temporal MAD across up to 18 frames.
+/// 2. Scans OUTWARD from the face on ALL 4 sides (including screen edges!) to find continuous
+///    straight OBS borders, pairing thick double-edge frames and locking onto the INNER edge.
+/// 3. Runs an iterative inward static-border / nameplate / glow peeler on all 4 sides.
+/// 4. Probes all 4 diagonals for rounded-corner masks + applies a hard zero-border safety inset
+///    so 0 pixels of OBS border, glow, rounded corner, or gameplay ever appear in the top window.
+fn detect_pip_webcam_zero_border(
     frames: &[(f64, RgbImage)],
     anchor_face: FaceBox,
     trim_pct: f64,
-) -> (PixelRect, PixelRect) {
-    let sample_count = frames.len().min(12).max(1);
+    force_pip: bool,
+) -> PipWebcamDetection {
+    let sample_count = frames.len().min(18).max(1);
     let step = (frames.len() / sample_count).max(1);
     let subset: Vec<&RgbImage> = frames
         .iter()
@@ -651,13 +686,13 @@ fn detect_pip_webcam_safe_box(
     let w = subset[0].width() as usize;
     let h = subset[0].height() as usize;
 
-    // Build 3-channel RGB temporal median image: moving gameplay blurs out while static
-    // OBS webcam borders (including colored overlays with similar brightness) stay razor-sharp.
     let mut median_rgb = vec![[0u8; 3]; w * h];
+    let mut temporal_mad = vec![0.0f32; w * h];
     let mut r_buf = Vec::with_capacity(subset.len());
     let mut g_buf = Vec::with_capacity(subset.len());
     let mut b_buf = Vec::with_capacity(subset.len());
     let mid = subset.len() / 2;
+    let inv_n = 1.0f32 / subset.len().max(1) as f32;
 
     for y in 0..h {
         for x in 0..w {
@@ -673,7 +708,19 @@ fn detect_pip_webcam_safe_box(
             r_buf.sort_unstable();
             g_buf.sort_unstable();
             b_buf.sort_unstable();
-            median_rgb[y * w + x] = [r_buf[mid], g_buf[mid], b_buf[mid]];
+            let mr = r_buf[mid];
+            let mg = g_buf[mid];
+            let mb = b_buf[mid];
+            median_rgb[y * w + x] = [mr, mg, mb];
+
+            let mut mad_sum = 0.0f32;
+            for i in 0..subset.len() {
+                mad_sum += ((r_buf[i] as i32 - mr as i32).abs()
+                    + (g_buf[i] as i32 - mg as i32).abs()
+                    + (b_buf[i] as i32 - mb as i32).abs()) as f32
+                    / 3.0;
+            }
+            temporal_mad[y * w + x] = mad_sum * inv_n;
         }
     }
 
@@ -693,62 +740,152 @@ fn detect_pip_webcam_safe_box(
     let fcx = (fx1 + fx2) / 2;
     let fcy = (fy1 + fy2) / 2;
 
-    // Realistic search corridor around the face for a PiP webcam box
-    let min_left = (fx1 - fw * 3).max(0) as usize;
-    let max_left = (fx1 - (fw / 3).max(4)).max(0) as usize;
-    let min_right = (fx2 + (fw / 3).max(4)).min(w as isize - 1) as usize;
-    let max_right = (fx2 + fw * 3).min(w as isize - 1) as usize;
+    // Generous outward corridors around the face (covers both tight 4:3 and wide 16:9 OBS cams)
+    let min_left = (fx1 - (fw as f64 * 3.6) as isize).max(1) as usize;
+    let max_left = (fx1 - (fw / 4).max(3)).clamp(1, w as isize - 2) as usize;
+    let min_right = (fx2 + (fw / 4).max(3)).clamp(1, w as isize - 2) as usize;
+    let max_right = (fx2 + (fw as f64 * 3.6) as isize).min(w as isize - 2) as usize;
 
-    let min_top = (fy1 - fh * 2).max(0) as usize;
-    let max_top = (fy1 - (fh / 3).max(4)).max(0) as usize;
-    let min_bot = (fy2 + (fh / 2).max(4)).min(h as isize - 1) as usize;
-    let max_bot = (fy2 + fh * 3).min(h as isize - 1) as usize;
+    let min_top = (fy1 - (fh as f64 * 2.2) as isize).max(1) as usize;
+    let max_top = (fy1 - (fh / 4).max(3)).clamp(1, h as isize - 2) as usize;
+    let min_bot = (fy2 + (fh / 3).max(3)).clamp(1, h as isize - 2) as usize;
+    let max_bot = (fy2 + (fh as f64 * 3.0) as isize).min(h as isize - 2) as usize;
 
-    let y_band0 = (fcy - fh).clamp(1, h as isize - 2) as usize;
-    let y_band1 = (fcy + fh).clamp(y_band0 as isize + 1, h as isize - 2) as usize;
-    let x_band0 = (fcx - fw).clamp(1, w as isize - 2) as usize;
-    let x_band1 = (fcx + fw).clamp(x_band0 as isize + 1, w as isize - 2) as usize;
+    let y_band0 = (fcy - fh).clamp(2, h as isize - 3) as usize;
+    let y_band1 = (fcy + fh).clamp(y_band0 as isize + 1, h as isize - 3) as usize;
+    let x_band0 = (fcx - fw).clamp(2, w as isize - 3) as usize;
+    let x_band1 = (fcx + fw).clamp(x_band0 as isize + 1, w as isize - 3) as usize;
 
-    // Scan vertical RGB edge strength along x for left & right walls
-    let scan_v_edge = |x_start: usize, x_end: usize, fallback: usize| -> usize {
-        if x_end <= x_start + 2 {
-            return fallback;
+    let collapse_and_pick_band = |hits: &[(usize, f64)], fallback: usize| -> WallScanResult {
+        if hits.is_empty() {
+            return WallScanResult {
+                inner: fallback,
+                outer: fallback,
+                detected: false,
+            };
         }
-        let mut best_x = fallback;
-        let mut best_score = 0.0f64;
-        for x in x_start.max(2)..x_end.min(w - 2) {
-            let mut sum = 0.0f64;
-            for y in y_band0..=y_band1 {
-                sum += rgb_diff(median_rgb[y * w + (x - 1)], median_rgb[y * w + (x + 1)]);
+        // `hits` is ordered from nearest-to-face -> farthest-from-face.
+        // Merge peaks within <= 26px (covers thick decorative OBS borders / glows up to ~78px in 1080p).
+        let mut bands: Vec<(usize, usize, f64)> = Vec::new();
+        for &(pos, strength) in hits {
+            if let Some(last) = bands.last_mut() {
+                if pos.abs_diff(last.1) <= 26 {
+                    last.1 = pos;
+                    if strength > last.2 {
+                        last.2 = strength;
+                    }
+                    continue;
+                }
             }
-            let mean = sum / (y_band1 - y_band0 + 1) as f64;
-            if mean > best_score {
-                best_score = mean;
-                best_x = x;
-            }
+            bands.push((pos, pos, strength));
         }
-        if best_score >= 10.0 { best_x } else { fallback }
+
+        let max_strength = bands
+            .iter()
+            .map(|b| b.2)
+            .fold(0.0f64, |a, b| a.max(b));
+        // Stop at the FIRST strong border band near the face so we never jump past the webcam
+        // into gameplay HUD lines, and ALWAYS lock onto its INNER edge (`band.0`).
+        let picked = bands
+            .iter()
+            .find(|b| b.2 >= max_strength * 0.50 || b.2 >= 18.0)
+            .copied()
+            .unwrap_or(bands[0]);
+
+        WallScanResult {
+            inner: picked.0,
+            outer: picked.1,
+            detected: true,
+        }
     };
 
-    // Scan horizontal RGB edge strength along y for top & bottom walls
-    let scan_h_edge = |y_start: usize, y_end: usize, fallback: usize| -> usize {
-        if y_end <= y_start + 2 {
-            return fallback;
-        }
-        let mut best_y = fallback;
-        let mut best_score = 0.0f64;
-        for y in y_start.max(2)..y_end.min(h - 2) {
-            let mut sum = 0.0f64;
-            for x in x_band0..=x_band1 {
-                sum += rgb_diff(median_rgb[(y - 1) * w + x], median_rgb[(y + 1) * w + x]);
+    // Phase A: Scan OUTWARD from the face on ALL 4 sides (never skipping screen edges!)
+    let scan_v_outward = |near_face: usize, far_limit: usize, go_left: bool, fallback: usize| -> WallScanResult {
+        let mut hits: Vec<(usize, f64)> = Vec::new();
+        let span = (y_band1 - y_band0 + 1) as f64;
+        let mut x = near_face;
+        loop {
+            if x >= 2 && x + 2 < w {
+                let mut g_sum = 0.0f64;
+                let mut consistent = 0usize;
+                let mut var_step_sum = 0.0f64;
+                for y in y_band0..=y_band1 {
+                    let d = rgb_diff(median_rgb[y * w + (x - 1)], median_rgb[y * w + (x + 1)]);
+                    g_sum += d;
+                    if d >= 9.0 {
+                        consistent += 1;
+                    }
+                    let dv = (temporal_mad[y * w + (x - 2)] - temporal_mad[y * w + (x + 2)]).abs() as f64;
+                    var_step_sum += dv;
+                }
+                let grad = g_sum / span;
+                let consistency = consistent as f64 / span;
+                let var_step = var_step_sum / span;
+                let is_strong = (consistency >= 0.52 && grad >= 9.0)
+                    || (consistency >= 0.42 && grad >= 13.5)
+                    || (var_step >= 7.5 && consistency >= 0.36);
+                if is_strong {
+                    let strength = grad * (0.40 + 0.60 * consistency) + var_step * 0.85;
+                    hits.push((x, strength));
+                }
             }
-            let mean = sum / (x_band1 - x_band0 + 1) as f64;
-            if mean > best_score {
-                best_score = mean;
-                best_y = y;
+            if go_left {
+                if x <= far_limit || x == 0 {
+                    break;
+                }
+                x -= 1;
+            } else {
+                if x >= far_limit || x + 1 >= w {
+                    break;
+                }
+                x += 1;
             }
         }
-        if best_score >= 10.0 { best_y } else { fallback }
+        collapse_and_pick_band(&hits, fallback)
+    };
+
+    let scan_h_outward = |near_face: usize, far_limit: usize, go_up: bool, fallback: usize| -> WallScanResult {
+        let mut hits: Vec<(usize, f64)> = Vec::new();
+        let span = (x_band1 - x_band0 + 1) as f64;
+        let mut y = near_face;
+        loop {
+            if y >= 2 && y + 2 < h {
+                let mut g_sum = 0.0f64;
+                let mut consistent = 0usize;
+                let mut var_step_sum = 0.0f64;
+                for x in x_band0..=x_band1 {
+                    let d = rgb_diff(median_rgb[(y - 1) * w + x], median_rgb[(y + 1) * w + x]);
+                    g_sum += d;
+                    if d >= 9.0 {
+                        consistent += 1;
+                    }
+                    let dv = (temporal_mad[(y - 2) * w + x] - temporal_mad[(y + 2) * w + x]).abs() as f64;
+                    var_step_sum += dv;
+                }
+                let grad = g_sum / span;
+                let consistency = consistent as f64 / span;
+                let var_step = var_step_sum / span;
+                let is_strong = (consistency >= 0.52 && grad >= 9.0)
+                    || (consistency >= 0.42 && grad >= 13.5)
+                    || (var_step >= 7.5 && consistency >= 0.36);
+                if is_strong {
+                    let strength = grad * (0.40 + 0.60 * consistency) + var_step * 0.85;
+                    hits.push((y, strength));
+                }
+            }
+            if go_up {
+                if y <= far_limit || y == 0 {
+                    break;
+                }
+                y -= 1;
+            } else {
+                if y >= far_limit || y + 1 >= h {
+                    break;
+                }
+                y += 1;
+            }
+        }
+        collapse_and_pick_band(&hits, fallback)
     };
 
     let def_left = (fx1 - (fw as f64 * 1.45) as isize).max(0) as usize;
@@ -756,46 +893,275 @@ fn detect_pip_webcam_safe_box(
     let def_top = (fy1 - (fh as f64 * 0.75) as isize).max(0) as usize;
     let def_bot = (fy2 + (fh as f64 * 1.35) as isize).min(h as isize - 1) as usize;
 
-    let mut left = if def_left <= 8 {
-        0
-    } else {
-        scan_v_edge(min_left, max_left, def_left)
-    };
-    let mut right = if def_right >= w.saturating_sub(9) {
-        w - 1
-    } else {
-        scan_v_edge(min_right, max_right, def_right)
-    };
-    let mut top = if def_top <= 8 {
-        0
-    } else {
-        scan_h_edge(min_top, max_top, def_top)
-    };
-    let mut bot = if def_bot >= h.saturating_sub(9) {
-        h - 1
-    } else {
-        scan_h_edge(min_bot, max_bot, def_bot)
+    let left_fb = if def_left <= 8 { 0 } else { def_left };
+    let right_fb = if def_right >= w.saturating_sub(9) { w - 1 } else { def_right };
+    let top_fb = if def_top <= 8 { 0 } else { def_top };
+    let bot_fb = if def_bot >= h.saturating_sub(9) { h - 1 } else { def_bot };
+
+    let l_scan = scan_v_outward(max_left, min_left, true, left_fb);
+    let r_scan = scan_v_outward(min_right, max_right, false, right_fb);
+    let t_scan = scan_h_outward(max_top, min_top, true, top_fb);
+    let b_scan = scan_h_outward(min_bot, max_bot, false, bot_fb);
+
+    let walls_detected = [l_scan.detected, r_scan.detected, t_scan.detected, b_scan.detected]
+        .into_iter()
+        .filter(|&d| d)
+        .count();
+
+    if !force_pip && walls_detected < 2 {
+        let full = PixelRect {
+            x: 0.005,
+            y: 0.005,
+            w: 0.99,
+            h: 0.99,
+        };
+        return PipWebcamDetection {
+            safe_rect: full,
+            outer_rect: full,
+            walls_detected,
+        };
+    }
+
+    let mut inner_l = l_scan.inner.min(fx1.max(0) as usize);
+    let mut inner_r = r_scan.inner.max(fx2.min(w as isize - 1) as usize);
+    let mut inner_t = t_scan.inner.min(fy1.max(0) as usize);
+    let mut inner_b = b_scan.inner.max(fy2.min(h as isize - 1) as usize);
+
+    let outer_l = l_scan.outer.min(inner_l);
+    let outer_r = r_scan.outer.max(inner_r);
+    let outer_t = t_scan.outer.min(inner_t);
+    let outer_b = b_scan.outer.max(inner_b);
+
+    // Phase B: Iterative inward static-border / nameplate / glow peeler on ALL 4 sides
+    let box_w_init = inner_r.saturating_sub(inner_l).max(32);
+    let box_h_init = inner_b.saturating_sub(inner_t).max(32);
+    let max_peel_x = ((box_w_init as f64 * 0.16).round() as usize).max(4);
+    let max_peel_y = ((box_h_init as f64 * 0.16).round() as usize).max(4);
+
+    let face_guard_l = (fx1 - (fw / 5).max(2)).max(0) as usize;
+    let face_guard_r = (fx2 + (fw / 5).max(2)).min(w as isize - 1) as usize;
+    let face_guard_t = (fy1 - (fh / 5).max(2)).max(0) as usize;
+    let face_guard_b = (fy2 + (fh / 4).max(2)).min(h as isize - 1) as usize;
+
+    let is_v_border_strip = |x: usize, inward_dx: isize, y0: usize, y1: usize| -> bool {
+        if y1 <= y0 + 4 || x >= w {
+            return false;
+        }
+        let x_in = (x as isize + inward_dx * 2).clamp(0, w as isize - 1) as usize;
+        let mut tmads = Vec::with_capacity(y1 - y0 + 1);
+        let mut uniform_sum = 0.0f64;
+        let mut jump_cnt = 0usize;
+        let mut total = 0usize;
+        for y in y0..y1 {
+            tmads.push(temporal_mad[y * w + x]);
+            uniform_sum += rgb_diff(median_rgb[y * w + x], median_rgb[(y + 1) * w + x]);
+            if rgb_diff(median_rgb[y * w + x], median_rgb[y * w + x_in]) >= 12.0 {
+                jump_cnt += 1;
+            }
+            total += 1;
+        }
+        if total == 0 {
+            return false;
+        }
+        tmads.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let med_tmad = tmads[tmads.len() / 2] as f64;
+        let uniformity = uniform_sum / total as f64;
+        let jump_frac = jump_cnt as f64 / total as f64;
+
+        (med_tmad < 1.8 && uniformity < 10.5)
+            || (med_tmad < 1.2 && jump_frac >= 0.45)
+            || (jump_frac >= 0.50 && med_tmad < 4.2)
     };
 
-    // Ensure detected box comfortably encloses the anchor face
-    left = left.min(fx1.max(0) as usize);
-    right = right.max(fx2.min(w as isize - 1) as usize);
-    top = top.min(fy1.max(0) as usize);
-    bot = bot.max(fy2.min(h as isize - 1) as usize);
+    let is_h_border_strip = |y: usize, inward_dy: isize, x0: usize, x1: usize| -> bool {
+        if x1 <= x0 + 4 || y >= h {
+            return false;
+        }
+        let y_in = (y as isize + inward_dy * 2).clamp(0, h as isize - 1) as usize;
+        let mut tmads = Vec::with_capacity(x1 - x0 + 1);
+        let mut uniform_sum = 0.0f64;
+        let mut jump_cnt = 0usize;
+        let mut total = 0usize;
+        for x in x0..x1 {
+            tmads.push(temporal_mad[y * w + x]);
+            uniform_sum += rgb_diff(median_rgb[y * w + x], median_rgb[y * w + (x + 1)]);
+            if rgb_diff(median_rgb[y * w + x], median_rgb[y_in * w + x]) >= 12.0 {
+                jump_cnt += 1;
+            }
+            total += 1;
+        }
+        if total == 0 {
+            return false;
+        }
+        tmads.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let med_tmad = tmads[tmads.len() / 2] as f64;
+        let uniformity = uniform_sum / total as f64;
+        let jump_frac = jump_cnt as f64 / total as f64;
 
-    let box_w = (right.saturating_sub(left)).max(32) as f64;
-    let box_h = (bot.saturating_sub(top)).max(32) as f64;
+        (med_tmad < 1.8 && uniformity < 10.5)
+            || (med_tmad < 1.2 && jump_frac >= 0.45)
+            || (jump_frac >= 0.50 && med_tmad < 4.2)
+    };
 
-    // Apply inward border trim (stronger on interior walls where OBS borders live)
-    let trim_l = if left <= 4 { box_w * 0.015 } else { box_w * trim_pct };
-    let trim_r = if right >= w - 5 { box_w * 0.015 } else { box_w * trim_pct };
-    let trim_t = if top <= 4 { box_h * 0.015 } else { box_h * trim_pct };
-    let trim_b = if bot >= h - 5 { box_h * 0.015 } else { box_h * trim_pct };
+    let mid_y0 = inner_t + box_h_init / 7;
+    let mid_y1 = inner_b.saturating_sub(box_h_init / 7).max(mid_y0 + 1);
+    let mid_x0 = inner_l + box_w_init / 7;
+    let mid_x1 = inner_r.saturating_sub(box_w_init / 7).max(mid_x0 + 1);
 
-    let sx1 = (left as f64 + trim_l).clamp(0.0, w as f64 - 16.0);
-    let sy1 = (top as f64 + trim_t).clamp(0.0, h as f64 - 16.0);
-    let sx2 = (right as f64 - trim_r).clamp(sx1 + 16.0, w as f64);
-    let sy2 = (bot as f64 - trim_b).clamp(sy1 + 16.0, h as f64);
+    let mut peeled_l = 0usize;
+    let mut miss = 0usize;
+    for step_i in 0..max_peel_x {
+        let x = inner_l + step_i;
+        if x >= face_guard_l {
+            break;
+        }
+        if is_v_border_strip(x, 1, mid_y0, mid_y1) {
+            peeled_l = step_i + 1;
+            miss = 0;
+        } else {
+            miss += 1;
+            if miss >= 2 {
+                break;
+            }
+        }
+    }
+    inner_l += peeled_l;
+
+    let mut peeled_r = 0usize;
+    miss = 0;
+    for step_i in 0..max_peel_x {
+        let x = inner_r.saturating_sub(step_i);
+        if x <= face_guard_r {
+            break;
+        }
+        if is_v_border_strip(x, -1, mid_y0, mid_y1) {
+            peeled_r = step_i + 1;
+            miss = 0;
+        } else {
+            miss += 1;
+            if miss >= 2 {
+                break;
+            }
+        }
+    }
+    inner_r = inner_r.saturating_sub(peeled_r);
+
+    let mut peeled_t = 0usize;
+    miss = 0;
+    for step_i in 0..max_peel_y {
+        let y = inner_t + step_i;
+        if y >= face_guard_t {
+            break;
+        }
+        if is_h_border_strip(y, 1, mid_x0, mid_x1) {
+            peeled_t = step_i + 1;
+            miss = 0;
+        } else {
+            miss += 1;
+            if miss >= 2 {
+                break;
+            }
+        }
+    }
+    inner_t += peeled_t;
+
+    let mut peeled_b = 0usize;
+    miss = 0;
+    for step_i in 0..max_peel_y {
+        let y = inner_b.saturating_sub(step_i);
+        if y <= face_guard_b {
+            break;
+        }
+        if is_h_border_strip(y, -1, mid_x0, mid_x1) {
+            peeled_b = step_i + 1;
+            miss = 0;
+        } else {
+            miss += 1;
+            if miss >= 2 {
+                break;
+            }
+        }
+    }
+    inner_b = inner_b.saturating_sub(peeled_b);
+
+    // Phase C: Rounded-corner mask probe (catches curved OBS corners exposing gameplay/border!)
+    let bw = inner_r.saturating_sub(inner_l).max(32);
+    let bh = inner_b.saturating_sub(inner_t).max(32);
+    let mut core_tmads = Vec::new();
+    for y in (inner_t + bh / 4)..(inner_b.saturating_sub(bh / 4)).max(inner_t + bh / 4 + 1) {
+        for x in (inner_l + bw / 4)..(inner_r.saturating_sub(bw / 4)).max(inner_l + bw / 4 + 1) {
+            if y < h && x < w {
+                core_tmads.push(temporal_mad[y * w + x]);
+            }
+        }
+    }
+    core_tmads.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let core_tmad = core_tmads
+        .get(core_tmads.len() / 2)
+        .copied()
+        .unwrap_or(2.0) as f64;
+
+    let max_corner_r = ((bw.min(bh) as f64 * 0.12).round() as usize).min(20);
+    let probe_corner = |sx: usize, sy: usize, dx: isize, dy: isize| -> usize {
+        let mut depth = 0usize;
+        for d in 0..max_corner_r {
+            let cx = (sx as isize + dx * d as isize).clamp(0, w as isize - 1) as usize;
+            let cy = (sy as isize + dy * d as isize).clamp(0, h as isize - 1) as usize;
+            let ix = (sx as isize + dx * (d + 4) as isize).clamp(0, w as isize - 1) as usize;
+            let iy = (sy as isize + dy * (d + 4) as isize).clamp(0, h as isize - 1) as usize;
+            let tm = temporal_mad[cy * w + cx] as f64;
+            let cd = rgb_diff(median_rgb[cy * w + cx], median_rgb[iy * w + ix]);
+            let masked_out = (tm > core_tmad * 2.5 + 9.0) || (tm < 1.2 && cd > 22.0);
+            if masked_out {
+                depth = d + 1;
+            } else {
+                break;
+            }
+        }
+        depth
+    };
+
+    let c_tl = probe_corner(inner_l, inner_t, 1, 1);
+    let c_tr = probe_corner(inner_r, inner_t, -1, 1);
+    let c_bl = probe_corner(inner_l, inner_b, 1, -1);
+    let c_br = probe_corner(inner_r, inner_b, -1, -1);
+    let corner_inset = c_tl.max(c_tr).max(c_bl).max(c_br);
+
+    inner_l = (inner_l + corner_inset).min(face_guard_l);
+    inner_r = inner_r.saturating_sub(corner_inset).max(face_guard_r);
+    inner_t = (inner_t + corner_inset).min(face_guard_t);
+    inner_b = inner_b.saturating_sub(corner_inset).max(face_guard_b);
+
+    // Phase D: Guaranteed Zero-Border Safety Inset (minimum >= 3px in analysis space on every
+    // detected/interior wall so anti-aliasing, shadows, or 1-2px glows can NEVER leak in!)
+    let box_w = inner_r.saturating_sub(inner_l).max(32) as f64;
+    let box_h = inner_b.saturating_sub(inner_t).max(32) as f64;
+
+    let trim_l = if inner_l <= 2 && !l_scan.detected && peeled_l == 0 {
+        (box_w * 0.02).max(2.0)
+    } else {
+        (box_w * trim_pct).max(3.0)
+    };
+    let trim_r = if inner_r >= w.saturating_sub(3) && !r_scan.detected && peeled_r == 0 {
+        (box_w * 0.02).max(2.0)
+    } else {
+        (box_w * trim_pct).max(3.0)
+    };
+    let trim_t = if inner_t <= 2 && !t_scan.detected && peeled_t == 0 {
+        (box_h * 0.02).max(2.0)
+    } else {
+        (box_h * trim_pct).max(3.0)
+    };
+    let trim_b = if inner_b >= h.saturating_sub(3) && !b_scan.detected && peeled_b == 0 {
+        (box_h * 0.02).max(2.0)
+    } else {
+        (box_h * trim_pct).max(3.0)
+    };
+
+    let sx1 = (inner_l as f64 + trim_l).clamp(0.0, w as f64 - 16.0);
+    let sy1 = (inner_t as f64 + trim_t).clamp(0.0, h as f64 - 16.0);
+    let sx2 = (inner_r as f64 - trim_r).clamp(sx1 + 16.0, w as f64);
+    let sy2 = (inner_b as f64 - trim_b).clamp(sy1 + 16.0, h as f64);
 
     let safe_rect = PixelRect {
         x: sx1 / w as f64,
@@ -804,12 +1170,16 @@ fn detect_pip_webcam_safe_box(
         h: (sy2 - sy1) / h as f64,
     };
     let outer_rect = PixelRect {
-        x: left as f64 / w as f64,
-        y: top as f64 / h as f64,
-        w: (right.saturating_sub(left)).max(16) as f64 / w as f64,
-        h: (bot.saturating_sub(top)).max(16) as f64 / h as f64,
+        x: outer_l as f64 / w as f64,
+        y: outer_t as f64 / h as f64,
+        w: (outer_r.saturating_sub(outer_l)).max(16) as f64 / w as f64,
+        h: (outer_b.saturating_sub(outer_t)).max(16) as f64 / h as f64,
     };
-    (safe_rect, outer_rect)
+    PipWebcamDetection {
+        safe_rect,
+        outer_rect,
+        walls_detected,
+    }
 }
 
 fn expand_norm_rect(r: PixelRect, pad: f64) -> PixelRect {
@@ -849,12 +1219,32 @@ pub fn build_natural_camera_track(
         .copied()
         .unwrap_or(safe_box_px.h * 0.35);
 
-    // 2. Compute maximum aspect-locked crop that fits 100% inside safe_box_px
-    let (max_cw, max_ch) = if safe_box_px.w / safe_box_px.h.max(1.0) >= target_aspect {
-        let ch = safe_box_px.h;
+    // 2. Compute strict integer interior of safe_box_px so NOT EVEN 1px can ever leak out
+    let safe_x0 = safe_box_px
+        .x
+        .ceil()
+        .clamp(0.0, src_w.saturating_sub(32) as f64);
+    let safe_y0 = safe_box_px
+        .y
+        .ceil()
+        .clamp(0.0, src_h.saturating_sub(32) as f64);
+    let safe_x1 = safe_box_px
+        .right()
+        .floor()
+        .clamp(safe_x0 + 32.0, src_w as f64);
+    let safe_y1 = safe_box_px
+        .bottom()
+        .floor()
+        .clamp(safe_y0 + 32.0, src_h as f64);
+    let safe_w_int = (safe_x1 - safe_x0).max(32.0);
+    let safe_h_int = (safe_y1 - safe_y0).max(32.0);
+
+    // Maximum aspect-locked crop that fits 100% inside the strict integer safe_box
+    let (max_cw, max_ch) = if safe_w_int / safe_h_int.max(1.0) >= target_aspect {
+        let ch = safe_h_int;
         (ch * target_aspect, ch)
     } else {
-        let cw = safe_box_px.w;
+        let cw = safe_w_int;
         (cw, cw / target_aspect)
     };
 
@@ -865,20 +1255,18 @@ pub fn build_natural_camera_track(
         max_ch * if is_pip_webcam { 0.92 } else { 0.88 },
     );
     let desired_cw = (desired_ch * target_aspect).min(max_cw);
-    let desired_ch = desired_cw / target_aspect;
+    let desired_ch = (desired_cw / target_aspect).min(max_ch);
 
-    // Keep even integer dimensions for yuv420p compatibility
-    let crop_w = ((desired_cw.floor() as u32) & !1).clamp(32, src_w & !1);
-    let crop_h = ((desired_ch.floor() as u32) & !1).clamp(32, src_h & !1);
+    // Keep even integer dimensions strictly <= safe_w_int / safe_h_int for yuv420p compatibility
+    let max_even_w = ((safe_w_int.floor() as u32) & !1).clamp(32, src_w & !1);
+    let max_even_h = ((safe_h_int.floor() as u32) & !1).clamp(32, src_h & !1);
+    let crop_w = ((desired_cw.floor() as u32) & !1).clamp(32.min(max_even_w), max_even_w);
+    let crop_h = ((desired_ch.floor() as u32) & !1).clamp(32.min(max_even_h), max_even_h);
 
-    let min_x = safe_box_px.x.ceil().clamp(0.0, (src_w - crop_w) as f64);
-    let max_x = (safe_box_px.right() - crop_w as f64)
-        .floor()
-        .clamp(min_x, (src_w - crop_w) as f64);
-    let min_y = safe_box_px.y.ceil().clamp(0.0, (src_h - crop_h) as f64);
-    let max_y = (safe_box_px.bottom() - crop_h as f64)
-        .floor()
-        .clamp(min_y, (src_h - crop_h) as f64);
+    let min_x = safe_x0.clamp(0.0, (src_w - crop_w) as f64);
+    let max_x = (safe_x1 - crop_w as f64).clamp(min_x, (src_w - crop_w) as f64);
+    let min_y = safe_y0.clamp(0.0, (src_h - crop_h) as f64);
+    let max_y = (safe_y1 - crop_h as f64).clamp(min_y, (src_h - crop_h) as f64);
 
     let clamp_xy = |x: f64, y: f64| -> (f64, f64) {
         (x.clamp(min_x, max_x), y.clamp(min_y, max_y))
@@ -1761,5 +2149,155 @@ mod tests {
         let left_m = measure_face_mouth_motion(&prev, &curr, left_face, gmad);
         let right_m = measure_face_mouth_motion(&prev, &curr, right_face, gmad);
         assert!(right_m > left_m + 30.0, "expected right speaker mouth motion ({right_m}) >> left ({left_m})");
+    }
+
+    #[test]
+    fn zero_border_detector_strips_thick_obs_border_even_on_screen_edge() {
+        // 320x180 frames: moving gameplay + bottom-right webcam touching right/bottom screen edge
+        // with a THICK 12px solid gold OBS border on ALL 4 sides (x: 180..320, y: 80..180,
+        // so clean interior is x: 192..308, y: 92..168).
+        let mut frames = Vec::new();
+        for i in 0..10usize {
+            let mut img = RgbImage::from_pixel(320, 180, image::Rgb([20, 30, 50]));
+            // Dynamic moving gameplay outside webcam
+            for y in 0..180u32 {
+                for x in 0..320u32 {
+                    let v = (((x + y + (i as u32 * 29)) * 7) % 180) as u8;
+                    img.put_pixel(x, y, image::Rgb([v, (v / 2).wrapping_add(40), 200u8.saturating_sub(v)]));
+                }
+            }
+            // Thick 12px static gold OBS border around x=180..320, y=80..180
+            for y in 80..180u32 {
+                for x in 180..320u32 {
+                    img.put_pixel(x, y, image::Rgb([245, 195, 25]));
+                }
+            }
+            // Clean live textured webcam interior: x=192..308, y=92..168
+            for y in 92..168u32 {
+                for x in 192..308u32 {
+                    let jitter = ((i * 5 + (x as usize % 7)) % 12) as u8;
+                    let r = (55u8).saturating_add(((x - 192) / 3) as u8).saturating_add(jitter);
+                    let g = (48u8).saturating_add(((y - 92) / 3) as u8).saturating_add(jitter / 2);
+                    let b = (62u8).saturating_add(jitter);
+                    img.put_pixel(x, y, image::Rgb([r, g, b]));
+                }
+            }
+            frames.push((i as f64 / 3.0, img));
+        }
+
+        // Streamer face centered inside the webcam interior (x: 235..265, y: 112..148)
+        let face = FaceBox {
+            x1: 235.0 / 320.0,
+            y1: 112.0 / 180.0,
+            x2: 265.0 / 320.0,
+            y2: 148.0 / 180.0,
+            score: 0.96,
+        };
+
+        let det = detect_pip_webcam_zero_border(&frames, face, 0.045, false);
+        assert!(det.walls_detected >= 3, "expected OBS walls detected, got {}", det.walls_detected);
+
+        let sx1 = det.safe_rect.x * 320.0;
+        let sy1 = det.safe_rect.y * 180.0;
+        let sx2 = det.safe_rect.right() * 320.0;
+        let sy2 = det.safe_rect.bottom() * 180.0;
+
+        // Every single side MUST sit strictly INSIDE the 12px gold border (zero gold pixels!)
+        assert!(sx1 >= 192.0, "left border leaked! sx1={sx1:.1} < 192");
+        assert!(sy1 >= 92.0, "top border leaked! sy1={sy1:.1} < 92");
+        assert!(sx2 <= 308.0, "right screen-edge border leaked! sx2={sx2:.1} > 308");
+        assert!(sy2 <= 168.0, "bottom screen-edge border leaked! sy2={sy2:.1} > 168");
+    }
+
+    #[test]
+    fn zero_border_detector_peels_static_bottom_nameplate_and_rounded_corners() {
+        // Bottom-left webcam at x=0..140, y=75..180 with:
+        // - 14px static dark nameplate bar along the bottom (y=166..180)
+        // - 8px rounded corners exposing fast-moving gameplay
+        let mut frames = Vec::new();
+        for i in 0..10usize {
+            let mut img = RgbImage::from_pixel(320, 180, image::Rgb([10, 10, 10]));
+            // Fast-moving gameplay everywhere
+            for y in 0..180u32 {
+                for x in 0..320u32 {
+                    let v = (((x * 3 + y * 5 + i as u32 * 47) % 240)) as u8;
+                    img.put_pixel(x, y, image::Rgb([v, 240 - v, (v / 2) + 50]));
+                }
+            }
+            // Live textured webcam interior: x=0..136, y=79..166
+            for y in 79..166u32 {
+                for x in 0..136u32 {
+                    // Cut out 8px rounded corners so moving gameplay shows through corners
+                    let near_tl = x + (y - 79) < 9;
+                    let near_tr = (135 - x) + (y - 79) < 9;
+                    let near_bl = x + (165 - y) < 9;
+                    let near_br = (135 - x) + (165 - y) < 9;
+                    if near_tl || near_tr || near_bl || near_br {
+                        continue;
+                    }
+                    let jitter = ((i * 4 + (x as usize % 5)) % 10) as u8;
+                    img.put_pixel(
+                        x,
+                        y,
+                        image::Rgb([
+                            65u8.saturating_add((x / 4) as u8).saturating_add(jitter),
+                            55u8.saturating_add(((y - 79) / 3) as u8),
+                            70u8.saturating_add(jitter),
+                        ]),
+                    );
+                }
+            }
+            // 14px static solid purple nameplate bar at bottom y=166..180
+            for y in 166..180u32 {
+                for x in 0..136u32 {
+                    img.put_pixel(x, y, image::Rgb([110, 25, 165]));
+                }
+            }
+            frames.push((i as f64 / 3.0, img));
+        }
+
+        let face = FaceBox {
+            x1: 52.0 / 320.0,
+            y1: 100.0 / 180.0,
+            x2: 84.0 / 320.0,
+            y2: 138.0 / 180.0,
+            score: 0.95,
+        };
+
+        let det = detect_pip_webcam_zero_border(&frames, face, 0.045, true);
+        let sy2 = det.safe_rect.bottom() * 180.0;
+        let sx2 = det.safe_rect.right() * 320.0;
+        assert!(sy2 <= 166.0, "bottom nameplate leaked! sy2={sy2:.1} > 166");
+        assert!(sx2 <= 135.0, "right edge leaked! sx2={sx2:.1} > 135");
+    }
+
+    #[test]
+    fn zero_border_detector_does_not_false_trigger_on_fullscreen_talking_head() {
+        // Smoothly lit natural full-screen room with NO PiP rectangular frame
+        let mut frames = Vec::new();
+        for i in 0..8usize {
+            let mut img = RgbImage::from_pixel(320, 180, image::Rgb([70, 65, 60]));
+            for y in 0..180u32 {
+                for x in 0..320u32 {
+                    let jitter = ((i * 3) % 6) as u8;
+                    let r = 60u8.saturating_add((x / 5) as u8).saturating_add(jitter);
+                    let g = 55u8.saturating_add((y / 4) as u8);
+                    let b = 65u8.saturating_add(jitter);
+                    img.put_pixel(x, y, image::Rgb([r, g, b]));
+                }
+            }
+            frames.push((i as f64 / 3.0, img));
+        }
+
+        let face = FaceBox {
+            x1: 0.38,
+            y1: 0.20,
+            x2: 0.62,
+            y2: 0.65,
+            score: 0.97,
+        };
+        let det = detect_pip_webcam_zero_border(&frames, face, 0.045, false);
+        assert!(det.walls_detected < 2, "expected fullscreen camera, got {} walls", det.walls_detected);
+        assert!(det.safe_rect.w > 0.95 && det.safe_rect.h > 0.95);
     }
 }

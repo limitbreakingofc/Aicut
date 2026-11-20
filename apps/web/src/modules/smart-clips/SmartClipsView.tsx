@@ -960,7 +960,7 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
               <Checkbox
                 checked={faceTracking}
                 onChange={setFaceTracking}
-                label="Rastreamento facial suave por IA (centralizar rosto e eliminar bordas durante o vídeo todo)"
+                label="IA Cameraman na webcam (identifica as bordas, exibe apenas o interior sem bordas e acompanha o rosto)"
               />
             )}
             <Checkbox

@@ -83,6 +83,11 @@ jobs:
           body: |
             ## Aicut ${{ steps.tag.outputs.name }} — Estúdio Modular AI-First para Windows 11
 
+            ### Novidades da v0.5.3 — Detector Cirúrgico Zero-Borda na Webcam (4 Fases)
+            - **Varredura de dentro para fora nos 4 lados (inclusive bordas encostadas no canto da tela):** identifica molduras OBS finas ou grossas (até ~78 px em 1080p) emparelhando a parede externa e a interna, travando **sempre na parede interna** — nunca deixa vazar borda direita ou inferior da tela!
+            - **Descascador de bordas estáticas, brilhos e barras de nome (`temporal MAD + uniformidade`):** cruza mediana RGB de 18 frames com variância temporal pixel a pixel para descascar automaticamente bordas sólidas, gradientes neon, brilhos e banners fixos do OBS antes de enquadrar.
+            - **Detecção automática de cantos arredondados:** sonda as 4 diagonais internas da webcam para recuar além de máscaras de cantos arredondados e aplicar trava inteira estrita (`ceil/floor`), garantindo **zero pixels de borda jamais** durante todo o vídeo.
+
             ### Novidades da v0.5.2 — IA Diretor de Conteúdo (Janela Inferior: Quem Está Falando + Ação em Destaque)
             - **Foco Dinâmico em Quem Está Falando (`smart_focus` — novo padrão da janela de baixo):** detecta os rostos na área do conteúdo (vídeos reagidos, entrevistas, podcasts, cutscenes) e mede a atividade labial/mandibular frame a frame com histerese editorial — acompanhando quem está falando de verdade, enquadrando em *two-shot* quando duas pessoas cabem juntas ou fazendo corte limpo de câmera quando a fala muda de lado!
             - **Rastreamento do Momento de Ação / Destaque (Gameplay, Trailers & Demos):** quando não há um orador em primeiro plano, uma grade visual 32×18 de movimento compensado por pan + contraste/saturação desliza a janela de recorte para capturar automaticamente o ponto de maior ação/destaque em cada instante.
