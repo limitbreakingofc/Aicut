@@ -203,12 +203,14 @@ pub async fn render_clip_to_library(
             video_codec: Some("h264".to_string()),
             audio_codec: Some("aac".to_string()),
             format_name: Some("mp4".to_string()),
+            transcript_id: transcript.map(|t| t.id.clone()),
             ..Default::default()
         },
         tags: vec![
             "short".to_string(),
             "ai-clip".to_string(),
             format!("{:?}", layout).to_lowercase(),
+            format!("video_id:{}", source.id),
         ],
         notes,
         created_at: now,

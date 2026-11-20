@@ -25,10 +25,10 @@ import type {
   HardwareProfile,
   JobRecord,
   MediaAsset,
+  MediaContextInfo,
   RouteId,
   SmartClipRun,
   ToolStatus,
-  TranscriptRecord,
   VisionModelStatus,
 } from "../../lib/types";
 
@@ -132,10 +132,10 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
   const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
   const [uninstallingModel, setUninstallingModel] = useState<string | null>(null);
 
-  // Runs & transcripts
+  // Runs & full-library video context
   const [runs, setRuns] = useState<SmartClipRun[]>([]);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
-  const [transcripts, setTranscripts] = useState<TranscriptRecord[]>([]);
+  const [mediaContext, setMediaContext] = useState<MediaContextInfo | null>(null);
 
   // Shorts rendering options
   const [layout, setLayout] = useState<
@@ -161,9 +161,22 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
     }
   }, [preselectedMediaId, videoMedia.length]);
 
+  const loadMediaContext = async (mediaId: string) => {
+    if (!mediaId) {
+      setMediaContext(null);
+      return;
+    }
+    try {
+      const res = await runAction<MediaContextInfo>("clips.media_context", { media_id: mediaId });
+      setMediaContext(res.data);
+    } catch {
+      setMediaContext(null);
+    }
+  };
+
   const loadAll = async () => {
     try {
-      const [cfgRes, modelsRes, runsRes, trRes] = await Promise.all([
+      const [cfgRes, modelsRes, runsRes] = await Promise.all([
         runAction<ClipsConfig>("clips.config_get"),
         runAction<{
           models: VisionModelStatus[];
@@ -171,7 +184,6 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
           total_installed_bytes: number;
         }>("clips.models_list"),
         runAction<{ runs: SmartClipRun[] }>("clips.runs_list"),
-        runAction<{ transcripts: TranscriptRecord[] }>("transcribe.list"),
       ]);
 
       setConfig(cfgRes.data);
@@ -198,8 +210,6 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
       if (rList.length > 0 && !activeRunId) {
         setActiveRunId(rList[0].id);
       }
-
-      setTranscripts(trRes.data.transcripts ?? []);
     } catch {
       // ignore if backend offline
     }
@@ -216,25 +226,32 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
         j.kind === "clips.model_download") &&
       (j.status === "queued" || j.status === "running"),
   );
-  const completedClipJobsCount = jobs.filter(
+  const completedRelatedJobsCount = jobs.filter(
     (j) =>
       (j.kind === "clips.analyze" ||
         j.kind === "clips.render" ||
-        j.kind === "clips.model_download") &&
+        j.kind === "clips.model_download" ||
+        j.kind === "transcribe.run") &&
       j.status === "completed",
   ).length;
 
   useEffect(() => {
-    if (completedClipJobsCount > 0) {
+    if (selectedMediaId) {
+      void loadMediaContext(selectedMediaId);
+    } else {
+      setMediaContext(null);
+    }
+  }, [selectedMediaId, media.length, completedRelatedJobsCount]);
+
+  useEffect(() => {
+    if (completedRelatedJobsCount > 0) {
       void loadAll();
       void onRefreshMedia();
     }
-  }, [completedClipJobsCount]);
+  }, [completedRelatedJobsCount]);
 
-  const selectedTranscript = useMemo(
-    () => transcripts.find((t) => t.media_id === selectedMediaId) ?? null,
-    [transcripts, selectedMediaId],
-  );
+  const resolvedTranscript = mediaContext?.resolved_transcript ?? null;
+  const relatedCount = Math.max(0, (mediaContext?.related_assets?.length ?? 1) - 1);
 
   const activeRun = useMemo(
     () => runs.find((r) => r.id === activeRunId) ?? runs[0] ?? null,
@@ -524,31 +541,38 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
             )}
           </div>
 
-          {/* Transcript anchor status */}
+          {/* Full Library lineage & Transcript anchor status */}
           {selectedMediaId && (
             <div
               style={{
                 display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                gap: 10,
-                padding: "8px 10px",
+                flexDirection: "column",
+                gap: 6,
+                padding: "9px 11px",
                 borderRadius: "var(--radius-sm)",
-                background: selectedTranscript ? "var(--success-soft)" : "var(--bg-elevated)",
+                background: resolvedTranscript ? "var(--success-soft)" : "var(--bg-elevated)",
+                border: `1px solid ${resolvedTranscript ? "var(--success)" : "var(--border-subtle)"}`,
                 fontSize: 12,
               }}
             >
-              <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                <Subtitles size={14} style={{ color: selectedTranscript ? "var(--success)" : "var(--text-muted)" }} />
-                {selectedTranscript
-                  ? `Transcrição vinculada (${selectedTranscript.segments.length} falas): cortes alinhados por palavra e legendas Karaokê prontas.`
-                  : "Dica: transcreva este vídeo antes na aba Transcrever IA para alinhar cortes exatos por palavra e gerar legendas Karaokê."}
-              </span>
-              {!selectedTranscript && (
-                <button type="button" className="btn btn-sm" onClick={() => onNavigate("transcribe")}>
-                  Transcrever
-                </button>
-              )}
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+                <span style={{ display: "flex", alignItems: "center", gap: 6, fontWeight: 500 }}>
+                  <Subtitles size={14} style={{ color: resolvedTranscript ? "var(--success)" : "var(--text-muted)" }} />
+                  {resolvedTranscript
+                    ? `Transcrição vinculada automaticamente (${resolvedTranscript.segment_count} falas · ${resolvedTranscript.language.toUpperCase()} · origem: ${resolvedTranscript.source})`
+                    : "Nenhuma transcrição encontrada na Biblioteca para este vídeo ainda."}
+                </span>
+                {!resolvedTranscript && (
+                  <button type="button" className="btn btn-sm" onClick={() => onNavigate("transcribe")}>
+                    Transcrever
+                  </button>
+                )}
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", fontSize: 11, color: "var(--text-secondary)", fontFamily: "var(--font-mono)" }}>
+                <span>video_id: {selectedMediaId.slice(0, 12)}</span>
+                {mediaContext?.external_video_key && <span>· {mediaContext.external_video_key}</span>}
+                <span>· {relatedCount} arquivo(s) vinculado(s) na Biblioteca</span>
+              </div>
             </div>
           )}
 

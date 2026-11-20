@@ -151,6 +151,18 @@ pub struct TranscriptRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ResolvedTranscript {
+    pub transcript: TranscriptRecord,
+    /// Where the transcript was found: "db_exact", "db_related_media", "db_video_key",
+    /// "db_asset_ref", "library_json_file", "library_subtitle_file", or "sidecar_file".
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_asset_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_file_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SmartClipSegment {
     pub start_sec: f64,
     pub end_sec: f64,
@@ -692,6 +704,257 @@ impl MediaRepository {
         Ok(changed > 0)
     }
 
+    // ---- Unified Video Lineage & Full-Library Context Resolution ----
+
+    /// Finds every Library asset linked to `media_id` via direct ID, `parent_media_id`,
+    /// `video_id:<id>` tag, shared `source_url`, shared `fingerprint`, or canonical external
+    /// video ID (such as YouTube `[fPQDxLwScrA]` or Twitch VOD ID).
+    pub fn find_related_media(&self, media_id: &str) -> AicutResult<Vec<MediaAsset>> {
+        let Some(target) = self.get_media(media_id)? else {
+            return Ok(Vec::new());
+        };
+        let all = self.list_media(&MediaListFilter {
+            limit: Some(5000),
+            ..Default::default()
+        })?;
+
+        let root_id = target
+            .parent_media_id
+            .clone()
+            .unwrap_or_else(|| target.id.clone());
+        let root_asset = all.iter().find(|a| a.id == root_id).unwrap_or(&target);
+
+        let target_url = normalize_url_opt(root_asset.source_url.as_deref())
+            .or_else(|| normalize_url_opt(target.source_url.as_deref()));
+        let target_fp = root_asset
+            .fingerprint
+            .as_deref()
+            .or(target.fingerprint.as_deref())
+            .map(str::to_string);
+        let target_ext_key = extract_external_video_key(
+            root_asset.source_url.as_deref().or(target.source_url.as_deref()),
+            &root_asset.title,
+            &root_asset.file_name,
+        )
+        .or_else(|| {
+            extract_external_video_key(
+                target.source_url.as_deref(),
+                &target.title,
+                &target.file_name,
+            )
+        });
+
+        let video_tag_target = format!("video_id:{}", target.id);
+        let video_tag_root = format!("video_id:{root_id}");
+
+        let mut related: Vec<MediaAsset> = Vec::new();
+        for item in all {
+            let is_direct = item.id == target.id
+                || item.id == root_id
+                || item.parent_media_id.as_deref() == Some(target.id.as_str())
+                || item.parent_media_id.as_deref() == Some(root_id.as_str())
+                || item
+                    .tags
+                    .iter()
+                    .any(|t| t == &video_tag_target || t == &video_tag_root);
+
+            let same_url = target_url.is_some()
+                && normalize_url_opt(item.source_url.as_deref()) == target_url;
+
+            let same_fp = target_fp.is_some()
+                && item.fingerprint.as_deref() == target_fp.as_deref();
+
+            let same_ext_key = target_ext_key.is_some()
+                && extract_external_video_key(
+                    item.source_url.as_deref(),
+                    &item.title,
+                    &item.file_name,
+                ) == target_ext_key;
+
+            if is_direct || same_url || same_fp || same_ext_key {
+                related.push(item);
+            }
+        }
+
+        // Second pass: include children of any matched sibling asset
+        let matched_ids: std::collections::HashSet<String> =
+            related.iter().map(|a| a.id.clone()).collect();
+        let all_again = self.list_media(&MediaListFilter {
+            limit: Some(5000),
+            ..Default::default()
+        })?;
+        for item in all_again {
+            if matched_ids.contains(&item.id) {
+                continue;
+            }
+            if let Some(ref pid) = item.parent_media_id {
+                if matched_ids.contains(pid) {
+                    related.push(item);
+                }
+            }
+        }
+
+        Ok(related)
+    }
+
+    /// Searches the entire Library & transcripts DB to find the best transcript for `media_id`:
+    /// 1. Exact DB transcript by `media_id`
+    /// 2. DB transcript linked to parent/sibling media (same video ID, URL, or fingerprint)
+    /// 3. DB transcript whose title contains the same external video ID (e.g. `[fPQDxLwScrA]`)
+    /// 4. Referenced via `metadata.transcript_id` on any related Library asset
+    /// 5. Related `.json` (`TranscriptRecord`), `.srt`, or `.vtt` file registered in the Library
+    /// 6. Sidecar `.srt`/`.vtt`/`.json` file sitting alongside the video on disk
+    pub fn find_best_transcript_for_media(
+        &self,
+        media_id: &str,
+    ) -> AicutResult<Option<ResolvedTranscript>> {
+        // 1. Exact DB match
+        if let Some(tr) = self.list_transcripts(Some(media_id))?.into_iter().next() {
+            return Ok(Some(ResolvedTranscript {
+                transcript: tr,
+                source: "db_exact".to_string(),
+                source_asset_id: Some(media_id.to_string()),
+                source_file_path: None,
+            }));
+        }
+
+        let Some(target) = self.get_media(media_id)? else {
+            return Ok(None);
+        };
+        let related = self.find_related_media(media_id)?;
+
+        // 2. DB transcript linked to any related asset ID (parent or sibling download)
+        for asset in &related {
+            if asset.id == media_id {
+                continue;
+            }
+            if let Some(tr) = self.list_transcripts(Some(&asset.id))?.into_iter().next() {
+                return Ok(Some(ResolvedTranscript {
+                    transcript: tr,
+                    source: "db_related_media".to_string(),
+                    source_asset_id: Some(asset.id.clone()),
+                    source_file_path: None,
+                }));
+            }
+        }
+
+        // 3. DB transcript referenced via metadata.transcript_id on any related Library asset
+        for asset in &related {
+            if let Some(ref tid) = asset.metadata.transcript_id {
+                if let Some(tr) = self.get_transcript(tid)? {
+                    return Ok(Some(ResolvedTranscript {
+                        transcript: tr,
+                        source: "db_asset_ref".to_string(),
+                        source_asset_id: Some(asset.id.clone()),
+                        source_file_path: Some(asset.file_path.clone()),
+                    }));
+                }
+            }
+        }
+
+        // 4. DB transcript matching canonical external video key (e.g. YouTube [fPQDxLwScrA])
+        let target_ext_key = extract_external_video_key(
+            target.source_url.as_deref(),
+            &target.title,
+            &target.file_name,
+        );
+        if let Some(ref key) = target_ext_key {
+            let all_tr = self.list_transcripts(None)?;
+            if let Some(tr) = all_tr.into_iter().find(|t| {
+                extract_external_video_key(None, &t.media_title, &t.media_title).as_deref()
+                    == Some(key.as_str())
+            }) {
+                return Ok(Some(ResolvedTranscript {
+                    transcript: tr,
+                    source: "db_video_key".to_string(),
+                    source_asset_id: None,
+                    source_file_path: None,
+                }));
+            }
+        }
+
+        // 5. Parse related Library JSON transcript file (preserves word-level timestamps!)
+        for asset in &related {
+            let ext = asset.extension.to_lowercase();
+            if ext == "json" && Path::new(&asset.file_path).is_file() {
+                if let Ok(raw) = std::fs::read_to_string(&asset.file_path) {
+                    if let Ok(tr) = serde_json::from_str::<TranscriptRecord>(&raw) {
+                        if !tr.segments.is_empty() {
+                            return Ok(Some(ResolvedTranscript {
+                                transcript: tr,
+                                source: "library_json_file".to_string(),
+                                source_asset_id: Some(asset.id.clone()),
+                                source_file_path: Some(asset.file_path.clone()),
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 6. Parse related Library SRT / VTT subtitle file
+        for asset in &related {
+            let ext = asset.extension.to_lowercase();
+            if matches!(ext.as_str(), "srt" | "vtt") && Path::new(&asset.file_path).is_file() {
+                if let Ok(raw) = std::fs::read_to_string(&asset.file_path) {
+                    if let Some(tr) = parse_subtitle_to_transcript(&raw, &target, &asset.id) {
+                        return Ok(Some(ResolvedTranscript {
+                            transcript: tr,
+                            source: "library_subtitle_file".to_string(),
+                            source_asset_id: Some(asset.id.clone()),
+                            source_file_path: Some(asset.file_path.clone()),
+                        }));
+                    }
+                }
+            }
+        }
+
+        // 7. Sidecar subtitle/json sitting next to the video file on disk
+        let video_path = Path::new(&target.file_path);
+        if let (Some(parent), Some(stem)) = (video_path.parent(), video_path.file_stem().and_then(|s| s.to_str())) {
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if !p.is_file() {
+                        continue;
+                    }
+                    let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if !fname.starts_with(stem) {
+                        continue;
+                    }
+                    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                    if ext == "json" {
+                        if let Ok(raw) = std::fs::read_to_string(&p) {
+                            if let Ok(tr) = serde_json::from_str::<TranscriptRecord>(&raw) {
+                                if !tr.segments.is_empty() {
+                                    return Ok(Some(ResolvedTranscript {
+                                        transcript: tr,
+                                        source: "sidecar_file".to_string(),
+                                        source_asset_id: None,
+                                        source_file_path: Some(p.to_string_lossy().to_string()),
+                                    }));
+                                }
+                            }
+                        }
+                    } else if matches!(ext.as_str(), "srt" | "vtt") {
+                        if let Ok(raw) = std::fs::read_to_string(&p) {
+                            if let Some(tr) = parse_subtitle_to_transcript(&raw, &target, "sidecar") {
+                                return Ok(Some(ResolvedTranscript {
+                                    transcript: tr,
+                                    source: "sidecar_file".to_string(),
+                                    source_asset_id: None,
+                                    source_file_path: Some(p.to_string_lossy().to_string()),
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     // ---- Smart Clip Runs ----
 
     pub fn insert_clip_run(&self, run: &SmartClipRun) -> AicutResult<()> {
@@ -1002,4 +1265,293 @@ fn row_to_clip_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<SmartClipRun> {
             .map(|d| d.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now()),
     })
+}
+
+fn normalize_url_opt(url: Option<&str>) -> Option<String> {
+    let raw = url?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(raw.trim_end_matches('/').to_lowercase())
+}
+
+/// Extracts a canonical external video identifier (e.g. `yt:fPQDxLwScrA` or `tw:123456789`)
+/// from a URL, title, or filename so all assets generated from the same video share identity.
+pub fn extract_external_video_key(
+    source_url: Option<&str>,
+    title: &str,
+    file_name: &str,
+) -> Option<String> {
+    if let Some(url) = source_url {
+        if let Some(yt_id) = extract_youtube_id_from_url(url) {
+            return Some(format!("yt:{yt_id}"));
+        }
+        if let Some(tw_id) = extract_twitch_vod_id(url) {
+            return Some(format!("tw:{tw_id}"));
+        }
+    }
+    for text in [title, file_name] {
+        if let Some(id) = extract_bracketed_id(text) {
+            return Some(format!("yt:{id}"));
+        }
+    }
+    None
+}
+
+fn extract_youtube_id_from_url(url: &str) -> Option<String> {
+    let lower = url.to_lowercase();
+    if !lower.contains("youtube.com") && !lower.contains("youtu.be") {
+        return None;
+    }
+    if let Some(idx) = url.find("v=") {
+        let candidate: String = url[idx + 2..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        if candidate.len() == 11 {
+            return Some(candidate);
+        }
+    }
+    for marker in ["youtu.be/", "/shorts/", "/live/", "/embed/"] {
+        if let Some(idx) = lower.find(marker) {
+            let start = idx + marker.len();
+            let candidate: String = url[start..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            if candidate.len() == 11 {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn extract_twitch_vod_id(url: &str) -> Option<String> {
+    let lower = url.to_lowercase();
+    let idx = lower.find("twitch.tv/videos/")?;
+    let digits: String = url[idx + "twitch.tv/videos/".len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.len() >= 6 {
+        Some(digits)
+    } else {
+        None
+    }
+}
+
+fn extract_bracketed_id(text: &str) -> Option<String> {
+    let mut search = text;
+    while let Some(open) = search.find('[') {
+        let rest = &search[open + 1..];
+        if let Some(close) = rest.find(']') {
+            let inside = &rest[..close];
+            if inside.len() == 11
+                && inside
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                return Some(inside.to_string());
+            }
+            search = &rest[close + 1..];
+        } else {
+            break;
+        }
+    }
+    None
+}
+
+fn parse_subtitle_to_transcript(
+    raw: &str,
+    target: &MediaAsset,
+    source_tag: &str,
+) -> Option<TranscriptRecord> {
+    let mut segments = Vec::new();
+    let mut full_parts = Vec::new();
+    let normalized = raw.replace("\r\n", "\n");
+    let lines: Vec<&str> = normalized.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i].trim();
+        if let Some((start_str, end_str)) = line.split_once("-->") {
+            let start_ms = parse_sub_timestamp_ms(start_str.trim());
+            let end_ms = parse_sub_timestamp_ms(
+                end_str
+                    .trim()
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(end_str.trim()),
+            );
+            i += 1;
+            let mut text_lines = Vec::new();
+            while i < lines.len() && !lines[i].trim().is_empty() {
+                let cleaned = strip_html_tags(lines[i].trim());
+                if !cleaned.is_empty() {
+                    text_lines.push(cleaned);
+                }
+                i += 1;
+            }
+            if let (Some(s), Some(e)) = (start_ms, end_ms) {
+                let text = text_lines.join(" ").trim().to_string();
+                if !text.is_empty() && e > s {
+                    full_parts.push(text.clone());
+                    segments.push(TranscriptSegment {
+                        index: segments.len(),
+                        start_ms: s,
+                        end_ms: e,
+                        text,
+                        words: Vec::new(),
+                    });
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    if segments.is_empty() {
+        return None;
+    }
+
+    Some(TranscriptRecord {
+        id: format!("parsed-{source_tag}"),
+        media_id: target.id.clone(),
+        media_title: target.title.clone(),
+        model_id: "library-subtitle".to_string(),
+        language: target
+            .metadata
+            .language
+            .clone()
+            .unwrap_or_else(|| "auto".to_string()),
+        duration_sec: target.metadata.duration_sec,
+        full_text: full_parts.join(" "),
+        segments,
+        created_at: Utc::now(),
+    })
+}
+
+fn parse_sub_timestamp_ms(ts: &str) -> Option<u64> {
+    let clean = ts.replace(',', ".");
+    let parts: Vec<&str> = clean.split(':').collect();
+    let (h, m, s_part) = match parts.as_slice() {
+        [m, s] => (0u64, m.parse::<u64>().ok()?, *s),
+        [h, m, s] => (h.parse::<u64>().ok()?, m.parse::<u64>().ok()?, *s),
+        _ => return None,
+    };
+    let (sec, ms) = if let Some((a, b)) = s_part.split_once('.') {
+        let s = a.parse::<u64>().ok()?;
+        let mut ms_str = b.chars().take(3).collect::<String>();
+        while ms_str.len() < 3 {
+            ms_str.push('0');
+        }
+        (s, ms_str.parse::<u64>().ok()?)
+    } else {
+        (s_part.parse::<u64>().ok()?, 0)
+    };
+    Some((h * 3600 + m * 60 + sec) * 1000 + ms)
+}
+
+fn strip_html_tags(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for ch in input.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_youtube_and_bracketed_video_keys() {
+        assert_eq!(
+            extract_external_video_key(
+                Some("https://www.youtube.com/watch?v=fPQDxLwScrA"),
+                "Test",
+                "test.mp4"
+            )
+            .as_deref(),
+            Some("yt:fPQDxLwScrA")
+        );
+        assert_eq!(
+            extract_external_video_key(
+                None,
+                "Instale isso no Claude Code [fPQDxLwScrA]",
+                "video.mp4"
+            )
+            .as_deref(),
+            Some("yt:fPQDxLwScrA")
+        );
+    }
+
+    #[test]
+    fn resolves_transcript_across_related_media_and_srt_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MediaRepository::open(&dir.path().join("test.db")).unwrap();
+
+        let now = Utc::now();
+        let video_asset = MediaAsset {
+            id: "vid-1".into(),
+            title: "Meu Video [fPQDxLwScrA]".into(),
+            kind: MediaKind::Video,
+            source_type: MediaSourceType::Download,
+            source_url: Some("https://www.youtube.com/watch?v=fPQDxLwScrA".into()),
+            parent_media_id: None,
+            file_path: dir.path().join("video.mp4").to_string_lossy().to_string(),
+            file_name: "video.mp4".into(),
+            extension: "mp4".into(),
+            file_size_bytes: 1000,
+            fingerprint: None,
+            thumbnail_path: None,
+            metadata: MediaMetadata::default(),
+            tags: vec![],
+            notes: String::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        db.insert_media(&video_asset).unwrap();
+
+        let srt_path = dir.path().join("sub.srt");
+        std::fs::write(
+            &srt_path,
+            "1\n00:00:01,000 --> 00:00:04,500\nFala galera, olha esse corte!\n\n",
+        )
+        .unwrap();
+
+        let srt_asset = MediaAsset {
+            id: "sub-1".into(),
+            title: "Legenda SRT".into(),
+            kind: MediaKind::Subtitle,
+            source_type: MediaSourceType::Generated,
+            source_url: None,
+            parent_media_id: Some("vid-1".into()),
+            file_path: srt_path.to_string_lossy().to_string(),
+            file_name: "sub.srt".into(),
+            extension: "srt".into(),
+            file_size_bytes: 60,
+            fingerprint: None,
+            thumbnail_path: None,
+            metadata: MediaMetadata::default(),
+            tags: vec!["video_id:vid-1".into()],
+            notes: String::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        db.insert_media(&srt_asset).unwrap();
+
+        let resolved = db.find_best_transcript_for_media("vid-1").unwrap().unwrap();
+        assert_eq!(resolved.source, "library_subtitle_file");
+        assert_eq!(resolved.transcript.segments.len(), 1);
+        assert_eq!(resolved.transcript.segments[0].start_ms, 1000);
+        assert!(resolved.transcript.segments[0].text.contains("olha esse corte"));
+    }
 }

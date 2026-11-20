@@ -1,6 +1,6 @@
 use aicut_core::{
     ActorKind, AicutError, AicutEvent, AicutKernel, AicutResult, JobProgress, MediaAsset,
-    SmartClipRun, TranscriptRecord,
+    ResolvedTranscript, SmartClipRun, TranscriptRecord,
 };
 use chrono::Utc;
 use schemars::JsonSchema;
@@ -224,16 +224,22 @@ pub async fn start_clip_analysis(
         }
     };
 
-    // Load saved transcript for word-level anchoring if available
-    let transcript: Option<TranscriptRecord> = if let Some(ref tid) = req.transcript_id {
-        kernel.repo.get_transcript(tid)?
-    } else {
+    // Full-library transcript lookup: explicit ID -> exact media_id -> related sibling/parent ID ->
+    // external video ID ([fPQDxLwScrA]) -> Library JSON/SRT/VTT file -> sidecar file on disk!
+    let resolved_transcript: Option<ResolvedTranscript> = if let Some(ref tid) = req.transcript_id {
         kernel
             .repo
-            .list_transcripts(Some(&source.id))?
-            .into_iter()
-            .next()
+            .get_transcript(tid)?
+            .map(|t| ResolvedTranscript {
+                transcript: t,
+                source: "explicit_id".to_string(),
+                source_asset_id: Some(source.id.clone()),
+                source_file_path: None,
+            })
+    } else {
+        kernel.repo.find_best_transcript_for_media(&source.id)?
     };
+    let related_assets = kernel.repo.find_related_media(&source.id).unwrap_or_default();
 
     let provider_label = match &resolved_provider {
         ResolvedProvider::Gemini(cfg) => format!("Gemini ({})", cfg.director_model),
@@ -256,7 +262,8 @@ pub async fn start_clip_analysis(
         ffmpeg_bin,
         ffprobe_bin,
         resolved_provider,
-        transcript,
+        resolved_transcript,
+        related_assets,
         req,
         cancel,
     ));
@@ -297,7 +304,8 @@ async fn execute_analysis_task(
     ffmpeg_bin: PathBuf,
     ffprobe_bin: PathBuf,
     provider: ResolvedProvider,
-    transcript: Option<TranscriptRecord>,
+    resolved_transcript: Option<ResolvedTranscript>,
+    related_assets: Vec<MediaAsset>,
     req: AnalyzeClipsRequest,
     cancel: CancellationToken,
 ) -> AicutResult<SmartClipRun> {
@@ -322,19 +330,44 @@ async fn execute_analysis_task(
         let max_dur = req.max_duration_sec.clamp(20.0, 180.0);
         let min_dur = req.min_duration_sec.clamp(10.0, max_dur);
         let max_clips = req.max_clips.clamp(1, 15);
+        let transcript: Option<TranscriptRecord> =
+            resolved_transcript.as_ref().map(|rt| rt.transcript.clone());
+
+        let tr_note = match &resolved_transcript {
+            Some(rt) => format!(
+                "vinculada ({} falas, origem: {}, id: {})",
+                rt.transcript.segments.len(),
+                rt.source,
+                rt.transcript.id
+            ),
+            None => "nao encontrada na Biblioteca (analise puramente visual/audio)".to_string(),
+        };
 
         kernel.jobs.append_log(
             &job_id,
             format!(
-                "Analisando '{}' ({duration_sec:.1}s) | max {max_dur:.0}s | transcricao: {}",
+                "Analisando '{}' [video_id: {}] ({duration_sec:.1}s) | max {max_dur:.0}s | arquivos vinculados na Biblioteca: {} | transcricao: {tr_note}",
                 source.title,
-                if transcript.is_some() {
-                    "vinculada (snap por palavra ativo)"
-                } else {
-                    "nao encontrada (analise puramente visual/audio)"
-                }
+                source.id,
+                related_assets.len()
             ),
         );
+
+        // Enrich editorial brief with Library lineage metadata (video ID, URL, already generated clips)
+        let mut enriched_description = req.description.trim().to_string();
+        let existing_shorts: Vec<String> = related_assets
+            .iter()
+            .filter(|a| a.id != source.id && a.tags.iter().any(|t| t == "short" || t == "ai-clip"))
+            .map(|a| a.title.clone())
+            .take(8)
+            .collect();
+        if !existing_shorts.is_empty() {
+            enriched_description.push_str(&format!(
+                "\n[CONTEXTO DA BIBLIOTECA — video_id: {} | Shorts ja gerados anteriormente para este video (evite repetir exatamente os mesmos momentos): {}]",
+                source.id,
+                existing_shorts.join("; ")
+            ));
+        }
 
         let (provider_name, model_id, raw_clips) = match provider {
             ResolvedProvider::Gemini(ref cfg) => {
@@ -345,7 +378,7 @@ async fn execute_analysis_task(
                     &video_path,
                     duration_sec,
                     transcript.as_ref(),
-                    &req.description,
+                    &enriched_description,
                     max_dur,
                     min_dur,
                     max_clips,
@@ -373,7 +406,7 @@ async fn execute_analysis_task(
                     &video_path,
                     duration_sec,
                     transcript.as_ref(),
-                    &req.description,
+                    &enriched_description,
                     max_dur,
                     min_dur,
                     max_clips,
@@ -465,9 +498,8 @@ pub async fn start_clip_render(
     let ffmpeg_bin = kernel.tools.resolve_tool("ffmpeg")?;
     let transcript = kernel
         .repo
-        .list_transcripts(Some(&source.id))?
-        .into_iter()
-        .next();
+        .find_best_transcript_for_media(&source.id)?
+        .map(|rt| rt.transcript);
 
     let target_indices: Vec<usize> = if let Some(ref cid) = req.clip_id {
         let idx = run

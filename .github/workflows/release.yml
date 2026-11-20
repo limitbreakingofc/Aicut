@@ -81,6 +81,11 @@ jobs:
           body: |
             ## Aicut ${{ steps.tag.outputs.name }} — Estúdio Modular AI-First para Windows 11
 
+            ### Novidades da v0.4.3 — Acesso Total à Biblioteca & Linhagem por ID do Vídeo
+            - **Resolução Automática de Transcrição em Toda a Biblioteca (`find_best_transcript_for_media`)**: a IA de Cortes Shorts agora localiza automaticamente a transcrição do vídeo em qualquer lugar da Biblioteca — pelo `media_id` exato, por mídia irmã/pai (ex.: download de áudio e vídeo do mesmo link ou mesmo ID externo `[fPQDxLwScrA]`), por referência `transcript_id`, ou lendo diretamente arquivos `.json`, `.srt` e `.vtt` vinculados na Biblioteca/disco!
+            - **Linhagem Unificada por ID (`video_id:<id>` + `parent_media_id`)**: tudo que é gerado a partir de um vídeo (legendas, timelines, transcrições e Shorts renderizados) carrega automaticamente o ID do vídeo original para que a IA e a interface identifiquem instantaneamente todos os arquivos daquele projeto.
+            - **Nova Action `clips.media_context` + Painel na UI**: mostra o `video_id`, chave externa (`yt:...`), origem da transcrição detectada e total de arquivos vinculados na Biblioteca, além de informar à IA quais Shorts já foram gerados para evitar repetições.
+
             ### Novidades da v0.4.2 — Moldura Shorts Padrão (Câmera em Cima + Conteúdo em Baixo)
             - **Moldura PNG 9:16 Integrada (`SMOKING33`) como Layout Padrão (`template_split`)**: embutida direto no Aicut com recorte transparente automático de alta precisão — **Câmera na janela superior** (`1020×582`) e **Conteúdo/Gameplay na janela inferior** (`1020×889`), com bordas arredondadas e douradas perfeitas por cima do vídeo!
             - **Suporte a qualquer Moldura PNG Personalizada**: o detector de canal alpha lê automaticamente as duas janelas transparentes de qualquer PNG 9:16 que você escolher.

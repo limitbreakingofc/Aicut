@@ -374,3 +374,22 @@ export interface SmartClipRun {
   clips: SmartClipPlan[];
   created_at: string;
 }
+
+export interface ResolvedTranscriptSummary {
+  id: string;
+  source: string;
+  language: string;
+  model_id: string;
+  segment_count: number;
+  word_count: number;
+  source_asset_id?: string | null;
+  source_file_path?: string | null;
+}
+
+export interface MediaContextInfo {
+  media: MediaAsset;
+  external_video_key?: string | null;
+  related_assets: MediaAsset[];
+  resolved_transcript?: ResolvedTranscriptSummary | null;
+  previous_runs_count: number;
+}

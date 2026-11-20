@@ -282,6 +282,7 @@ pub fn export_and_save_to_library(
             "whisper".to_string(),
             format.extension().to_string(),
             rec.language.clone(),
+            format!("video_id:{}", rec.media_id),
         ],
         notes: format!(
             "Gerado localmente por IA ({}) a partir de '{}'.",

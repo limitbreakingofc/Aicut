@@ -9,8 +9,9 @@ pub mod renderer;
 pub mod template;
 
 use aicut_core::{
-    ActionAnnotations, ActionHandler, AicutError, AicutEvent, AicutKernel, AicutModule, EmptyInput,
-    ModuleHealth, ModuleManifest, SmartClipRun, ToolDefinition, ToolInstallStrategy, TypedAction,
+    extract_external_video_key, ActionAnnotations, ActionHandler, AicutError, AicutEvent,
+    AicutKernel, AicutModule, EmptyInput, MediaAsset, ModuleHealth, ModuleManifest, SmartClipRun,
+    ToolDefinition, ToolInstallStrategy, TypedAction,
 };
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -88,6 +89,36 @@ pub struct ClipRunIdInput {
 pub struct ClipRunDeleteOutput {
     pub id: String,
     pub deleted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MediaContextInput {
+    pub media_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ResolvedTranscriptSummary {
+    pub id: String,
+    pub source: String,
+    pub language: String,
+    pub model_id: String,
+    pub segment_count: usize,
+    pub word_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_asset_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_file_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MediaContextOutput {
+    pub media: MediaAsset,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_video_key: Option<String>,
+    pub related_assets: Vec<MediaAsset>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_transcript: Option<ResolvedTranscriptSummary>,
+    pub previous_runs_count: usize,
 }
 
 fn read_clips_config(kernel: &AicutKernel) -> ClipsConfigOutput {
@@ -319,6 +350,77 @@ impl AicutModule for SmartClipsModule {
                         }
                         let cfg = read_clips_config(&ctx.kernel);
                         Ok((cfg, "Saved Smart Clips configuration".into(), vec![]))
+                    })
+                },
+            )),
+            Arc::new(TypedAction::<MediaContextInput, MediaContextOutput, _>::new(
+                "clips.media_context",
+                "smart-clips",
+                "Inspecionar Contexto Completo do Vídeo na Biblioteca",
+                "Inspect all Library files linked to a video ID (subtitles, transcripts, timelines, rendered Shorts, sibling audio/video downloads) and automatically resolve the best available transcript across the entire Library.",
+                ActionAnnotations { read_only: true, idempotent: true, ..Default::default() },
+                |ctx, input| {
+                    Box::pin(async move {
+                        let media = ctx
+                            .kernel
+                            .repo
+                            .get_media(&input.media_id)?
+                            .ok_or_else(|| {
+                                AicutError::not_found(format!(
+                                    "Media '{}' not found in Library",
+                                    input.media_id
+                                ))
+                            })?;
+                        let external_video_key = extract_external_video_key(
+                            media.source_url.as_deref(),
+                            &media.title,
+                            &media.file_name,
+                        );
+                        let related_assets = ctx.kernel.repo.find_related_media(&media.id)?;
+                        let resolved_transcript = ctx
+                            .kernel
+                            .repo
+                            .find_best_transcript_for_media(&media.id)?
+                            .map(|rt| {
+                                let word_count: usize = rt
+                                    .transcript
+                                    .segments
+                                    .iter()
+                                    .map(|s| s.words.len())
+                                    .sum();
+                                ResolvedTranscriptSummary {
+                                    id: rt.transcript.id,
+                                    source: rt.source,
+                                    language: rt.transcript.language,
+                                    model_id: rt.transcript.model_id,
+                                    segment_count: rt.transcript.segments.len(),
+                                    word_count,
+                                    source_asset_id: rt.source_asset_id,
+                                    source_file_path: rt.source_file_path,
+                                }
+                            });
+                        let previous_runs_count =
+                            ctx.kernel.repo.list_clip_runs(Some(&media.id))?.len();
+                        let summary = format!(
+                            "Video '{}' ({} related Library file(s), transcript: {})",
+                            media.title,
+                            related_assets.len(),
+                            resolved_transcript
+                                .as_ref()
+                                .map(|t| format!("{} segments via {}", t.segment_count, t.source))
+                                .unwrap_or_else(|| "none".to_string())
+                        );
+                        Ok((
+                            MediaContextOutput {
+                                media,
+                                external_video_key,
+                                related_assets,
+                                resolved_transcript,
+                                previous_runs_count,
+                            },
+                            summary,
+                            vec![],
+                        ))
                     })
                 },
             )),
