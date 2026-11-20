@@ -1,6 +1,6 @@
 # Maintainer: limitbreakingofc <https://github.com/limitbreakingofc/Aicut>
 pkgname=aicut
-pkgver=0.10.0
+pkgver=0.10.1
 pkgrel=1
 pkgdesc="Aicut — Modular AI-First Media Studio for Linux (Arch/CachyOS & NVIDIA CUDA/NVENC)"
 arch=('x86_64')
