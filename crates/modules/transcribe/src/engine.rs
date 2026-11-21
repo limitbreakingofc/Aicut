@@ -1,7 +1,7 @@
 use aicut_core::{
-    configure_linux_gpu_env_tokio, configure_tokio_command, ActorKind, AicutError, AicutEvent,
-    AicutKernel, AicutResult, JobProgress, MediaAsset, TranscriptRecord, TranscriptSegment,
-    TranscriptWord,
+    configure_linux_gpu_env_tokio, configure_tokio_command, detect_installed_ggml_backend,
+    AccelBackend, ActorKind, AicutError, AicutEvent, AicutKernel, AicutResult, JobProgress,
+    MediaAsset, TranscriptRecord, TranscriptSegment, TranscriptWord,
 };
 use chrono::Utc;
 use schemars::JsonSchema;
@@ -155,7 +155,7 @@ async fn execute_transcription_task(
     let out_prefix = tmp_dir.join("transcript");
     let out_json = tmp_dir.join("transcript.json");
 
-    let run_res: AicutResult<(TranscriptRecord, Vec<MediaAsset>)> = async {
+    let run_res: AicutResult<(TranscriptRecord, Vec<MediaAsset>, WhisperGpuTelemetry)> = async {
         // 1. Convert any video/audio file into 16kHz mono PCM WAV for whisper.cpp
         let mut ff_cmd = Command::new(&ffmpeg_bin);
         configure_tokio_command(&mut ff_cmd);
@@ -214,18 +214,38 @@ async fn execute_transcription_task(
             }
         }
 
+        let installed_backend = detect_installed_ggml_backend(&whisper_bin);
+        let host_has_gpu = kernel.hardware.recommended_accel != AccelBackend::CpuOnly;
+        let mut telemetry = WhisperGpuTelemetry::default();
+
         kernel.jobs.update_progress(
             &job_id,
             JobProgress {
                 percent: 12.0,
                 stage: "transcribing".into(),
-                message: Some(format!("Transcrevendo com {}...", req.model_id)),
+                message: Some(match installed_backend.as_deref() {
+                    Some(b) if b != "CPU" => {
+                        format!("Transcrevendo com {} na GPU ({b})...", req.model_id)
+                    }
+                    _ => format!("Transcrevendo com {}...", req.model_id),
+                }),
                 ..Default::default()
             },
         );
-        kernel
-            .jobs
-            .append_log(&job_id, format!("Executando whisper-cli ({})", whisper_bin.display()));
+        kernel.jobs.append_log(
+            &job_id,
+            format!(
+                "Executando whisper-cli ({}) · backend detectado em disco: {}",
+                whisper_bin.display(),
+                installed_backend.as_deref().unwrap_or("desconhecido")
+            ),
+        );
+        if host_has_gpu && matches!(installed_backend.as_deref(), Some("CPU")) {
+            kernel.jobs.append_log(
+                &job_id,
+                "[AVISO GPU] Binário whisper-cli atual só possui backend CPU (sem libggml-cuda.so ou libggml-vulkan.so). Atualize o whisper.cpp em Downloads -> Ferramentas para ativar aceleração por GPU.",
+            );
+        }
 
         let mut cmd = Command::new(&whisper_bin);
         configure_linux_gpu_env_tokio(&mut cmd, &whisper_bin);
@@ -243,6 +263,7 @@ async fn execute_transcription_task(
         let mut stdout_done = false;
         let mut stderr_done = false;
         let mut stderr_buf = Vec::new();
+        let mut fallback_warned = false;
 
         while !(stdout_done && stderr_done) {
             tokio::select! {
@@ -255,11 +276,13 @@ async fn execute_transcription_task(
                         Ok(Some(l)) => {
                             let trimmed = l.trim();
                             if !trimmed.is_empty() {
+                                telemetry.observe_line(trimmed);
                                 if let Some(pct) = parse_whisper_progress(trimmed) {
+                                    let dev = telemetry.active_device_label();
                                     kernel.jobs.update_progress(&job_id, JobProgress {
                                         percent: 12.0 + pct * 0.80,
                                         stage: "transcribing".into(),
-                                        message: Some(format!("Transcrevendo áudio ({pct:.0}%)...")),
+                                        message: Some(format!("Transcrevendo áudio ({dev}) — {pct:.0}%...")),
                                         ..Default::default()
                                     });
                                 } else {
@@ -275,11 +298,20 @@ async fn execute_transcription_task(
                         Ok(Some(el)) => {
                             let trimmed = el.trim();
                             if !trimmed.is_empty() {
+                                telemetry.observe_line(trimmed);
+                                if host_has_gpu && telemetry.no_gpu_found && !fallback_warned {
+                                    fallback_warned = true;
+                                    kernel.jobs.append_log(
+                                        &job_id,
+                                        "[AVISO GPU] whisper-cli reportou 'no GPU found' e fez fallback para CPU. Reinstale/atualize o whisper.cpp em Downloads -> Ferramentas para baixar o build com CUDA/Vulkan.",
+                                    );
+                                }
                                 if let Some(pct) = parse_whisper_progress(trimmed) {
+                                    let dev = telemetry.active_device_label();
                                     kernel.jobs.update_progress(&job_id, JobProgress {
                                         percent: 12.0 + pct * 0.80,
                                         stage: "transcribing".into(),
-                                        message: Some(format!("Transcrevendo áudio ({pct:.0}%)...")),
+                                        message: Some(format!("Transcrevendo áudio ({dev}) — {pct:.0}%...")),
                                         ..Default::default()
                                     });
                                 } else {
@@ -348,20 +380,33 @@ async fn execute_transcription_task(
             exported_assets.push(asset);
         }
 
-        Ok((record, exported_assets))
+        Ok((record, exported_assets, telemetry))
     }
     .await;
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
     match run_res {
-        Ok((record, exported)) => {
+        Ok((record, exported, telemetry)) => {
+            let active_device = telemetry.active_device_label();
+            let gpu_used = telemetry.gpu_used();
+            let gpu_warning = if kernel.hardware.recommended_accel != AccelBackend::CpuOnly && !gpu_used {
+                Some(
+                    "GPU detectada no sistema, mas whisper-cli executou na CPU porque o backend CUDA/Vulkan não foi carregado. Atualize o whisper.cpp em Downloads -> Ferramentas."
+                        .to_string(),
+                )
+            } else {
+                None
+            };
             kernel.jobs.complete(
                 &job_id,
                 serde_json::json!({
                     "transcript_id": record.id,
                     "segments": record.segments.len(),
                     "exported_count": exported.len(),
+                    "active_device": active_device,
+                    "gpu_used": gpu_used,
+                    "gpu_warning": gpu_warning,
                 }),
             );
             Ok((record, exported))
@@ -500,3 +545,112 @@ fn extract_words_from_tokens(seg: &Value) -> Vec<TranscriptWord> {
 pub fn check_binary_present(path: &Path) -> bool {
     path.is_file()
 }
+
+/// Parses live `whisper-cli` startup/backend logs to identify whether execution is running
+/// on a physical GPU (CUDA/Vulkan) or fell back to CPU (`no GPU found`).
+#[derive(Debug, Default, Clone)]
+pub struct WhisperGpuTelemetry {
+    pub loaded_gpu_backend: Option<String>,
+    pub gpu_device_name: Option<String>,
+    pub no_gpu_found: bool,
+}
+
+impl WhisperGpuTelemetry {
+    pub fn observe_line(&mut self, line: &str) {
+        let lower = line.to_lowercase();
+        if let Some(rest) = line.strip_prefix("load_backend: loaded ") {
+            let backend_word = rest.split_whitespace().next().unwrap_or("");
+            if !backend_word.eq_ignore_ascii_case("CPU") && !backend_word.is_empty() {
+                self.loaded_gpu_backend = Some(backend_word.to_string());
+            }
+        }
+        if lower.contains("whisper_backend_init_gpu: no gpu found") {
+            self.no_gpu_found = true;
+        } else if let Some(idx) = line.find("whisper_backend_init_gpu: using ") {
+            let rest = &line[idx + "whisper_backend_init_gpu: using ".len()..];
+            let backend = rest
+                .trim_end_matches("backend")
+                .trim()
+                .to_string();
+            if !backend.is_empty() && !backend.eq_ignore_ascii_case("CPU") {
+                self.loaded_gpu_backend = Some(backend);
+                self.no_gpu_found = false;
+            }
+        } else if let Some(idx) = line.find("whisper_backend_init_gpu: device ") {
+            let rest = &line[idx + "whisper_backend_init_gpu: device ".len()..];
+            if let Some((_, desc)) = rest.split_once(':') {
+                let desc_trimmed = desc.trim();
+                let is_cpu = desc_trimmed.to_lowercase().starts_with("cpu")
+                    || desc_trimmed.contains("(type: 0)");
+                if !is_cpu {
+                    let clean_name = desc_trimmed
+                        .split(" (type:")
+                        .next()
+                        .unwrap_or(desc_trimmed)
+                        .trim();
+                    if !clean_name.is_empty() {
+                        self.gpu_device_name = Some(clean_name.to_string());
+                        self.no_gpu_found = false;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn gpu_used(&self) -> bool {
+        !self.no_gpu_found
+            && (self.gpu_device_name.is_some() || self.loaded_gpu_backend.is_some())
+    }
+
+    pub fn active_device_label(&self) -> String {
+        if self.gpu_used() {
+            match (&self.gpu_device_name, &self.loaded_gpu_backend) {
+                (Some(dev), Some(b)) => format!("GPU: {dev} ({b})"),
+                (Some(dev), None) => format!("GPU: {dev}"),
+                (None, Some(b)) => format!("GPU ({b})"),
+                (None, None) => "GPU".to_string(),
+            }
+        } else {
+            "CPU".to_string()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn telemetry_detects_cpu_fallback_from_real_issue_log() {
+        let mut t = WhisperGpuTelemetry::default();
+        for line in [
+            "load_backend: loaded CPU backend from /home/limitbreaking/.local/share/Aicut/bin/whisper/libggml-cpu-haswell.so",
+            "whisper_init_with_params_no_state: use gpu = 1",
+            "whisper_backend_init_gpu: device 0: CPU (type: 0)",
+            "whisper_backend_init_gpu: no GPU found",
+        ] {
+            t.observe_line(line);
+        }
+        assert!(t.no_gpu_found);
+        assert!(!t.gpu_used());
+        assert_eq!(t.active_device_label(), "CPU");
+    }
+
+    #[test]
+    fn telemetry_detects_nvidia_cuda_gpu_execution() {
+        let mut t = WhisperGpuTelemetry::default();
+        for line in [
+            "load_backend: loaded CUDA backend from /home/limitbreaking/.local/share/Aicut/bin/whisper/libggml-cuda.so",
+            "load_backend: loaded CPU backend from /home/limitbreaking/.local/share/Aicut/bin/whisper/libggml-cpu-haswell.so",
+            "whisper_backend_init_gpu: device 0: NVIDIA GeForce RTX 3060 (type: 1)",
+            "whisper_backend_init_gpu: using CUDA0 backend",
+        ] {
+            t.observe_line(line);
+        }
+        assert!(!t.no_gpu_found);
+        assert!(t.gpu_used());
+        assert!(t.active_device_label().contains("NVIDIA GeForce RTX 3060"));
+        assert!(t.active_device_label().contains("CUDA"));
+    }
+}
+

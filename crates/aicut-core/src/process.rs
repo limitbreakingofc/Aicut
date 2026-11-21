@@ -41,8 +41,11 @@ pub fn build_linux_gpu_ld_library_path(bin_path: &Path, existing_host_ld: Option
         "/opt/cuda/lib64",
         "/opt/cuda/targets/x86_64-linux/lib",
         "/usr/local/cuda/lib64",
+        "/usr/local/cuda/targets/x86_64-linux/lib",
         "/usr/lib64/nvidia",
+        "/usr/lib64/nvidia-drm",
         "/usr/lib/nvidia",
+        "/usr/lib/x86_64-linux-gnu/nvidia",
     ] {
         if PathBuf::from(candidate).is_dir() {
             push_unique(candidate.to_string());

@@ -38,6 +38,6 @@ pub use process::{
     configure_linux_gpu_env_std, configure_linux_gpu_env_tokio, configure_std_command,
     configure_tokio_command,
 };
-pub use tools::{ToolDefinition, ToolInstallStrategy, ToolManager, ToolStatus};
+pub use tools::{detect_installed_ggml_backend, ToolDefinition, ToolInstallStrategy, ToolManager, ToolStatus};
 pub use ui_state::{PlayerState, UiState, UiStateStore};
 pub use workspace::WorkspaceConfig;

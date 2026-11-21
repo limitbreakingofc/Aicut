@@ -61,6 +61,12 @@ pub struct ToolStatus {
     pub managed_by_aicut: bool,
     pub recommended_build: String,
     pub hardware_note: String,
+    /// Detected active compute backend of the installed AI engine ("CUDA", "Vulkan", "CUDA + Vulkan", "CPU").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_backend: Option<String>,
+    /// True when the host has a GPU, this AI engine is installed, yet only a CPU backend was found.
+    #[serde(default)]
+    pub gpu_backend_missing: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -265,24 +271,24 @@ impl ToolManager {
                         .as_deref()
                         .map(|v| format!("CUDA {v}"))
                         .unwrap_or_else(|| "NVIDIA".to_string());
-                    let note = if self.hardware.cuda_runtime_installed {
+                    (
+                        format!("whisper.cpp Linux x64 CUDA ({cuda_label} · GPU NVIDIA)"),
                         format!(
-                            "GPU NVIDIA ({cuda_label}) + CUDA Runtime detectados: prioriza build Linux CUDA/Vulkan (ou `whisper-cli` já disponível no PATH)."
-                        )
-                    } else {
-                        format!(
-                            "GPU NVIDIA ({cuda_label}) detectada: usa Vulkan/Linux oficial ou `whisper-cli` com suporte a CUDA, se instalado."
-                        )
-                    };
-                    (format!("whisper.cpp Linux x64 ({cuda_label})"), note)
+                            "GPU NVIDIA ({cuda_label}) detectada: instala build Linux CUDA com libggml-cuda.so + runtime CUDA embutido (sem precisar instalar CUDA Toolkit)."
+                        ),
+                    )
                 }
+                ("linux-x64", AccelBackend::AmfDirectml | AccelBackend::QsvOpenvino) => (
+                    "whisper.cpp Linux x64 Vulkan (GPU)".to_string(),
+                    "GPU AMD/Intel detectada: instala build Linux Vulkan com libggml-vulkan.so para transcrição acelerada na GPU.".to_string(),
+                ),
                 ("linux-arm64", _) => (
                     "whisper.cpp Linux ARM64 Official".to_string(),
                     "Build oficial pré-compilada Linux ARM64.".to_string(),
                 ),
                 _ => (
                     "whisper.cpp Linux x64 Official".to_string(),
-                    "Build oficial pré-compilada Linux x64.".to_string(),
+                    "Build oficial pré-compilada Linux x64 (CPU).".to_string(),
                 ),
             },
             ToolInstallStrategy::LlamaCppOfficialRelease => match (tag, accel) {
@@ -302,7 +308,7 @@ impl ToolManager {
                         )
                     } else {
                         (
-                            format!("llama.cpp Linux x64 Vulkan (GPU NVIDIA {cuda_label})"),
+                            format!("llama.cpp Linux x64 CUDA (GPU NVIDIA {cuda_label})"),
                             "Prioriza CUDA com o runtime fornecido pela release quando compatível com o driver. Usa Vulkan como alternativa.".to_string(),
                         )
                     }
@@ -337,19 +343,38 @@ impl ToolManager {
 
         let (recommended_build, hardware_note) = self.recommend_build_for(&def);
         let resolved = self.resolve_binary(&def.binary_name);
-        let (installed, binary_path, managed_by_aicut, installed_version) = match resolved {
-            Some((path, managed)) => {
-                // For managed whisper.cpp or llama.cpp, read stored version marker if available
-                let marker_ver = path.parent().filter(|p| managed && *p != self.bin_dir)
-                    .and_then(|dir| std::fs::read_to_string(dir.join(".version")).ok());
-                let ver = match marker_ver {
-                    Some(v) => Some(v),
-                    None => probe_binary_version(&path, &def.version_args).await,
-                };
-                (true, Some(path.to_string_lossy().to_string()), managed, ver)
-            }
-            None => (false, None, false, None),
-        };
+        let (installed, binary_path, managed_by_aicut, installed_version, installed_backend) =
+            match resolved {
+                Some((path, managed)) => {
+                    // For managed whisper.cpp or llama.cpp, read stored version marker if available
+                    let marker_ver = path
+                        .parent()
+                        .filter(|p| managed && *p != self.bin_dir)
+                        .and_then(|dir| std::fs::read_to_string(dir.join(".version")).ok());
+                    let ver = match marker_ver {
+                        Some(v) => Some(v),
+                        None => probe_binary_version(&path, &def.version_args).await,
+                    };
+                    let backend = if matches!(def.id.as_str(), "whisper" | "llama-server") {
+                        detect_installed_ggml_backend(&path)
+                    } else {
+                        None
+                    };
+                    (
+                        true,
+                        Some(path.to_string_lossy().to_string()),
+                        managed,
+                        ver,
+                        backend,
+                    )
+                }
+                None => (false, None, false, None, None),
+            };
+
+        let gpu_backend_missing = installed
+            && matches!(def.id.as_str(), "whisper" | "llama-server")
+            && self.hardware.recommended_accel != AccelBackend::CpuOnly
+            && matches!(installed_backend.as_deref(), Some("CPU"));
 
         let latest_version = self
             .latest_cache
@@ -357,11 +382,12 @@ impl ToolManager {
             .ok()
             .and_then(|g| g.get(&def.id).cloned());
 
-        let update_available = match (&installed_version, &latest_version) {
-            (Some(inst), Some(latest)) => !versions_match(inst, latest),
-            (None, Some(_)) => true,
-            _ => false,
-        };
+        let update_available = gpu_backend_missing
+            || match (&installed_version, &latest_version) {
+                (Some(inst), Some(latest)) => !versions_match(inst, latest),
+                (None, Some(_)) => true,
+                _ => false,
+            };
 
         Ok(ToolStatus {
             id: def.id,
@@ -377,6 +403,8 @@ impl ToolManager {
             managed_by_aicut,
             recommended_build,
             hardware_note,
+            installed_backend,
+            gpu_backend_missing,
         })
     }
 
@@ -868,8 +896,7 @@ impl ToolManager {
         self.fetch_web_release_for_tag(repo, tag).await
     }
 
-    pub async fn versions(&self, tool: &str) -> AicutResult<Vec<String>> {
-        let repo = Self::release_repo(tool)?;
+    async fn versions_in_repo(&self, tool: &str, repo: &str, max_web_check: usize) -> Vec<String> {
         if let Ok(releases) = self.fetch_api_releases(repo, 30).await {
             let compatible: Vec<String> = releases
                 .iter()
@@ -877,24 +904,51 @@ impl ToolManager {
                 .filter_map(|r| r["tag_name"].as_str().map(str::to_owned))
                 .collect();
             if !compatible.is_empty() {
-                return Ok(compatible);
+                return compatible;
             }
         }
 
-        // Web fallback via releases.atom (no GitHub REST API rate limit).
-        let tags = self.fetch_web_release_tags(repo).await?;
-        if tool == "whisper" {
+        let Ok(tags) = self.fetch_web_release_tags(repo).await else {
+            return Vec::new();
+        };
+        if max_web_check > 0 {
             let mut compatible = Vec::new();
-            for tag in tags.into_iter().take(10) {
+            for tag in tags.into_iter().take(max_web_check) {
                 if let Ok(rel) = self.fetch_web_release_for_tag(repo, &tag).await {
                     if self.release_asset(tool, &rel).is_ok() {
                         compatible.push(tag);
                     }
                 }
             }
-            return Ok(compatible);
+            return compatible;
         }
-        Ok(tags)
+        tags
+    }
+
+    pub async fn versions(&self, tool: &str) -> AicutResult<Vec<String>> {
+        let repo = Self::release_repo(tool)?;
+        let mut out = Vec::new();
+        if tool == "whisper"
+            && self.hardware.platform_tag == "linux-x64"
+            && self.hardware.recommended_accel != AccelBackend::CpuOnly
+        {
+            out.extend(
+                self.versions_in_repo("whisper", "limitbreakingofc/Aicut", 6)
+                    .await,
+            );
+        }
+        let upstream_check = if tool == "whisper" { 10 } else { 0 };
+        for tag in self.versions_in_repo(tool, repo, upstream_check).await {
+            if !out.iter().any(|existing| existing == &tag) {
+                out.push(tag);
+            }
+        }
+        if out.is_empty() {
+            return Err(AicutError::not_found(format!(
+                "Nenhuma versão disponível encontrada para '{tool}'."
+            )));
+        }
+        Ok(out)
     }
 
     async fn tagged_release(&self, tool: &str, tag: &str) -> AicutResult<ResolvedDownload> {
@@ -907,6 +961,19 @@ impl ToolManager {
             || tag == ".."
         {
             return Err(AicutError::invalid_input("Informe uma tag de release válida."));
+        }
+        if tool == "whisper"
+            && self.hardware.platform_tag == "linux-x64"
+            && self.hardware.recommended_accel != AccelBackend::CpuOnly
+        {
+            if let Ok(rel) = self
+                .fetch_release_for_tag("limitbreakingofc/Aicut", tag)
+                .await
+            {
+                if let Ok(resolved) = self.release_asset("whisper", &rel) {
+                    return Ok(resolved);
+                }
+            }
         }
         let repo = Self::release_repo(tool)?;
         let release = self.fetch_release_for_tag(repo, tag).await?;
@@ -974,13 +1041,13 @@ impl ToolManager {
         })
     }
 
-    async fn resolve_latest_from_repo(
+    async fn resolve_latest_from_specific_repo(
         &self,
         tool: &str,
+        repo: &str,
         per_page: usize,
         prefer_tag: Option<fn(&str) -> bool>,
     ) -> AicutResult<ResolvedDownload> {
-        let repo = Self::release_repo(tool)?;
         let api_err = match self.fetch_api_releases(repo, per_page).await {
             Ok(releases) => {
                 for rel in &releases {
@@ -1039,6 +1106,17 @@ impl ToolManager {
         ))
     }
 
+    async fn resolve_latest_from_repo(
+        &self,
+        tool: &str,
+        per_page: usize,
+        prefer_tag: Option<fn(&str) -> bool>,
+    ) -> AicutResult<ResolvedDownload> {
+        let repo = Self::release_repo(tool)?;
+        self.resolve_latest_from_specific_repo(tool, repo, per_page, prefer_tag)
+            .await
+    }
+
     async fn resolve_ytdlp_release(&self) -> AicutResult<ResolvedDownload> {
         if let Ok(resolved) = self.resolve_latest_from_repo("yt-dlp", 10, None).await {
             return Ok(resolved);
@@ -1083,14 +1161,26 @@ impl ToolManager {
         })
     }
 
-    /// Queries the latest releases of `ggml-org/whisper.cpp` (skipping source-only tags)
-    /// and picks the optimal Linux binary archive for the host CPU/GPU profile.
+    /// Resolves the optimal `whisper.cpp` Linux binary for the host hardware:
+    /// on Linux x64 GPU machines, prioritizes Aicut's GPU-compiled releases (CUDA with bundled
+    /// runtime for NVIDIA, Vulkan for AMD/Intel) from `limitbreakingofc/Aicut` because upstream
+    /// `ggml-org/whisper.cpp` only publishes CPU-only Linux builds; falls back to upstream.
     async fn resolve_whisper_release(&self) -> AicutResult<ResolvedDownload> {
+        if self.hardware.platform_tag == "linux-x64"
+            && self.hardware.recommended_accel != AccelBackend::CpuOnly
+        {
+            if let Ok(resolved) = self
+                .resolve_latest_from_specific_repo("whisper", "limitbreakingofc/Aicut", 10, None)
+                .await
+            {
+                return Ok(resolved);
+            }
+        }
         self.resolve_latest_from_repo("whisper", 15, None).await
     }
 
     /// Queries the latest releases of `ggml-org/llama.cpp` and picks the highest-quality
-    /// Linux GPU/CPU binary archive (CUDA when runtime is present, Vulkan for out-of-the-box NVIDIA/AMD/Intel GPU, or CPU fallback).
+    /// Linux GPU/CPU binary archive (CUDA when runtime is present or bundled, Vulkan for out-of-the-box NVIDIA/AMD/Intel GPU, or CPU fallback).
     async fn resolve_llama_release(&self) -> AicutResult<ResolvedDownload> {
         self.resolve_latest_from_repo("llama-server", 10, None).await
     }
@@ -1162,6 +1252,29 @@ impl ToolManager {
     }
 }
 
+/// Inspects the directory containing an installed `whisper-cli` or `llama-server` binary
+/// to detect which ggml compute backend shared libraries are actually present on disk.
+pub fn detect_installed_ggml_backend(binary_path: &Path) -> Option<String> {
+    let dir = binary_path.parent()?;
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut has_cuda = false;
+    let mut has_vulkan = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        if name.starts_with("libggml-cuda.so") {
+            has_cuda = true;
+        } else if name.starts_with("libggml-vulkan.so") {
+            has_vulkan = true;
+        }
+    }
+    match (has_cuda, has_vulkan) {
+        (true, true) => Some("CUDA + Vulkan".to_string()),
+        (true, false) => Some("CUDA".to_string()),
+        (false, true) => Some("Vulkan".to_string()),
+        (false, false) => Some("CPU".to_string()),
+    }
+}
+
 /// Extracts `(major, minor)` CUDA version from a release asset filename (e.g.
 /// `whisper-bin-win-cuda-13.4.0-x64.zip` -> `(13, 4)`, `whisper-cublas-12.4.0-bin-x64.zip` -> `(12, 4)`).
 pub fn parse_cuda_version_from_asset(filename: &str) -> Option<(u32, u32)> {
@@ -1183,6 +1296,8 @@ pub fn parse_cuda_version_from_asset(filename: &str) -> Option<(u32, u32)> {
 
 /// Picks the optimal `whisper.cpp` Linux binary asset from a GitHub release's asset list based on
 /// detected GPU hardware, CUDA driver version, and whether local CUDA runtime libraries exist.
+/// Self-contained `whisper-bin-linux-cuda-*` builds bundle `libcudart`/`libcublas` directly and
+/// run on any NVIDIA driver supporting CUDA >= build version without requiring a local CUDA Toolkit.
 pub fn select_best_whisper_asset(
     assets: &[serde_json::Value],
     platform_tag: &str,
@@ -1194,6 +1309,9 @@ pub fn select_best_whisper_asset(
         .iter()
         .filter_map(|a| {
             let name = a.get("name")?.as_str()?.to_string();
+            if !name.to_lowercase().starts_with("whisper") {
+                return None;
+            }
             let url = a.get("browser_download_url")?.as_str()?.to_string();
             Some((name, url))
         })
@@ -1221,8 +1339,10 @@ pub fn select_best_whisper_asset(
                 let lower = n.to_lowercase();
                 let is_archive = lower.ends_with(".tar.gz") || lower.ends_with(".zip");
                 let is_linux = lower.contains("ubuntu") || lower.contains("linux");
+                let is_self_contained = lower.starts_with("whisper-bin-linux-cuda");
                 if is_archive
                     && is_linux
+                    && (has_cuda_runtime || is_self_contained)
                     && (lower.contains(arch_token) || lower.contains("x86_64") || lower.contains("amd64"))
                     && (lower.contains("cuda") || lower.contains("cublas"))
                 {
@@ -1260,7 +1380,7 @@ pub fn select_best_whisper_asset(
                 && n.contains("arm64")
         }),
         _ => {
-            if accel == AccelBackend::CudaNvenc && has_cuda_runtime {
+            if accel == AccelBackend::CudaNvenc {
                 if let Some(m) = pick_best_linux_cuda("x64") {
                     return Some(m);
                 }
@@ -2001,6 +2121,41 @@ mod tests {
         assert!(!tm.github_api_is_blocked());
         tm.mark_github_api_rate_limited(std::time::Duration::from_secs(60));
         assert!(tm.github_api_is_blocked());
+    }
+
+    #[test]
+    fn selects_aicut_self_contained_whisper_cuda_and_vulkan_from_mixed_release_assets() {
+        let assets = vec![
+            serde_json::json!({"name": "Aicut-0.13.0-1.x86_64.rpm", "browser_download_url": "https://x/aicut.rpm"}),
+            serde_json::json!({"name": "aicut-cli-fedora-x86_64", "browser_download_url": "https://x/cli"}),
+            serde_json::json!({"name": "whisper-bin-linux-cuda-12.8-x64.tar.gz", "browser_download_url": "https://x/whisper-cuda.tar.gz"}),
+            serde_json::json!({"name": "whisper-bin-linux-vulkan-x64.tar.gz", "browser_download_url": "https://x/whisper-vulkan.tar.gz"}),
+        ];
+
+        // NVIDIA RTX 3060 with CUDA 13.5 driver WITHOUT local CUDA Toolkit still picks bundled CUDA 12.8!
+        let nv = select_best_whisper_asset(&assets, "linux-x64", AccelBackend::CudaNvenc, Some((13, 5)), false).unwrap();
+        assert_eq!(nv.0, "whisper-bin-linux-cuda-12.8-x64.tar.gz");
+
+        // AMD/Intel GPU picks Vulkan
+        let amd = select_best_whisper_asset(&assets, "linux-x64", AccelBackend::AmfDirectml, None, false).unwrap();
+        assert_eq!(amd.0, "whisper-bin-linux-vulkan-x64.tar.gz");
+        let intel = select_best_whisper_asset(&assets, "linux-x64", AccelBackend::QsvOpenvino, None, false).unwrap();
+        assert_eq!(intel.0, "whisper-bin-linux-vulkan-x64.tar.gz");
+    }
+
+    #[test]
+    fn detects_installed_ggml_backend_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("whisper-cli");
+        std::fs::write(&bin, b"").unwrap();
+        std::fs::write(tmp.path().join("libggml-cpu-haswell.so"), b"").unwrap();
+        assert_eq!(detect_installed_ggml_backend(&bin).as_deref(), Some("CPU"));
+
+        std::fs::write(tmp.path().join("libggml-vulkan.so"), b"").unwrap();
+        assert_eq!(detect_installed_ggml_backend(&bin).as_deref(), Some("Vulkan"));
+
+        std::fs::write(tmp.path().join("libggml-cuda.so"), b"").unwrap();
+        assert_eq!(detect_installed_ggml_backend(&bin).as_deref(), Some("CUDA + Vulkan"));
     }
 
     #[tokio::test]

@@ -309,6 +309,43 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
 
   const engineMissing = (!whisperTool?.installed || !ffmpegTool?.installed) && tools.length > 0;
 
+  const [upgradingWhisper, setUpgradingWhisper] = useState(false);
+
+  const activeDeviceBadge = useMemo(() => {
+    if (!whisperTool?.installed) return null;
+    const backend = whisperTool.installed_backend;
+    const gpuName = hardware?.gpus?.[0]?.name;
+    if (backend && backend !== "CPU") {
+      return {
+        tone: "success" as const,
+        label: gpuName ? `GPU: ${gpuName} (${backend})` : `GPU (${backend})`,
+      };
+    }
+    if (whisperTool.gpu_backend_missing) {
+      return {
+        tone: "warning" as const,
+        label: "CPU (fallback — sem backend GPU)",
+      };
+    }
+    return {
+      tone: "neutral" as const,
+      label: "CPU",
+    };
+  }, [whisperTool, hardware]);
+
+  async function handleInstallGpuWhisper() {
+    setUpgradingWhisper(true);
+    try {
+      await runAction("tools.install", { tool_id: "whisper", version: null });
+      await onRefreshTools();
+      onNotify("success", "whisper.cpp atualizado", "Motor de transcrição com suporte a GPU instalado.");
+    } catch (e) {
+      onNotify("error", "Falha ao atualizar whisper.cpp", (e as Error).message);
+    } finally {
+      setUpgradingWhisper(false);
+    }
+  }
+
   return (
     <>
       <Tabs
@@ -339,6 +376,32 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
         </Callout>
       )}
 
+      {whisperTool?.gpu_backend_missing && (
+        <Callout
+          tone="warning"
+          title="whisper-cli está rodando apenas na CPU (sem backend GPU)"
+          actions={
+            <>
+              <button
+                type="button"
+                className="btn btn-sm btn-primary"
+                disabled={upgradingWhisper}
+                onClick={() => void handleInstallGpuWhisper()}
+              >
+                <BusyIcon busy={upgradingWhisper} icon={Download} />
+                Atualizar whisper.cpp para GPU
+              </button>
+              <button type="button" className="btn btn-sm" onClick={() => onNavigate("downloads")}>
+                Downloads
+              </button>
+            </>
+          }
+        >
+          GPU detectada ({gpuSummary}), mas o binário atual em <code>bin/whisper/</code> não contém{" "}
+          <code>libggml-cuda.so</code> nem <code>libggml-vulkan.so</code>. Clique para instalar o build com GPU.
+        </Callout>
+      )}
+
       {/* ================================================================ */}
       {/* NEW TRANSCRIPTION                                                */}
       {/* ================================================================ */}
@@ -348,6 +411,11 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
             <Panel
               title="Transcrever vídeo / áudio"
               icon={Mic}
+              actions={
+                activeDeviceBadge ? (
+                  <Badge tone={activeDeviceBadge.tone}>{activeDeviceBadge.label}</Badge>
+                ) : undefined
+              }
               footer={
                 <>
                   <span className="secondary text-sm">

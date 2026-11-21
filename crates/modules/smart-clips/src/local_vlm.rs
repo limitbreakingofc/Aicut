@@ -27,6 +27,8 @@ struct LlamaServerGuard {
     child: Child,
     base_url: String,
     stderr_log: PathBuf,
+    active_device: String,
+    gpu_layers: u32,
 }
 
 impl Drop for LlamaServerGuard {
@@ -51,13 +53,40 @@ fn pick_context_size(hw: &HardwareProfile) -> usize {
     8_192
 }
 
+fn pick_preferred_gpu_device(list_devices_output: &str, accel: AccelBackend) -> Option<(String, String)> {
+    let mut cuda_dev: Option<(String, String)> = None;
+    let mut vulkan_dev: Option<(String, String)> = None;
+    for line in list_devices_output.lines() {
+        let trimmed = line.trim();
+        let Some((name, desc)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let dev_id = name.trim();
+        let dev_desc = desc.trim();
+        if let Some(idx) = dev_id.strip_prefix("CUDA") {
+            if !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) && cuda_dev.is_none() {
+                cuda_dev = Some((dev_id.to_string(), dev_desc.to_string()));
+            }
+        } else if let Some(idx) = dev_id.strip_prefix("Vulkan") {
+            if !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) && vulkan_dev.is_none() {
+                vulkan_dev = Some((dev_id.to_string(), dev_desc.to_string()));
+            }
+        }
+    }
+    match accel {
+        AccelBackend::CudaNvenc => cuda_dev.or(vulkan_dev),
+        AccelBackend::AmfDirectml | AccelBackend::QsvOpenvino => vulkan_dev.or(cuda_dev),
+        _ => None,
+    }
+}
+
 impl LlamaServerGuard {
     fn spawn(
         llama_bin: &Path,
         model_path: &Path,
         mmproj_path: &Path,
         gpu_layers: u32,
-        cuda_device: Option<&str>,
+        gpu_device: Option<&(String, String)>,
         logical_cores: usize,
         ctx_size: usize,
     ) -> AicutResult<Self> {
@@ -80,7 +109,9 @@ impl LlamaServerGuard {
         let mut cmd = Command::new(llama_bin);
         configure_linux_gpu_env_std(&mut cmd, llama_bin);
         if gpu_layers > 0 {
-            if let Some(device) = cuda_device { cmd.args(["--device", device]); }
+            if let Some((device_id, _)) = gpu_device {
+                cmd.args(["--device", device_id]);
+            }
         }
         cmd.args([
             "-m",
@@ -112,10 +143,22 @@ impl LlamaServerGuard {
             ))
         })?;
 
+        let active_device = if gpu_layers > 0 {
+            match gpu_device {
+                Some((id, desc)) if !desc.is_empty() => format!("GPU: {desc} ({id})"),
+                Some((id, _)) => format!("GPU ({id})"),
+                None => "GPU".to_string(),
+            }
+        } else {
+            "CPU".to_string()
+        };
+
         Ok(Self {
             child,
             base_url: format!("http://127.0.0.1:{port}"),
             stderr_log,
+            active_device,
+            gpu_layers,
         })
     }
 
@@ -171,8 +214,9 @@ impl LlamaServerGuard {
         ))
     }
 
-    /// Spawns `llama-server` with automatic VRAM resilience: tries optimal GPU offload first,
-    /// then lighter partial GPU offload, and finally CPU-only if GPU VRAM is temporarily busy.
+    /// Spawns `llama-server` with maximum GPU offload first (CUDA or Vulkan):
+    /// keeps 100% of model + vision layers on GPU (`-ngl 99`) even if context size must be reduced,
+    /// before ever falling back to partial GPU offload or CPU-only.
     async fn spawn_ready_with_fallback(
         llama_bin: &Path,
         model_path: &Path,
@@ -183,33 +227,50 @@ impl LlamaServerGuard {
         http: &reqwest::Client,
         cancel: &CancellationToken,
     ) -> AicutResult<Self> {
-        let mut cuda_device = None;
-        if accel == AccelBackend::CudaNvenc {
+        let mut gpu_device = None;
+        if accel != AccelBackend::CpuOnly {
             let mut probe = tokio::process::Command::new(llama_bin);
             aicut_core::configure_linux_gpu_env_tokio(&mut probe, llama_bin);
             probe.arg("--list-devices").kill_on_drop(true);
-            if let Ok(Ok(output)) = tokio::time::timeout(std::time::Duration::from_secs(5), probe.output()).await {
-                let devices = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-                cuda_device = devices.lines().filter_map(|line| line.trim().split_once(':'))
-                    .map(|(name, _)| name).find(|name| name.strip_prefix("CUDA")
-                        .is_some_and(|idx| !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()))).map(str::to_owned);
+            if let Ok(Ok(output)) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), probe.output()).await
+            {
+                let devices = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                gpu_device = pick_preferred_gpu_device(&devices, accel);
             }
         }
-        let attempts: Vec<(u32, usize)> = match accel {
+        let mut attempts: Vec<(u32, usize)> = match accel {
             AccelBackend::CpuOnly => vec![(0, preferred_ctx.min(8_192))],
-            _ => vec![
-                (99, preferred_ctx),
-                (24, preferred_ctx.min(8_192)),
-                (0, preferred_ctx.min(6_144)),
-            ],
+            _ => {
+                let mut list = vec![(99, preferred_ctx)];
+                if preferred_ctx > 8_192 {
+                    list.push((99, 8_192));
+                }
+                list.push((32, preferred_ctx.min(8_192)));
+                list.push((0, preferred_ctx.min(6_144)));
+                list
+            }
         };
+        attempts.dedup();
 
         let mut last_err: Option<AicutError> = None;
         for (ngl, ctx) in attempts {
             if cancel.is_cancelled() {
                 return Err(AicutError::cancelled("Inicializacao do llama-server cancelada."));
             }
-            match Self::spawn(llama_bin, model_path, mmproj_path, ngl, cuda_device.as_deref(), logical_cores, ctx) {
+            match Self::spawn(
+                llama_bin,
+                model_path,
+                mmproj_path,
+                ngl,
+                gpu_device.as_ref(),
+                logical_cores,
+                ctx,
+            ) {
                 Ok(mut guard) => match guard.wait_ready(http, cancel).await {
                     Ok(()) => return Ok(guard),
                     Err(e) => {
@@ -324,6 +385,20 @@ pub async fn analyze_with_local_vlm(
         cancel,
     )
     .await?;
+
+    kernel.jobs.append_log(
+        job_id,
+        format!(
+            "llama-server pronto em {} (-ngl {})",
+            server.active_device, server.gpu_layers
+        ),
+    );
+    if kernel.hardware.recommended_accel != AccelBackend::CpuOnly && server.gpu_layers == 0 {
+        kernel.jobs.append_log(
+            job_id,
+            "[AVISO GPU] llama-server precisou fazer fallback para CPU (VRAM ocupada ou backend CUDA/Vulkan ausente). Verifique a instalação em Downloads -> Ferramentas.",
+        );
+    }
 
     // 10-minute windows with 3-minute overlap keep local context sharp & dense even on multi-hour lives
     let windows = plan_windows(duration_sec, 600.0, 180.0);

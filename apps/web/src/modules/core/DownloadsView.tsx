@@ -61,7 +61,7 @@ export function DownloadsView({ jobs, tools, workspace, refreshTools }: Props) {
       {window.__TAURI_INTERNALS__?.invoke && <button className="btn btn-sm" onClick={() => window.__TAURI_INTERNALS__?.invoke?.("open_download_folder", {tools:group === "Ferramentas"}).catch(e => setMessage(String(e)))}>Abrir pasta</button>}</div>
     {group === "Ferramentas" && <button className="btn btn-sm" disabled={!!busy} onClick={() => execute("tools.check_updates")}>Verificar atualizações</button>}
     {group === "Ferramentas" && visibleTools.map(t => <div key={t.id} className="inset row row-between wrap gap-sm">
-      <div><strong>{t.display_name}</strong><div className="secondary text-xs">{t.installed ? [t.managed_by_aicut ? "Aicut" : "Sistema", t.installed_version, t.binary_path].filter(Boolean).join(" · ") : "Disponível"}{t.update_available && ' · Atualização disponível'}</div><small>{t.recommended_build}</small></div>
+      <div><strong>{t.display_name}</strong><div className="secondary text-xs">{t.installed ? [t.managed_by_aicut ? "Aicut" : "Sistema", t.installed_version, t.installed_backend && `Backend: ${t.installed_backend}`, t.binary_path].filter(Boolean).join(" · ") : "Disponível"}{t.gpu_backend_missing ? " · Sem backend GPU (clique em Atualizar)" : t.update_available && " · Atualização disponível"}</div><small>{t.recommended_build}</small></div>
       <div className="row wrap gap-xs"><datalist id={"versions-"+t.id}>{tags[t.id]?.map(tag => <option key={tag} value={tag} />)}</datalist><input list={"versions-"+t.id} onFocus={async () => {
         if (tags[t.id]) return;
         try {

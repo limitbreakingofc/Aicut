@@ -151,6 +151,8 @@ pub fn detect_linux_cuda_runtime() -> bool {
         "/opt/cuda/lib64",
         "/opt/cuda/targets/x86_64-linux/lib",
         "/usr/local/cuda/lib64",
+        "/usr/local/cuda/targets/x86_64-linux/lib",
+        "/usr/lib64/nvidia",
         "/usr/lib",
         "/usr/lib64",
         "/usr/lib/x86_64-linux-gnu",
@@ -167,6 +169,18 @@ pub fn detect_linux_cuda_runtime() -> bool {
         }
     }
     false
+}
+
+/// Checks whether the NVIDIA user-space CUDA driver (`libcuda.so.1`) is present on Linux.
+pub fn detect_linux_nvidia_driver() -> bool {
+    let paths = [
+        "/usr/lib64/libcuda.so.1",
+        "/usr/lib64/nvidia/libcuda.so.1",
+        "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+        "/usr/lib/libcuda.so.1",
+        "/usr/lib/nvidia/libcuda.so.1",
+    ];
+    paths.iter().any(|p| std::path::Path::new(p).exists())
 }
 
 /// Checks whether a Linux Vulkan ICD / loader is available.
@@ -248,6 +262,16 @@ fn detect_gpus() -> Vec<GpuInfo> {
                 }
             }
         }
+    }
+
+    // 3. Fallback: if NVIDIA CUDA driver library (`libcuda.so.1`) is installed on Linux.
+    if !gpus.iter().any(|g| g.vendor == GpuVendor::Nvidia) && detect_linux_nvidia_driver() {
+        gpus.push(GpuInfo {
+            name: "NVIDIA GPU (CUDA)".to_string(),
+            vendor: GpuVendor::Nvidia,
+            vram_mb: None,
+            driver_version: None,
+        });
     }
 
     gpus

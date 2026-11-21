@@ -66,6 +66,143 @@ jobs:
           cp apps/desktop/src-tauri/target/release/bundle/rpm/*.rpm release-assets/
           ls -lh release-assets
 
+      - name: Upload Fedora release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: fedora-assets
+          path: release-assets/*
+
+  build-whisper-cuda:
+    name: Build whisper.cpp Linux x64 (CUDA 12.8 + bundled runtime)
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:12.8.2-devel-ubuntu24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git build-essential cmake ninja-build ca-certificates
+
+      - name: Clone whisper.cpp b5907
+        run: |
+          git clone --depth 1 --branch b5907 https://github.com/ggml-org/whisper.cpp.git /tmp/whisper.cpp
+
+      - name: Build whisper.cpp with CUDA backend
+        run: |
+          cmake -S /tmp/whisper.cpp -B /tmp/whisper-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_CUDA=ON \
+            -DGGML_CUDA_NCCL=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES="75;80-virtual;86;89;90-virtual" \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_EXAMPLES=ON \
+            -DWHISPER_BUILD_SERVER=ON \
+            -DWHISPER_BUILD_IS_DEV=OFF
+          cmake --build /tmp/whisper-build --config Release -j "$(nproc)"
+
+      - name: Package whisper-bin-linux-cuda-12.8-x64.tar.gz
+        run: |
+          mkdir -p /tmp/whisper-pkg release-assets
+          cp -P /tmp/whisper-build/bin/whisper-cli /tmp/whisper-pkg/
+          cp -P /tmp/whisper-build/bin/whisper-server /tmp/whisper-pkg/
+          find /tmp/whisper-build/bin -maxdepth 1 \( -name '*.so' -o -name '*.so.*' \) -exec cp -P {} /tmp/whisper-pkg/ \;
+          cp -L /usr/local/cuda/lib64/libcudart.so.12 /tmp/whisper-pkg/
+          cp -L /usr/local/cuda/lib64/libcublas.so.12 /tmp/whisper-pkg/
+          cp -L /usr/local/cuda/lib64/libcublasLt.so.12 /tmp/whisper-pkg/
+          cp /tmp/whisper.cpp/LICENSE /tmp/whisper-pkg/
+          ls -lh /tmp/whisper-pkg
+          test -f /tmp/whisper-pkg/whisper-cli
+          test -f /tmp/whisper-pkg/libggml-cuda.so
+          test -f /tmp/whisper-pkg/libcudart.so.12
+          tar -czf release-assets/whisper-bin-linux-cuda-12.8-x64.tar.gz \
+            --transform "s,^\.,whisper-bin-linux-cuda-12.8-x64," \
+            -C /tmp/whisper-pkg .
+          ls -lh release-assets
+
+      - name: Upload whisper CUDA asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-cuda-asset
+          path: release-assets/whisper-bin-linux-cuda-12.8-x64.tar.gz
+
+  build-whisper-vulkan:
+    name: Build whisper.cpp Linux x64 (Vulkan GPU)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install Vulkan build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git build-essential cmake ninja-build glslc libvulkan-dev spirv-headers
+
+      - name: Clone whisper.cpp b5907
+        run: |
+          git clone --depth 1 --branch b5907 https://github.com/ggml-org/whisper.cpp.git /tmp/whisper.cpp
+
+      - name: Build whisper.cpp with Vulkan backend
+        run: |
+          cmake -S /tmp/whisper.cpp -B /tmp/whisper-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_VULKAN=ON \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_EXAMPLES=ON \
+            -DWHISPER_BUILD_SERVER=ON \
+            -DWHISPER_BUILD_IS_DEV=OFF
+          cmake --build /tmp/whisper-build --config Release -j "$(nproc)"
+
+      - name: Package whisper-bin-linux-vulkan-x64.tar.gz
+        run: |
+          mkdir -p /tmp/whisper-pkg release-assets
+          cp -P /tmp/whisper-build/bin/whisper-cli /tmp/whisper-pkg/
+          cp -P /tmp/whisper-build/bin/whisper-server /tmp/whisper-pkg/
+          find /tmp/whisper-build/bin -maxdepth 1 \( -name '*.so' -o -name '*.so.*' \) -exec cp -P {} /tmp/whisper-pkg/ \;
+          cp /tmp/whisper.cpp/LICENSE /tmp/whisper-pkg/
+          ls -lh /tmp/whisper-pkg
+          test -f /tmp/whisper-pkg/whisper-cli
+          test -f /tmp/whisper-pkg/libggml-vulkan.so
+          tar -czf release-assets/whisper-bin-linux-vulkan-x64.tar.gz \
+            --transform "s,^\.,whisper-bin-linux-vulkan-x64," \
+            -C /tmp/whisper-pkg .
+          ls -lh release-assets
+
+      - name: Upload whisper Vulkan asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-vulkan-asset
+          path: release-assets/whisper-bin-linux-vulkan-x64.tar.gz
+
+  publish-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-24.04
+    needs: [build-fedora, build-whisper-cuda, build-whisper-vulkan]
+    steps:
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: List collected release assets
+        run: ls -lh release-assets
+
       - name: Determine Release Tag
         id: tag
         env:
@@ -83,11 +220,12 @@ jobs:
         with:
           tag_name: ${{ steps.tag.outputs.name }}
           target_commitish: ${{ github.sha }}
-          name: "Aicut ${{ steps.tag.outputs.name }} (Fedora x86_64)"
+          name: "Aicut ${{ steps.tag.outputs.name }} (Fedora x86_64 · GPU CUDA/Vulkan)"
           generate_release_notes: true
           body: |
             Desktop para Fedora 44 e 45 (x86_64). Instale o RPM com DNF.
-            O binário aicut-cli-fedora-x86_64 fornece a CLI e o servidor MCP.
+            O binário `aicut-cli-fedora-x86_64` fornece a CLI e o servidor MCP.
+            Inclui builds nativos Linux x64 do `whisper.cpp` com **CUDA 12.8 (runtime embutido)** e **Vulkan** para aceleração real na GPU (NVIDIA / AMD / Intel).
           fail_on_unmatched_files: true
           files: |
             release-assets/*

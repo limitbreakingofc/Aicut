@@ -260,6 +260,8 @@ export interface ToolStatus {
   managed_by_aicut: boolean;
   recommended_build: string;
   hardware_note: string;
+  installed_backend?: string;
+  gpu_backend_missing?: boolean;
 }
 
 export interface ModuleManifest {
