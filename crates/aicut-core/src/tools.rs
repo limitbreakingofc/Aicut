@@ -83,12 +83,28 @@ pub enum ArchiveKind {
     LlamaTarGz,
 }
 
+const RELEASE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+const DEFAULT_RATE_LIMIT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(900);
+
+struct CachedReleases {
+    fetched_at: std::time::Instant,
+    releases: Vec<serde_json::Value>,
+}
+
+struct CachedTag {
+    fetched_at: std::time::Instant,
+    release: serde_json::Value,
+}
+
 pub struct ToolManager {
     mutation: tokio::sync::Mutex<()>,
     bin_dir: PathBuf,
     hardware: HardwareProfile,
     definitions: RwLock<HashMap<String, ToolDefinition>>,
     latest_cache: RwLock<HashMap<String, String>>,
+    releases_cache: RwLock<HashMap<String, CachedReleases>>,
+    tag_cache: RwLock<HashMap<(String, String), CachedTag>>,
+    github_api_blocked_until: RwLock<Option<std::time::Instant>>,
     events: Arc<EventBus>,
     jobs: Arc<JobManager>,
     http: reqwest::Client,
@@ -102,7 +118,12 @@ impl ToolManager {
         jobs: Arc<JobManager>,
     ) -> Self {
         let http = reqwest::Client::builder()
-            .user_agent("Aicut/0.2.0 (+https://github.com/limitbreakingofc/Aicut)")
+            .user_agent(concat!(
+                "Aicut/",
+                env!("CARGO_PKG_VERSION"),
+                " (+https://github.com/limitbreakingofc/Aicut)"
+            ))
+            .connect_timeout(std::time::Duration::from_secs(20))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -112,6 +133,9 @@ impl ToolManager {
             hardware,
             definitions: RwLock::new(HashMap::new()),
             latest_cache: RwLock::new(HashMap::new()),
+            releases_cache: RwLock::new(HashMap::new()),
+            tag_cache: RwLock::new(HashMap::new()),
+            github_api_blocked_until: RwLock::new(None),
             events,
             jobs,
             http,
@@ -590,7 +614,7 @@ impl ToolManager {
 
     fn release_repo(tool: &str) -> AicutResult<&'static str> {
         Ok(match tool {
-            "ffmpeg" => "BtbN/FFmpeg-Builds",
+            "ffmpeg" => "FFmpeg-Builds/FFmpeg-Builds",
             "yt-dlp" => "yt-dlp/yt-dlp",
             "whisper" => "ggml-org/whisper.cpp",
             "llama-server" => "ggml-org/llama.cpp",
@@ -598,218 +622,477 @@ impl ToolManager {
         })
     }
 
+    fn github_api_is_blocked(&self) -> bool {
+        if let Ok(guard) = self.github_api_blocked_until.read() {
+            if let Some(until) = *guard {
+                return std::time::Instant::now() < until;
+            }
+        }
+        false
+    }
+
+    fn mark_github_api_rate_limited(&self, cooldown: std::time::Duration) {
+        if let Ok(mut guard) = self.github_api_blocked_until.write() {
+            *guard = Some(std::time::Instant::now() + cooldown);
+        }
+    }
+
+    /// Calls a GitHub REST API endpoint with status verification, optional `GITHUB_TOKEN`/`GH_TOKEN`
+    /// authentication, and automatic rate-limit cooldown detection so callers can seamlessly fall back
+    /// to `github.com` web feeds when unauthenticated quota (60 req/h) is exhausted.
+    async fn github_api_get_json(&self, url: &str) -> Result<serde_json::Value, String> {
+        if self.github_api_is_blocked() {
+            return Err("GitHub API rate limit ativo; usando fallback web.".to_string());
+        }
+
+        let mut req = self
+            .http
+            .get(url)
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28");
+
+        if let Some(token) = std::env::var("GITHUB_TOKEN")
+            .ok()
+            .or_else(|| std::env::var("GH_TOKEN").ok())
+            .filter(|t| !t.trim().is_empty())
+        {
+            req = req.bearer_auth(token.trim());
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("Falha de rede ao consultar {url}: {e}"))?;
+
+        let status = resp.status();
+        let remaining = resp
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let reset_header = resp
+            .headers()
+            .get("x-ratelimit-reset")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let is_rate_limited = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || (status == reqwest::StatusCode::FORBIDDEN
+                    && (remaining.as_deref() == Some("0")
+                        || body.to_lowercase().contains("rate limit")));
+            if is_rate_limited {
+                let cooldown = parse_rate_limit_cooldown(reset_header.as_deref());
+                self.mark_github_api_rate_limited(cooldown);
+                return Err(format!(
+                    "Limite da API do GitHub atingido (HTTP {})",
+                    status.as_u16()
+                ));
+            }
+            let snippet: String = body.chars().take(180).collect();
+            return Err(format!(
+                "GitHub API retornou HTTP {} para {url}: {snippet}",
+                status.as_u16()
+            ));
+        }
+
+        resp.json::<serde_json::Value>()
+            .await
+            .map_err(|e| format!("Resposta JSON inválida da API do GitHub ({url}): {e}"))
+    }
+
+    fn cached_releases(&self, repo: &str) -> Option<Vec<serde_json::Value>> {
+        let guard = self.releases_cache.read().ok()?;
+        let entry = guard.get(repo)?;
+        if entry.fetched_at.elapsed() < RELEASE_CACHE_TTL {
+            Some(entry.releases.clone())
+        } else {
+            None
+        }
+    }
+
+    fn store_releases_cache(&self, repo: &str, releases: Vec<serde_json::Value>) {
+        if let Ok(mut guard) = self.releases_cache.write() {
+            guard.insert(
+                repo.to_string(),
+                CachedReleases {
+                    fetched_at: std::time::Instant::now(),
+                    releases,
+                },
+            );
+        }
+    }
+
+    fn cached_tag_release(&self, repo: &str, tag: &str) -> Option<serde_json::Value> {
+        if let Ok(guard) = self.tag_cache.read() {
+            if let Some(entry) = guard.get(&(repo.to_string(), tag.to_string())) {
+                if entry.fetched_at.elapsed() < RELEASE_CACHE_TTL {
+                    return Some(entry.release.clone());
+                }
+            }
+        }
+        if let Some(releases) = self.cached_releases(repo) {
+            if let Some(found) = releases
+                .into_iter()
+                .find(|r| r.get("tag_name").and_then(|v| v.as_str()) == Some(tag))
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    fn store_tag_cache(&self, repo: &str, tag: &str, release: serde_json::Value) {
+        if let Ok(mut guard) = self.tag_cache.write() {
+            guard.insert(
+                (repo.to_string(), tag.to_string()),
+                CachedTag {
+                    fetched_at: std::time::Instant::now(),
+                    release,
+                },
+            );
+        }
+    }
+
+    /// Tries cached releases first, then GitHub REST API `/releases?per_page=...`.
+    async fn fetch_api_releases(
+        &self,
+        repo: &str,
+        per_page: usize,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        if let Some(cached) = self.cached_releases(repo) {
+            return Ok(cached);
+        }
+        let url = format!("https://api.github.com/repos/{repo}/releases?per_page={per_page}");
+        let val = self.github_api_get_json(&url).await?;
+        let list = val
+            .as_array()
+            .cloned()
+            .ok_or_else(|| format!("Payload inesperado da API do GitHub para {repo} (esperado array)."))?;
+        self.store_releases_cache(repo, list.clone());
+        Ok(list)
+    }
+
+    /// Fetches recent release tags directly from `https://github.com/{repo}/releases.atom`
+    /// (does NOT use `api.github.com` and is immune to the 60 req/h unauthenticated API limit).
+    async fn fetch_web_release_tags(&self, repo: &str) -> AicutResult<Vec<String>> {
+        let url = format!("https://github.com/{repo}/releases.atom");
+        let resp = self
+            .http
+            .get(&url)
+            .header(reqwest::header::ACCEPT, "application/atom+xml,application/xml,text/xml")
+            .send()
+            .await
+            .map_err(|e| {
+                AicutError::internal(format!(
+                    "Falha ao consultar feed de releases de {repo}: {e}"
+                ))
+            })?;
+        if !resp.status().is_success() {
+            return Err(AicutError::internal(format!(
+                "Feed de releases de {repo} retornou HTTP {}",
+                resp.status().as_u16()
+            )));
+        }
+        let xml = resp.text().await.map_err(|e| {
+            AicutError::internal(format!("Falha ao ler feed de releases de {repo}: {e}"))
+        })?;
+        let tags = parse_atom_release_tags(&xml);
+        if tags.is_empty() {
+            return Err(AicutError::not_found(format!(
+                "Nenhuma release encontrada para {repo}."
+            )));
+        }
+        Ok(tags)
+    }
+
+    /// Fetches the asset list for a specific release tag via GitHub's web `expanded_assets`
+    /// fragment (`https://github.com/{repo}/releases/expanded_assets/{tag}`), which bypasses
+    /// `api.github.com` rate limits completely.
+    async fn fetch_web_release_for_tag(
+        &self,
+        repo: &str,
+        tag: &str,
+    ) -> AicutResult<serde_json::Value> {
+        if let Some(cached) = self.cached_tag_release(repo, tag) {
+            return Ok(cached);
+        }
+        let url = format!("https://github.com/{repo}/releases/expanded_assets/{tag}");
+        let resp = self
+            .http
+            .get(&url)
+            .header(reqwest::header::ACCEPT, "text/html")
+            .send()
+            .await
+            .map_err(|e| {
+                AicutError::internal(format!(
+                    "Falha ao consultar arquivos da release '{tag}' de {repo}: {e}"
+                ))
+            })?;
+        if !resp.status().is_success() {
+            return Err(AicutError::internal(format!(
+                "Release '{tag}' de {repo} retornou HTTP {}",
+                resp.status().as_u16()
+            )));
+        }
+        let html = resp.text().await.map_err(|e| {
+            AicutError::internal(format!(
+                "Falha ao ler arquivos da release '{tag}' de {repo}: {e}"
+            ))
+        })?;
+        let assets = parse_expanded_assets_html(&html);
+        let release = serde_json::json!({
+            "tag_name": tag,
+            "assets": assets,
+        });
+        self.store_tag_cache(repo, tag, release.clone());
+        Ok(release)
+    }
+
+    async fn fetch_release_for_tag(
+        &self,
+        repo: &str,
+        tag: &str,
+    ) -> AicutResult<serde_json::Value> {
+        if let Some(cached) = self.cached_tag_release(repo, tag) {
+            return Ok(cached);
+        }
+        let api_url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
+        if let Ok(release) = self.github_api_get_json(&api_url).await {
+            if release.get("assets").and_then(|v| v.as_array()).is_some() {
+                self.store_tag_cache(repo, tag, release.clone());
+                return Ok(release);
+            }
+        }
+        self.fetch_web_release_for_tag(repo, tag).await
+    }
+
     pub async fn versions(&self, tool: &str) -> AicutResult<Vec<String>> {
         let repo = Self::release_repo(tool)?;
-        let releases: Vec<serde_json::Value> = self.http.get(format!("https://api.github.com/repos/{repo}/releases?per_page=30"))
-            .send().await.and_then(|r| r.error_for_status()).map_err(|e| AicutError::internal(e.to_string()))?
-            .json().await.map_err(|e| AicutError::internal(e.to_string()))?;
-        Ok(releases.iter().filter(|r| self.release_asset(tool, r).is_ok())
-            .filter_map(|r| r["tag_name"].as_str().map(str::to_owned)).collect())
+        if let Ok(releases) = self.fetch_api_releases(repo, 30).await {
+            let compatible: Vec<String> = releases
+                .iter()
+                .filter(|r| self.release_asset(tool, r).is_ok())
+                .filter_map(|r| r["tag_name"].as_str().map(str::to_owned))
+                .collect();
+            if !compatible.is_empty() {
+                return Ok(compatible);
+            }
+        }
+
+        // Web fallback via releases.atom (no GitHub REST API rate limit).
+        let tags = self.fetch_web_release_tags(repo).await?;
+        if tool == "whisper" {
+            let mut compatible = Vec::new();
+            for tag in tags.into_iter().take(10) {
+                if let Ok(rel) = self.fetch_web_release_for_tag(repo, &tag).await {
+                    if self.release_asset(tool, &rel).is_ok() {
+                        compatible.push(tag);
+                    }
+                }
+            }
+            return Ok(compatible);
+        }
+        Ok(tags)
     }
 
     async fn tagged_release(&self, tool: &str, tag: &str) -> AicutResult<ResolvedDownload> {
-        if tag.is_empty() || tag.len() > 100 || !tag.bytes().all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b)) || tag == "." || tag == ".." {
+        if tag.is_empty()
+            || tag.len() > 100
+            || !tag
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b))
+            || tag == "."
+            || tag == ".."
+        {
             return Err(AicutError::invalid_input("Informe uma tag de release válida."));
         }
         let repo = Self::release_repo(tool)?;
-        let api = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
-        let release: serde_json::Value = self.http.get(api).send().await
-            .and_then(|r| r.error_for_status()).map_err(|e| AicutError::internal(e.to_string()))?
-            .json().await.map_err(|e| AicutError::internal(e.to_string()))?;
+        let release = self.fetch_release_for_tag(repo, tag).await?;
         self.release_asset(tool, &release)
     }
 
     fn release_asset(&self, tool: &str, release: &serde_json::Value) -> AicutResult<ResolvedDownload> {
-        let tag = release["tag_name"].as_str().ok_or_else(|| AicutError::invalid_input("Sem tag"))?;
-        let assets = release["assets"].as_array().ok_or_else(|| AicutError::invalid_input("Release sem arquivos."))?;
+        let tag = release["tag_name"]
+            .as_str()
+            .ok_or_else(|| AicutError::invalid_input("Sem tag"))?;
+        let assets = release["assets"]
+            .as_array()
+            .ok_or_else(|| AicutError::invalid_input("Release sem arquivos."))?;
         let hw = &self.hardware;
         let asset = match tool {
-            "whisper" => select_best_whisper_asset(assets, &hw.platform_tag, hw.recommended_accel, hw.cuda_major_minor(), hw.cuda_runtime_installed)
-                .map(|(n,u,k)| (n,u,None,k)),
-            "llama-server" => select_best_llama_assets(assets, &hw.platform_tag, hw.recommended_accel, hw.cuda_major_minor(), hw.cuda_runtime_installed),
-            _ => assets.iter().find_map(|a| {
-                let name = a["name"].as_str()?;
-                let kind = match tool {
-                    "yt-dlp" if name == "yt-dlp_linux" => ArchiveKind::SingleBinary,
-                    "ffmpeg" if name.ends_with("linux64-gpl.tar.xz") => ArchiveKind::FfmpegTarXz,
-                    _ => return None,
+            "whisper" => select_best_whisper_asset(
+                assets,
+                &hw.platform_tag,
+                hw.recommended_accel,
+                hw.cuda_major_minor(),
+                hw.cuda_runtime_installed,
+            )
+            .map(|(n, u, k)| (n, u, None, k)),
+            "llama-server" => select_best_llama_assets(
+                assets,
+                &hw.platform_tag,
+                hw.recommended_accel,
+                hw.cuda_major_minor(),
+                hw.cuda_runtime_installed,
+            ),
+            _ => {
+                let ytdlp_name = match hw.platform_tag.as_str() {
+                    "linux-arm64" => "yt-dlp_linux_aarch64",
+                    _ => "yt-dlp_linux",
                 };
-                Some((name.to_owned(), a["browser_download_url"].as_str()?.to_owned(), None, kind))
-            }),
+                let ffmpeg_suffix = match hw.platform_tag.as_str() {
+                    "linux-arm64" => "linuxarm64-gpl.tar.xz",
+                    _ => "linux64-gpl.tar.xz",
+                };
+                assets.iter().find_map(|a| {
+                    let name = a["name"].as_str()?;
+                    let kind = match tool {
+                        "yt-dlp" if name == ytdlp_name => ArchiveKind::SingleBinary,
+                        "ffmpeg" if name.ends_with(ffmpeg_suffix) => ArchiveKind::FfmpegTarXz,
+                        _ => return None,
+                    };
+                    Some((
+                        name.to_owned(),
+                        a["browser_download_url"].as_str()?.to_owned(),
+                        None,
+                        kind,
+                    ))
+                })
+            }
         };
-        let (build_label, url, companion_url, archive_kind) = asset.ok_or_else(|| AicutError::invalid_input("Release sem binário compatível com este hardware."))?;
-        Ok(ResolvedDownload { build_label, url, companion_url, archive_kind, version: tag.to_owned() })
+        let (build_label, url, companion_url, archive_kind) = asset.ok_or_else(|| {
+            AicutError::invalid_input("Release sem binário compatível com este hardware.")
+        })?;
+        Ok(ResolvedDownload {
+            build_label,
+            url,
+            companion_url,
+            archive_kind,
+            version: tag.to_owned(),
+        })
+    }
+
+    async fn resolve_latest_from_repo(
+        &self,
+        tool: &str,
+        per_page: usize,
+        prefer_tag: Option<fn(&str) -> bool>,
+    ) -> AicutResult<ResolvedDownload> {
+        let repo = Self::release_repo(tool)?;
+        let api_err = match self.fetch_api_releases(repo, per_page).await {
+            Ok(releases) => {
+                for rel in &releases {
+                    let Some(tag) = rel.get("tag_name").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    if let Some(pred) = prefer_tag {
+                        if !pred(tag) {
+                            continue;
+                        }
+                    }
+                    if let Ok(resolved) = self.release_asset(tool, rel) {
+                        return Ok(resolved);
+                    }
+                }
+                None
+            }
+            Err(err) => Some(err),
+        };
+
+        // Fallback via github.com Atom feed + expanded_assets HTML (zero REST API rate limit).
+        match self.fetch_web_release_tags(repo).await {
+            Ok(tags) => {
+                let candidate_tags: Vec<String> = match prefer_tag {
+                    Some(pred) => tags.into_iter().filter(|t| pred(t)).take(10).collect(),
+                    None => tags.into_iter().take(10).collect(),
+                };
+                for tag in candidate_tags {
+                    if let Ok(rel) = self.fetch_web_release_for_tag(repo, &tag).await {
+                        if let Ok(resolved) = self.release_asset(tool, &rel) {
+                            return Ok(resolved);
+                        }
+                    }
+                }
+            }
+            Err(web_err) => {
+                if let Some(api_reason) = api_err {
+                    return Err(AicutError::internal(format!(
+                        "Não foi possível obter releases de {tool} ({api_reason}; fallback web: {}).",
+                        web_err.message
+                    )));
+                }
+                return Err(web_err);
+            }
+        }
+
+        let tag = self.hardware.platform_tag.as_str();
+        let code = match tool {
+            "whisper" => "WHISPER_ASSET_NOT_FOUND",
+            "llama-server" => "LLAMA_ASSET_NOT_FOUND",
+            _ => "ASSET_NOT_FOUND",
+        };
+        Err(AicutError::new(
+            code,
+            format!("Nenhum binário Linux pré-compilado de '{tool}' encontrado para a plataforma '{tag}'."),
+        ))
     }
 
     async fn resolve_ytdlp_release(&self) -> AicutResult<ResolvedDownload> {
+        if let Ok(resolved) = self.resolve_latest_from_repo("yt-dlp", 10, None).await {
+            return Ok(resolved);
+        }
+
         let asset_name = match self.hardware.platform_tag.as_str() {
             "linux-arm64" => "yt-dlp_linux_aarch64",
             _ => "yt-dlp_linux",
         };
-
-        let resp = self
-            .http
-            .get("https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest")
-            .send()
-            .await
-            .map_err(|e| AicutError::internal(format!("Failed querying yt-dlp releases: {e}")))?;
-
-        let json: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| AicutError::internal(format!("Invalid GitHub release payload: {e}")))?;
-
-        let tag_name = json
-            .get("tag_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("latest")
-            .to_string();
-
-        let download_url = json
-            .get("assets")
-            .and_then(|v| v.as_array())
-            .and_then(|assets| {
-                assets.iter().find_map(|a| {
-                    let name = a.get("name").and_then(|n| n.as_str())?;
-                    if name == asset_name {
-                        a.get("browser_download_url")
-                            .and_then(|u| u.as_str())
-                            .map(|s| s.to_string())
-                    } else {
-                        None
-                    }
-                })
-            })
-            .unwrap_or_else(|| {
-                format!("https://github.com/yt-dlp/yt-dlp/releases/latest/download/{asset_name}")
-            });
-
         Ok(ResolvedDownload {
-            url: download_url,
+            url: format!("https://github.com/yt-dlp/yt-dlp/releases/latest/download/{asset_name}"),
             companion_url: None,
-            version: tag_name,
+            version: "latest".to_string(),
             build_label: asset_name.to_string(),
             archive_kind: ArchiveKind::SingleBinary,
         })
     }
 
     async fn resolve_ffmpeg_release(&self) -> AicutResult<ResolvedDownload> {
-        let tag = self.versions("ffmpeg").await?.into_iter()
-            .find(|tag| tag.starts_with("autobuild-"))
-            .ok_or_else(|| AicutError::not_found("Nenhuma versão datada do FFmpeg disponível."))?;
-        self.tagged_release("ffmpeg", &tag).await
+        if let Ok(resolved) = self
+            .resolve_latest_from_repo("ffmpeg", 15, Some(|tag: &str| tag.starts_with("autobuild-")))
+            .await
+        {
+            return Ok(resolved);
+        }
+        if let Ok(resolved) = self.resolve_latest_from_repo("ffmpeg", 15, None).await {
+            return Ok(resolved);
+        }
+
+        let asset_name = match self.hardware.platform_tag.as_str() {
+            "linux-arm64" => "ffmpeg-master-latest-linuxarm64-gpl.tar.xz",
+            _ => "ffmpeg-master-latest-linux64-gpl.tar.xz",
+        };
+        Ok(ResolvedDownload {
+            url: format!(
+                "https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/latest/{asset_name}"
+            ),
+            companion_url: None,
+            version: "latest".to_string(),
+            build_label: asset_name.to_string(),
+            archive_kind: ArchiveKind::FfmpegTarXz,
+        })
     }
 
     /// Queries the latest releases of `ggml-org/whisper.cpp` (skipping source-only tags)
     /// and picks the optimal Linux binary archive for the host CPU/GPU profile.
     async fn resolve_whisper_release(&self) -> AicutResult<ResolvedDownload> {
-        let resp = self
-            .http
-            .get("https://api.github.com/repos/ggml-org/whisper.cpp/releases?per_page=15")
-            .send()
-            .await
-            .map_err(|e| {
-                AicutError::internal(format!("Failed querying whisper.cpp releases: {e}"))
-            })?;
-
-        let releases: Vec<serde_json::Value> = resp
-            .json()
-            .await
-            .map_err(|e| AicutError::internal(format!("Invalid whisper.cpp releases JSON: {e}")))?;
-
-        let tag = self.hardware.platform_tag.as_str();
-        let accel = self.hardware.recommended_accel;
-
-        for rel in &releases {
-            let Some(assets) = rel.get("assets").and_then(|v| v.as_array()) else {
-                continue;
-            };
-            if assets.is_empty() {
-                continue;
-            }
-            let version = rel
-                .get("tag_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("latest")
-                .to_string();
-
-            if let Some((name, url, kind)) = select_best_whisper_asset(
-                assets,
-                tag,
-                accel,
-                self.hardware.cuda_major_minor(),
-                self.hardware.cuda_runtime_installed,
-            ) {
-                return Ok(ResolvedDownload {
-                    url,
-                    companion_url: None,
-                    version,
-                    build_label: name,
-                    archive_kind: kind,
-                });
-            }
-        }
-
-        Err(AicutError::new(
-            "WHISPER_ASSET_NOT_FOUND",
-            format!("No prebuilt whisper.cpp Linux binary found for platform '{tag}'."),
-        ))
+        self.resolve_latest_from_repo("whisper", 15, None).await
     }
 
     /// Queries the latest releases of `ggml-org/llama.cpp` and picks the highest-quality
     /// Linux GPU/CPU binary archive (CUDA when runtime is present, Vulkan for out-of-the-box NVIDIA/AMD/Intel GPU, or CPU fallback).
     async fn resolve_llama_release(&self) -> AicutResult<ResolvedDownload> {
-        let resp = self
-            .http
-            .get("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10")
-            .send()
-            .await
-            .map_err(|e| {
-                AicutError::internal(format!("Failed querying llama.cpp releases: {e}"))
-            })?;
-
-        let releases: Vec<serde_json::Value> = resp
-            .json()
-            .await
-            .map_err(|e| AicutError::internal(format!("Invalid llama.cpp releases JSON: {e}")))?;
-
-        let tag = self.hardware.platform_tag.as_str();
-        let accel = self.hardware.recommended_accel;
-
-        for rel in &releases {
-            let Some(assets) = rel.get("assets").and_then(|v| v.as_array()) else {
-                continue;
-            };
-            if assets.is_empty() {
-                continue;
-            }
-            let version = rel
-                .get("tag_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("latest")
-                .to_string();
-
-            if let Some((name, url, companion_url, kind)) = select_best_llama_assets(
-                assets,
-                tag,
-                accel,
-                self.hardware.cuda_major_minor(),
-                self.hardware.cuda_runtime_installed,
-            ) {
-                return Ok(ResolvedDownload {
-                    url,
-                    companion_url,
-                    version,
-                    build_label: name,
-                    archive_kind: kind,
-                });
-            }
-        }
-
-        Err(AicutError::new(
-            "LLAMA_ASSET_NOT_FOUND",
-            format!("No prebuilt llama.cpp Linux binary found for platform '{tag}'."),
-        ))
+        self.resolve_latest_from_repo("llama-server", 10, None).await
     }
 
     async fn download_file(
@@ -1443,6 +1726,130 @@ fn extract_llama_from_targz(archive_path: &Path, llama_dir: &Path) -> AicutResul
     Ok(())
 }
 
+fn parse_rate_limit_cooldown(reset_header: Option<&str>) -> std::time::Duration {
+    let Some(raw) = reset_header else {
+        return DEFAULT_RATE_LIMIT_COOLDOWN;
+    };
+    let Ok(reset_epoch) = raw.trim().parse::<u64>() else {
+        return DEFAULT_RATE_LIMIT_COOLDOWN;
+    };
+    let Ok(now_epoch) = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+    else {
+        return DEFAULT_RATE_LIMIT_COOLDOWN;
+    };
+    let wait_secs = reset_epoch.saturating_sub(now_epoch).clamp(60, 3600);
+    std::time::Duration::from_secs(wait_secs)
+}
+
+fn percent_decode_simple(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex_str) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(val) = u8::from_str_radix(hex_str, 16) {
+                    out.push(val);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| input.to_string())
+}
+
+/// Extracts ordered, deduplicated release tags from a GitHub `releases.atom` XML feed.
+/// Only inspects `<link ... href="https://github.com/.../releases/tag/{tag}"/>` elements
+/// so tags referenced inside `<content>` release notes are ignored.
+pub fn parse_atom_release_tags(xml: &str) -> Vec<String> {
+    let mut tags = Vec::new();
+    let mut rest = xml;
+    while let Some(link_start) = rest.find("<link ") {
+        rest = &rest[link_start + 6..];
+        let Some(tag_end) = rest.find('>') else {
+            break;
+        };
+        let attrs = &rest[..tag_end];
+        rest = &rest[tag_end + 1..];
+
+        let Some(href_pos) = attrs.find("href=\"") else {
+            continue;
+        };
+        let after_href = &attrs[href_pos + 6..];
+        let Some(href_end) = after_href.find('"') else {
+            continue;
+        };
+        let href = &after_href[..href_end];
+        let Some(tag_pos) = href.find("/releases/tag/") else {
+            continue;
+        };
+        let raw_tag = &href[tag_pos + "/releases/tag/".len()..];
+        let clean = raw_tag
+            .split(['?', '#', '/'])
+            .next()
+            .unwrap_or("")
+            .trim();
+        if clean.is_empty() {
+            continue;
+        }
+        let decoded = percent_decode_simple(clean);
+        if !decoded.is_empty() && !tags.iter().any(|t| t == &decoded) {
+            tags.push(decoded);
+        }
+    }
+    tags
+}
+
+/// Extracts GitHub release asset `{name, browser_download_url}` objects from the HTML
+/// returned by `https://github.com/{owner}/{repo}/releases/expanded_assets/{tag}`.
+pub fn parse_expanded_assets_html(html: &str) -> Vec<serde_json::Value> {
+    let mut assets = Vec::new();
+    let mut seen_names = std::collections::HashSet::new();
+    let mut rest = html;
+
+    while let Some(href_pos) = rest.find("href=\"") {
+        rest = &rest[href_pos + 6..];
+        let Some(end_pos) = rest.find('"') else {
+            break;
+        };
+        let href = &rest[..end_pos];
+        rest = &rest[end_pos + 1..];
+
+        if !href.contains("/releases/download/") {
+            continue;
+        }
+        let full_url = if href.starts_with("https://") || href.starts_with("http://") {
+            href.to_string()
+        } else if href.starts_with('/') {
+            format!("https://github.com{href}")
+        } else {
+            continue;
+        };
+
+        let path_only = full_url.split(['?', '#']).next().unwrap_or(&full_url);
+        let Some(raw_name) = path_only.rsplit('/').next() else {
+            continue;
+        };
+        if raw_name.is_empty() {
+            continue;
+        }
+        let name = percent_decode_simple(raw_name);
+        if seen_names.insert(name.clone()) {
+            assets.push(serde_json::json!({
+                "name": name,
+                "browser_download_url": full_url,
+            }));
+        }
+    }
+
+    assets
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1514,4 +1921,118 @@ mod tests {
         let cpu = select_best_llama_assets(&assets, "linux-x64", AccelBackend::CpuOnly, None, false).unwrap();
         assert_eq!(cpu.0, "llama-b5500-bin-ubuntu-x64.tar.gz");
     }
+
+    #[test]
+    fn parses_github_atom_release_tags_ignoring_body_links() {
+        let xml = r#"
+          <feed>
+            <link type="text/html" rel="alternate" href="https://github.com/ggml-org/whisper.cpp/releases"/>
+            <entry>
+              <link rel="alternate" type="text/html" href="https://github.com/ggml-org/whisper.cpp/releases/tag/b5907"/>
+              <content>See https://github.com/ggml-org/ggml/releases/tag/v0.26.0 for notes</content>
+            </entry>
+            <entry>
+              <link rel="alternate" type="text/html" href="https://github.com/ggml-org/whisper.cpp/releases/tag/v1.9.5"/>
+            </entry>
+            <entry>
+              <link rel="alternate" type="text/html" href="https://github.com/ggml-org/whisper.cpp/releases/tag/b5907"/>
+            </entry>
+            <entry>
+              <link rel="alternate" type="text/html" href="https://github.com/ggml-org/whisper.cpp/releases/tag/b5454"/>
+            </entry>
+          </feed>
+        "#;
+        let tags = parse_atom_release_tags(xml);
+        assert_eq!(tags, vec!["b5907", "v1.9.5", "b5454"]);
+    }
+
+    #[test]
+    fn parses_expanded_assets_html_for_llama_whisper_and_ffmpeg() {
+        let html = r#"
+          <ul>
+            <li><a href="/ggml-org/llama.cpp/releases/download/b12606/cudart-llama-b12606-bin-ubuntu-cuda-13.5-x64.tar.gz">cudart</a></li>
+            <li><a href="/ggml-org/llama.cpp/releases/download/b12606/llama-b12606-bin-ubuntu-cuda-13.5-x64.tar.gz">cuda</a></li>
+            <li><a href="/ggml-org/llama.cpp/releases/download/b12606/llama-b12606-bin-ubuntu-vulkan-x64.tar.gz">vulkan</a></li>
+            <li><a href="/ggml-org/llama.cpp/archive/refs/tags/b12606.tar.gz">Source code</a></li>
+          </ul>
+        "#;
+        let assets = parse_expanded_assets_html(html);
+        assert_eq!(assets.len(), 3);
+        let picked = select_best_llama_assets(
+            &assets,
+            "linux-x64",
+            AccelBackend::CudaNvenc,
+            Some((13, 5)),
+            false,
+        )
+        .unwrap();
+        assert_eq!(picked.0, "llama-b12606-bin-ubuntu-cuda-13.5-x64.tar.gz");
+        assert_eq!(
+            picked.1,
+            "https://github.com/ggml-org/llama.cpp/releases/download/b12606/llama-b12606-bin-ubuntu-cuda-13.5-x64.tar.gz"
+        );
+        assert_eq!(
+            picked.2.as_deref(),
+            Some("https://github.com/ggml-org/llama.cpp/releases/download/b12606/cudart-llama-b12606-bin-ubuntu-cuda-13.5-x64.tar.gz")
+        );
+    }
+
+    #[test]
+    fn rate_limit_cooldown_clamps_reasonable_bounds() {
+        assert_eq!(parse_rate_limit_cooldown(None), DEFAULT_RATE_LIMIT_COOLDOWN);
+        assert_eq!(
+            parse_rate_limit_cooldown(Some("not-a-number")),
+            DEFAULT_RATE_LIMIT_COOLDOWN
+        );
+        // Past timestamp clamps to 60s minimum
+        assert_eq!(
+            parse_rate_limit_cooldown(Some("1000")),
+            std::time::Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn rate_limit_blocker_tracks_active_cooldown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let events = Arc::new(EventBus::new(16));
+        let jobs = Arc::new(JobManager::new(events.clone()));
+        let hw = HardwareProfile::detect();
+        let tm = ToolManager::new(tmp.path().to_path_buf(), hw, events, jobs);
+        assert!(!tm.github_api_is_blocked());
+        tm.mark_github_api_rate_limited(std::time::Duration::from_secs(60));
+        assert!(tm.github_api_is_blocked());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires live network access to github.com"]
+    async fn live_web_fallback_resolves_all_tools_when_api_is_rate_limited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let events = Arc::new(EventBus::new(16));
+        let jobs = Arc::new(JobManager::new(events.clone()));
+        let hw = HardwareProfile::detect();
+        let tm = ToolManager::new(tmp.path().to_path_buf(), hw, events, jobs);
+
+        // Simulate GitHub REST API 403 rate limit exceeded!
+        tm.mark_github_api_rate_limited(std::time::Duration::from_secs(600));
+        assert!(tm.github_api_is_blocked());
+
+        let ytdlp = tm.resolve_ytdlp_release().await.expect("yt-dlp web fallback");
+        assert!(ytdlp.url.contains("github.com/yt-dlp/yt-dlp/releases/"));
+
+        let ffmpeg = tm.resolve_ffmpeg_release().await.expect("ffmpeg web fallback");
+        assert!(ffmpeg.url.contains("FFmpeg-Builds/releases/download/"));
+        assert!(ffmpeg.url.ends_with("gpl.tar.xz"));
+
+        let whisper = tm.resolve_whisper_release().await.expect("whisper web fallback");
+        assert!(whisper.url.contains("whisper.cpp/releases/download/"));
+        assert_ne!(whisper.version, "v1.9.5"); // skipped source-only tags
+
+        let llama = tm.resolve_llama_release().await.expect("llama web fallback");
+        assert!(llama.url.contains("llama.cpp/releases/download/"));
+
+        let whisper_versions = tm.versions("whisper").await.expect("whisper versions via web");
+        assert!(!whisper_versions.is_empty());
+    }
 }
+
+

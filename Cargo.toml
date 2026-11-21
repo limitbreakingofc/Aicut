@@ -16,7 +16,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.12.1"
+version = "0.12.2"
 edition = "2021"
 license = "MIT"
 
@@ -42,7 +42,7 @@ http-body-util = "0.1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 mime_guess = "2.0"
 png = "0.17"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "stream"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 schemars = { version = "0.8", features = ["chrono", "uuid1"] }
 serde = { version = "1.0", features = ["derive"] }
