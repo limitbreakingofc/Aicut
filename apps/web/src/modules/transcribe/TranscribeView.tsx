@@ -102,12 +102,6 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
   const [tab, setTab] = useState<TabId>("new");
   const [selectedMediaId, setSelectedMediaId] = useState<string>(preselectedMediaId ?? playableMedia[0]?.id ?? "");
   const [models, setModels] = useState<WhisperModelStatus[]>([]);
-  const [totalInstalledBytes, setTotalInstalledBytes] = useState<number>(0);
-  const [showAllModels, setShowAllModels] = useState(false);
-
-  // Per-family active version tab (e.g. family "large-v3-turbo" -> "large-v3-turbo-q8_0")
-  const [familySelection, setFamilySelection] = useState<Record<string, string>>({});
-
   // Globally active model version used for transcription
   const [selectedModel, setSelectedModel] = useState<string>(() => storage.get("aicut_whisper_model") ?? "");
 
@@ -122,9 +116,6 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
   const [initialPrompt, setInitialPrompt] = useState<string>("");
   const [selectedFormats, setSelectedFormats] = useState<string[]>(["srt", "fcpxml", "json"]);
 
-  const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
-  const [uninstallingModel, setUninstallingModel] = useState<string | null>(null);
-  const [installingEngine, setInstallingEngine] = useState(false);
   const [starting, setStarting] = useState(false);
   const [exportingFmt, setExportingFmt] = useState<string | null>(null);
   const [searchSeg, setSearchSeg] = useState("");
@@ -162,35 +153,12 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
       ]);
       const mList = mRes.data.models ?? [];
       setModels(mList);
-      setTotalInstalledBytes(mRes.data.total_installed_bytes ?? 0);
       setFormats(fRes.data.formats ?? []);
       const tList = tRes.data.transcripts ?? [];
       setTranscripts(tList);
       if (tList.length > 0 && !activeTranscriptId) {
         setActiveTranscriptId(tList[0].id);
       }
-
-      // Initialize per-family default version (prefer installed -> recommended -> highest quality compatible)
-      setFamilySelection((prev) => {
-        const next = { ...prev };
-        const byFamily = new Map<string, WhisperModelStatus[]>();
-        for (const m of mList) {
-          const arr = byFamily.get(m.family_id) ?? [];
-          arr.push(m);
-          byFamily.set(m.family_id, arr);
-        }
-        for (const [famId, items] of byFamily.entries()) {
-          if (!next[famId] || !items.some((x) => x.id === next[famId])) {
-            const pick =
-              items.find((x) => x.installed) ??
-              items.find((x) => x.recommended) ??
-              items.find((x) => x.compatible) ??
-              items[0];
-            if (pick) next[famId] = pick.id;
-          }
-        }
-        return next;
-      });
 
       // Ensure active model points to a valid installed or recommended model
       setSelectedModel((curr) => {
@@ -222,96 +190,7 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
     }
   }, [completedTranscribeCount]);
 
-  // Group visible models by family (default: ONLY curated hardware-compatible best models + any already installed!)
-  const visibleFamilies = useMemo(() => {
-    const visible = showAllModels ? models : models.filter((m) => m.curated_for_hardware || m.installed);
-
-    const groups: Array<{
-      familyId: string;
-      familyName: string;
-      versions: WhisperModelStatus[];
-      maxQuality: number;
-      hasRecommended: boolean;
-      hasBestQuality: boolean;
-    }> = [];
-
-    const map = new Map<string, WhisperModelStatus[]>();
-    for (const m of visible) {
-      const list = map.get(m.family_id) ?? [];
-      list.push(m);
-      map.set(m.family_id, list);
-    }
-
-    for (const [familyId, versions] of map.entries()) {
-      versions.sort((a, b) => b.quality_score - a.quality_score);
-      groups.push({
-        familyId,
-        familyName: versions[0].family_name,
-        versions,
-        maxQuality: Math.max(...versions.map((v) => v.quality_score)),
-        hasRecommended: versions.some((v) => v.recommended),
-        hasBestQuality: versions.some((v) => v.best_quality_for_hardware),
-      });
-    }
-
-    // Put recommended / highest quality families first
-    groups.sort((a, b) => {
-      if (a.hasRecommended !== b.hasRecommended) return a.hasRecommended ? -1 : 1;
-      return b.maxQuality - a.maxQuality;
-    });
-
-    return groups;
-  }, [models, showAllModels]);
-
   const installedModels = useMemo(() => models.filter((m) => m.installed), [models]);
-
-  async function handleInstallWhisperEngine() {
-    setInstallingEngine(true);
-    try {
-      const res = await runAction("tools.install", { tool_id: "whisper" });
-      await onRefreshTools();
-      onNotify("success", "whisper.cpp instalado!", res.summary);
-    } catch (e) {
-      onNotify("error", "Falha ao instalar whisper.cpp", (e as Error).message);
-    } finally {
-      setInstallingEngine(false);
-    }
-  }
-
-  async function handleDownloadModel(model: WhisperModelStatus) {
-    setDownloadingModel(model.id);
-    try {
-      await runAction("transcribe.model_download", { model_id: model.id });
-      await loadAll();
-      chooseActiveModel(model.id);
-      onNotify("success", "Modelo instalado!", `${model.display_name} pronto e selecionado como ativo.`);
-    } catch (e) {
-      onNotify("error", "Erro ao baixar modelo", (e as Error).message);
-    } finally {
-      setDownloadingModel(null);
-    }
-  }
-
-  async function handleUninstallModel(model: WhisperModelStatus) {
-    setUninstallingModel(model.id);
-    try {
-      const res = await runAction<{
-        model_id: string;
-        deleted: boolean;
-        freed_bytes: number;
-      }>("transcribe.model_delete", { model_id: model.id });
-      await loadAll();
-      onNotify(
-        "success",
-        "Modelo desinstalado completamente",
-        `${model.display_name} removido do disco (${formatBytes(res.data.freed_bytes)} liberados).`,
-      );
-    } catch (e) {
-      onNotify("error", "Erro ao desinstalar modelo", (e as Error).message);
-    } finally {
-      setUninstallingModel(null);
-    }
-  }
 
   function toggleFormat(fmtId: string) {
     setSelectedFormats((prev) => (prev.includes(fmtId) ? prev.filter((x) => x !== fmtId) : [...prev, fmtId]));
@@ -428,35 +307,6 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
     },
   ];
 
-  const modelMenu = (m: WhisperModelStatus): MenuItems => [
-    { type: "label", label: m.display_name },
-    m.installed && {
-      label: selectedModel === m.id ? "Em uso para transcrever" : "Usar esta versão",
-      icon: CircleCheck,
-      disabled: selectedModel === m.id,
-      onSelect: () => chooseActiveModel(m.id),
-    },
-    !m.installed && {
-      label: `Baixar (${m.size_mb} MB)`,
-      icon: Download,
-      disabled: downloadingModel === m.id,
-      onSelect: () => void handleDownloadModel(m),
-    },
-    m.file_path && {
-      label: "Copiar caminho do modelo",
-      icon: Copy,
-      onSelect: () => void copyToClipboard(m.file_path ?? "", onNotify, "Caminho do modelo"),
-    },
-    m.installed && { type: "separator" },
-    m.installed && {
-      label: "Desinstalar completamente",
-      icon: Trash2,
-      danger: true,
-      disabled: uninstallingModel === m.id,
-      onSelect: () => void handleUninstallModel(m),
-    },
-  ];
-
   const engineMissing = (!whisperTool?.installed || !ffmpegTool?.installed) && tools.length > 0;
 
   return (
@@ -468,7 +318,6 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
         items={[
           { id: "new", label: "Transcrever", icon: Mic },
           { id: "results", label: "Transcrições", icon: ListVideo, count: transcripts.length },
-          { id: "models", label: "Modelos", icon: Layers, count: installedModels.length },
         ]}
       />
 
@@ -478,18 +327,7 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
           title="Motor de IA local pendente"
           actions={
             <>
-              {!whisperTool?.installed && (
-                <button
-                  type="button"
-                  className="btn btn-primary btn-sm"
-                  disabled={installingEngine}
-                  onClick={handleInstallWhisperEngine}
-                >
-                  <BusyIcon busy={installingEngine} icon={Download} size={13} />
-                  Instalar whisper.cpp
-                </button>
-              )}
-              <button type="button" className="btn btn-sm" onClick={() => onNavigate("settings")}>
+              <button type="button" className="btn btn-sm" onClick={() => onNavigate("downloads")}>
                 Ferramentas
               </button>
             </>
@@ -637,7 +475,7 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
               title="Modelo ativo"
               icon={Cpu}
               actions={
-                <button type="button" className="btn btn-ghost btn-xs" onClick={() => setTab("models")}>
+                <button type="button" className="btn btn-ghost btn-xs" onClick={() => onNavigate("downloads")}>
                   gerenciar <ArrowRight aria-hidden />
                 </button>
               }
@@ -648,7 +486,7 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
                   tone="warning"
                   title="Nenhum modelo instalado"
                   actions={
-                    <button type="button" className="btn btn-primary btn-sm" onClick={() => setTab("models")}>
+                    <button type="button" className="btn btn-primary btn-sm" onClick={() => onNavigate("downloads")}>
                       Ver modelos
                     </button>
                   }
@@ -792,144 +630,6 @@ export const TranscribeView: React.FC<TranscribeViewProps> = ({
       {/* ================================================================ */}
       {/* GPU-CURATED MODEL & VERSION MANAGER                              */}
       {/* ================================================================ */}
-      {tab === "models" && (
-        <>
-          <div className="toolbar">
-            <span className="row text-sm">
-              <Cpu size={14} className="text-accent" aria-hidden /> {gpuSummary}
-            </span>
-            <span className="toolbar-sep" />
-            <Badge icon={HardDrive}>
-              Instalados: {installedModels.length} ({formatBytes(totalInstalledBytes)})
-            </Badge>
-            <label className="row ml-auto text-sm secondary">
-              <Switch checked={showAllModels} onChange={setShowAllModels} label="Mostrar todos os modelos" />
-              mostrar todos (incl. incompatíveis)
-            </label>
-          </div>
-
-          <div className="family-grid">
-            {visibleFamilies.map((fam) => {
-              const viewedId = familySelection[fam.familyId] ?? fam.versions[0]?.id;
-              const current = fam.versions.find((v) => v.id === viewedId) ?? fam.versions[0];
-              if (!current) return null;
-
-              const isActiveForUse = selectedModel === current.id && current.installed;
-              const isDownloading = downloadingModel === current.id;
-              const isUninstalling = uninstallingModel === current.id;
-
-              return (
-                <section
-                  key={fam.familyId}
-                  className="panel family-card"
-                  data-tone={isActiveForUse ? "accent" : undefined}
-                  onContextMenu={(e) => menu.open(e, modelMenu(current))}
-                >
-                  <header className="panel-header">
-                    <div className="panel-heading">
-                      <h2 className="panel-title">
-                        <Layers aria-hidden />
-                        {fam.familyName}
-                      </h2>
-                    </div>
-                    <div className="panel-actions">
-                      {current.best_quality_for_hardware && (
-                        <Badge tone="success" icon={Award}>
-                          maior qualidade
-                        </Badge>
-                      )}
-                      {current.recommended && <Badge tone="accent">recomendado</Badge>}
-                      <MoreButton items={() => modelMenu(current)} />
-                    </div>
-                  </header>
-
-                  <div className="panel-body">
-                    <p className="panel-description">{current.description}</p>
-
-                    <div className="stack stack-xs">
-                      <span className="section-label">Versão / precisão</span>
-                      <div className="row wrap gap-xs" role="group" aria-label={`Versões de ${fam.familyName}`}>
-                        {fam.versions.map((ver) => (
-                          <button
-                            key={ver.id}
-                            type="button"
-                            className="chip chip-sm"
-                            aria-pressed={ver.id === current.id}
-                            onClick={() => {
-                              setFamilySelection((prev) => ({ ...prev, [fam.familyId]: ver.id }));
-                              if (ver.installed) chooseActiveModel(ver.id);
-                            }}
-                            onContextMenu={(e) => menu.open(e, modelMenu(ver))}
-                          >
-                            {ver.installed && <span className="installed-dot" aria-label="instalado" />}
-                            {ver.version_tag}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-
-                    <div className="inset stack stack-sm">
-                      <div className="row wrap gap-xs">
-                        <Badge tone="accent">qualidade {current.quality_tier}</Badge>
-                        <Badge>{current.speed_tier}</Badge>
-                        <Badge>{current.size_mb} MB</Badge>
-                        <Badge>VRAM mín {(current.min_vram_mb / 1024).toFixed(1)} GB</Badge>
-                      </div>
-                      <p className="text-sm">{current.quality_notes}</p>
-                      <p className={`text-xs ${current.compatible ? "text-success" : "text-danger"}`}>
-                        {current.compatible ? <CircleCheck size={12} className="inline-icon" aria-hidden /> : <TriangleAlert size={12} className="inline-icon" aria-hidden />}{" "}
-                        {current.compatibility_reason}
-                      </p>
-                    </div>
-                  </div>
-
-                  <footer className="panel-footer">
-                    {current.installed ? (
-                      <>
-                        <button
-                          type="button"
-                          className={`btn btn-sm ${isActiveForUse ? "btn-primary" : ""}`}
-                          onClick={() => chooseActiveModel(current.id)}
-                        >
-                          {isActiveForUse ? (
-                            <>
-                              <CircleCheck aria-hidden /> Em uso para transcrever
-                            </>
-                          ) : (
-                            "Usar esta versão"
-                          )}
-                        </button>
-                        <button
-                          type="button"
-                          className="btn btn-danger btn-sm"
-                          disabled={isUninstalling}
-                          onClick={() => handleUninstallModel(current)}
-                        >
-                          <BusyIcon busy={isUninstalling} icon={Trash2} size={13} />
-                          Desinstalar
-                        </button>
-                      </>
-                    ) : (
-                      <>
-                        <span className="muted text-xs">não instalado</span>
-                        <button
-                          type="button"
-                          className="btn btn-primary btn-sm"
-                          disabled={isDownloading}
-                          onClick={() => handleDownloadModel(current)}
-                        >
-                          <BusyIcon busy={isDownloading} icon={Download} size={13} />
-                          Baixar {current.version_tag.split(" ")[0]} ({current.size_mb} MB)
-                        </button>
-                      </>
-                    )}
-                  </footer>
-                </section>
-              );
-            })}
-          </div>
-        </>
-      )}
     </>
   );
 };

@@ -810,12 +810,12 @@ export const MotionStudioView: React.FC<MotionStudioViewProps> = ({
           tone="warning"
           title="FFmpeg necessário"
           actions={
-            <button type="button" className="btn btn-primary btn-sm" onClick={() => onNavigate("settings")}>
+            <button type="button" className="btn btn-primary btn-sm" onClick={() => onNavigate("downloads")}>
               Instalar
             </button>
           }
         >
-          Instale o FFmpeg em Configurações → Ferramentas para que a IA assista e renderize o corte.
+          Instale o FFmpeg em Downloads → Ferramentas para que a IA assista e renderize o corte.
         </Callout>
       )}
 

@@ -57,6 +57,7 @@ impl LlamaServerGuard {
         model_path: &Path,
         mmproj_path: &Path,
         gpu_layers: u32,
+        cuda_device: Option<&str>,
         logical_cores: usize,
         ctx_size: usize,
     ) -> AicutResult<Self> {
@@ -78,6 +79,9 @@ impl LlamaServerGuard {
 
         let mut cmd = Command::new(llama_bin);
         configure_linux_gpu_env_std(&mut cmd, llama_bin);
+        if gpu_layers > 0 {
+            if let Some(device) = cuda_device { cmd.args(["--device", device]); }
+        }
         cmd.args([
             "-m",
             &model_path.to_string_lossy(),
@@ -179,6 +183,18 @@ impl LlamaServerGuard {
         http: &reqwest::Client,
         cancel: &CancellationToken,
     ) -> AicutResult<Self> {
+        let mut cuda_device = None;
+        if accel == AccelBackend::CudaNvenc {
+            let mut probe = tokio::process::Command::new(llama_bin);
+            aicut_core::configure_linux_gpu_env_tokio(&mut probe, llama_bin);
+            probe.arg("--list-devices").kill_on_drop(true);
+            if let Ok(Ok(output)) = tokio::time::timeout(std::time::Duration::from_secs(5), probe.output()).await {
+                let devices = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+                cuda_device = devices.lines().filter_map(|line| line.trim().split_once(':'))
+                    .map(|(name, _)| name).find(|name| name.strip_prefix("CUDA")
+                        .is_some_and(|idx| !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()))).map(str::to_owned);
+            }
+        }
         let attempts: Vec<(u32, usize)> = match accel {
             AccelBackend::CpuOnly => vec![(0, preferred_ctx.min(8_192))],
             _ => vec![
@@ -193,7 +209,7 @@ impl LlamaServerGuard {
             if cancel.is_cancelled() {
                 return Err(AicutError::cancelled("Inicializacao do llama-server cancelada."));
             }
-            match Self::spawn(llama_bin, model_path, mmproj_path, ngl, logical_cores, ctx) {
+            match Self::spawn(llama_bin, model_path, mmproj_path, ngl, cuda_device.as_deref(), logical_cores, ctx) {
                 Ok(mut guard) => match guard.wait_ready(http, cancel).await {
                     Ok(()) => return Ok(guard),
                     Err(e) => {

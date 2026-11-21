@@ -3,6 +3,15 @@ use aicut_server::ServerConfig;
 use tauri_plugin_dialog::DialogExt;
 
 #[tauri::command]
+async fn open_download_folder(tools: bool) -> Result<(), String> {
+    let workspace = WorkspaceConfig::default_paths();
+    let path = if tools { workspace.bin_dir } else { workspace.models_dir };
+    std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+    let status = tokio::process::Command::new("xdg-open").arg(path).status().await.map_err(|e| e.to_string())?;
+    if status.success() { Ok(()) } else { Err("Falha ao abrir a pasta".into()) }
+}
+
+#[tauri::command]
 async fn pick_media_paths(app: tauri::AppHandle, directory: bool) -> Result<Vec<String>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         if directory {
@@ -35,7 +44,7 @@ async fn pick_media_paths(app: tauri::AppHandle, directory: bool) -> Result<Vec<
     .map_err(|e| e.to_string())
 }
 
-/// Protects WebKitGTK on Linux (especially Arch Linux / CachyOS with NVIDIA proprietary or
+/// Protects WebKitGTK on Fedora Linux (especially with NVIDIA proprietary or
 /// open-kernel drivers on Wayland/XWayland) against blank windows and GBM/EGL protocol crashes.
 /// Users can explicitly override by setting `WEBKIT_DISABLE_DMABUF_RENDERER=0` in their shell.
 fn configure_linux_webkit_env() {
@@ -89,7 +98,7 @@ pub fn run() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![pick_media_paths])
+        .invoke_handler(tauri::generate_handler![pick_media_paths, open_download_folder])
         .run(tauri::generate_context!())
         .expect("error while running Aicut desktop application");
 }

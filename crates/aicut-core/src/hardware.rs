@@ -46,11 +46,10 @@ pub struct HardwareProfile {
     /// Maximum CUDA version supported by the installed NVIDIA driver (e.g. "13.2", "12.8").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cuda_version: Option<String>,
-    /// True when the local Linux host has a CUDA runtime library (`libcudart.so*`) installed
-    /// (e.g. `sudo pacman -S cuda` on Arch/CachyOS).
+    /// True when the local Linux host has a CUDA runtime library (`libcudart.so*`) installed.
     #[serde(default)]
     pub cuda_runtime_installed: bool,
-    /// True when a Linux Vulkan ICD / loader is available (installed by default with `nvidia-utils` on CachyOS).
+    /// True when a Linux Vulkan ICD / loader is available.
     #[serde(default)]
     pub vulkan_available: bool,
     pub recommended_accel: AccelBackend,
@@ -146,7 +145,7 @@ fn detect_linux_distro_name() -> Option<String> {
     None
 }
 
-/// Checks Arch/CachyOS (`/opt/cuda`) and standard Linux paths for `libcudart.so*`.
+/// Checks CUDA toolkit and system library paths for `libcudart.so*`.
 pub fn detect_linux_cuda_runtime() -> bool {
     let dirs = [
         "/opt/cuda/lib64",
@@ -170,7 +169,7 @@ pub fn detect_linux_cuda_runtime() -> bool {
     false
 }
 
-/// Checks whether a Linux Vulkan ICD / loader is available (present out-of-the-box with NVIDIA drivers on CachyOS/Arch).
+/// Checks whether a Linux Vulkan ICD / loader is available.
 pub fn detect_linux_vulkan_available() -> bool {
     let paths = [
         "/usr/lib/libvulkan.so.1",
@@ -279,7 +278,7 @@ fn detect_cuda_version() -> Option<String> {
         }
     }
 
-    // 2. Fallback: `nvcc --version` on PATH or Arch/CachyOS (`/opt/cuda/bin/nvcc`) / standard Linux path
+    // 2. Fallback: `nvcc --version` on PATH or in common CUDA toolkit directories
     for nvcc_bin in ["nvcc", "/opt/cuda/bin/nvcc", "/usr/local/cuda/bin/nvcc"] {
         let mut nvcc = Command::new(nvcc_bin);
         crate::process::configure_std_command(&mut nvcc);

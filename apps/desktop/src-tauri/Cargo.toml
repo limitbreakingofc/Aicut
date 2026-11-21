@@ -1,7 +1,7 @@
 [package]
 name = "aicut-desktop"
-version = "0.11.0"
-description = "Aicut — Modular AI-First Media Studio for Linux (Arch/CachyOS & NVIDIA)"
+version = "0.12.0"
+description = "Aicut — Modular AI-First Media Studio for Fedora Linux"
 edition = "2021"
 license = "MIT"
 

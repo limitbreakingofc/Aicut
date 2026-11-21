@@ -24,6 +24,39 @@ pub struct WorkspaceConfig {
     pub db_path: PathBuf,
 }
 
+/// Lock the user's resource directory across GUI, CLI and MCP processes. The lock
+/// belongs to the open directory descriptor and disappears when the process exits.
+pub fn lock_downloads(root: &Path) -> AicutResult<std::fs::File> {
+    std::fs::create_dir_all(root)?;
+    let directory = std::fs::File::open(root)?;
+    rustix::fs::flock(&directory, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .map_err(|e| crate::error::AicutError::new("DOWNLOAD_LOCK", format!("Pasta de downloads ocupada ou indisponível: {e}")))?;
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(".aicut-stage-") && entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(directory)
+}
+
+pub fn download_stage(root: &Path) -> AicutResult<tempfile::TempDir> {
+    Ok(tempfile::Builder::new().prefix(".aicut-stage-").tempdir_in(root)?)
+}
+
+/// Publish a complete directory on the same Fedora filesystem. After exchange,
+/// the staging directory owns the previous version and cleans it up on drop.
+pub fn publish_directory(staged: &Path, destination: &Path) -> AicutResult<()> {
+    if destination.exists() {
+        rustix::fs::renameat_with(rustix::fs::CWD, staged, rustix::fs::CWD, destination, rustix::fs::RenameFlags::EXCHANGE)
+            .map_err(std::io::Error::from)?;
+    } else {
+        std::fs::rename(staged, destination)?;
+    }
+    Ok(())
+}
+
 impl WorkspaceConfig {
     pub fn default_paths() -> Self {
         let env_workspace = std::env::var("AICUT_WORKSPACE_DIR").ok().map(PathBuf::from);

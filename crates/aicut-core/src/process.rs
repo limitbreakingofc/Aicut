@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 /// Removes AppImage mount prefixes (`$APPDIR` or `/tmp/.mount_*`) from `LD_LIBRARY_PATH`
 /// so external host binaries (`nvidia-smi`, `ffmpeg`, `chromium`, `yt-dlp`) launched from
-/// inside an Ubuntu-built `.AppImage` never clash with rolling Arch/CachyOS system libraries.
+/// a legacy AppImage use system libraries.
 pub fn sanitized_host_ld_library_path(raw: &str, appdir: Option<&str>) -> String {
     raw.split(':')
         .map(str::trim)
@@ -23,7 +23,7 @@ pub fn sanitized_host_ld_library_path(raw: &str, appdir: Option<&str>) -> String
 
 /// Builds a clean Linux `LD_LIBRARY_PATH` for managed GPU/AI binaries (`llama-server`, `whisper-cli`)
 /// by prepending the binary's own directory (for bundled `libllama.so`, `libggml.so`, `libwhisper.so`)
-/// plus Arch/CachyOS (`/opt/cuda/lib64`) and standard Linux CUDA/NVIDIA library directories.
+/// plus standard CUDA/NVIDIA library directories.
 pub fn build_linux_gpu_ld_library_path(bin_path: &Path, existing_host_ld: Option<&str>) -> String {
     let mut dirs: Vec<String> = Vec::new();
     let mut push_unique = |p: String| {
@@ -36,11 +36,12 @@ pub fn build_linux_gpu_ld_library_path(bin_path: &Path, existing_host_ld: Option
         push_unique(parent.to_string_lossy().to_string());
     }
 
-    // Arch Linux / CachyOS installs CUDA under `/opt/cuda`, while Debian/Ubuntu uses `/usr/local/cuda`.
+    // Check toolkit and system driver library directories.
     for candidate in [
         "/opt/cuda/lib64",
         "/opt/cuda/targets/x86_64-linux/lib",
         "/usr/local/cuda/lib64",
+        "/usr/lib64/nvidia",
         "/usr/lib/nvidia",
     ] {
         if PathBuf::from(candidate).is_dir() {
@@ -72,7 +73,7 @@ fn clean_env_ld_library_path() -> Option<String> {
 }
 
 /// Sanitizes child process environment on Linux (prevents AppImage `LD_LIBRARY_PATH` pollution
-/// when invoking system binaries on Arch Linux / CachyOS).
+/// when invoking system binaries from a legacy AppImage).
 pub fn configure_std_command(cmd: &mut std::process::Command) -> &mut std::process::Command {
     if let Some(clean_ld) = clean_env_ld_library_path() {
         if clean_ld.is_empty() {
@@ -96,7 +97,7 @@ pub fn configure_tokio_command(cmd: &mut tokio::process::Command) -> &mut tokio:
 }
 
 /// Configures a native Linux GPU/AI child process (`llama-server`, `whisper-cli`) with
-/// sanitized host `LD_LIBRARY_PATH` + local `.so` directory + Arch/CachyOS CUDA lib paths.
+/// sanitized host `LD_LIBRARY_PATH` + local `.so` directory + CUDA library paths.
 pub fn configure_linux_gpu_env_std<'a>(
     cmd: &'a mut std::process::Command,
     bin_path: &Path,

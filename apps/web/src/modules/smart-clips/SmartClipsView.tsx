@@ -441,7 +441,7 @@ export const SmartClipsView: React.FC<SmartClipsViewProps> = ({
             </button>
           }
         >
-          Instale o FFmpeg em Configurações → Ferramentas para analisar frames e renderizar Shorts.
+          Instale o FFmpeg em Downloads → Ferramentas para analisar frames e renderizar Shorts.
         </Callout>
       )}
 

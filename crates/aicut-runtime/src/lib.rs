@@ -271,6 +271,7 @@ pub struct ToolsListOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ToolInstallInput {
+    pub version: Option<String>,
     pub tool_id: String,
 }
 
@@ -336,6 +337,20 @@ impl AicutModule for ToolsModule {
                     })
                 },
             )),
+            Arc::new(TypedAction::<ToolInstallInput, Vec<String>, _>::new(
+                "tools.versions", "tools", "Versões disponíveis", "List recent compatible release tags.",
+                ActionAnnotations { read_only: true, ..Default::default() }, |ctx, input| Box::pin(async move {
+                    Ok((ctx.kernel.tools.versions(&input.tool_id).await?, "Versões disponíveis".into(), vec![]))
+                }),
+            )),
+            Arc::new(TypedAction::<ToolInstallInput, ToolStatus, _>::new(
+                "tools.uninstall", "tools", "Desinstalar ferramenta", "Remove the managed copy from the Aicut workspace.",
+                ActionAnnotations { destructive: true, ..Default::default() },
+                |ctx, input| Box::pin(async move {
+                    let status = ctx.kernel.tools.uninstall(&input.tool_id).await?;
+                    Ok((status, "Cópia gerenciada removida".into(), vec![]))
+                }),
+            )),
             Arc::new(TypedAction::<ToolInstallInput, ToolStatus, _>::new(
                 "tools.install",
                 "tools",
@@ -344,7 +359,7 @@ impl AicutModule for ToolsModule {
                 ActionAnnotations { long_running: true, ..Default::default() },
                 |ctx, input| {
                     Box::pin(async move {
-                        let status = ctx.kernel.tools.install_or_update(&input.tool_id, ctx.actor).await?;
+                        let status = ctx.kernel.tools.install_version(&input.tool_id, input.version.as_deref(), ctx.actor).await?;
                         let summary = format!(
                             "Installed/updated {} ({})",
                             status.display_name,
@@ -581,7 +596,7 @@ impl AicutModule for UiModule {
                 ActionAnnotations { idempotent: true, ..Default::default() },
                 |ctx, input| {
                     Box::pin(async move {
-                        let allowed = ["ingest", "library", "transcribe", "smart-clips", "framing", "motion-studio", "audio-master", "jobs", "modules", "ai-connect", "settings"];
+                        let allowed = ["ingest", "library", "transcribe", "smart-clips", "framing", "motion-studio", "audio-master", "downloads", "jobs", "modules", "ai-connect", "settings"];
                         if !allowed.contains(&input.route.as_str()) {
                             return Err(AicutError::invalid_input(format!(
                                 "Unknown route '{}'. Valid routes: {}",
@@ -807,6 +822,21 @@ impl AicutModule for AudioMasterModule {
                         ))
                     })
                 },
+            )),
+            Arc::new(TypedAction::<EmptyInput, serde_json::Value, _>::new(
+                "audio.remove_rnnoise", "audio-master", "Remover RNNoise", "Remove the managed noise model.",
+                ActionAnnotations { destructive: true, ..Default::default() },
+                |ctx, _| Box::pin(async move {
+                    let _directory = aicut_core::workspace::lock_downloads(&ctx.kernel.workspace.models_dir)?;
+                    let path = rnnoise_model_path(&ctx.kernel.workspace.models_dir);
+                    for file in [path.with_extension("rnnn.tmp"), path] {
+                        match std::fs::remove_file(file) {
+                            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                            _ => (),
+                        }
+                    }
+                    Ok((serde_json::json!({}), "RNNoise removido".into(), vec![]))
+                }),
             )),
             Arc::new(TypedAction::<EmptyInput, AudioConfigOutput, _>::new(
                 "audio.install_rnnoise",

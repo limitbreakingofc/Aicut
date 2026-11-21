@@ -675,14 +675,14 @@ mod integration_tests {
 
         let video_av = tmp.path().join("sample_av.mp4");
         let video_only = tmp.path().join("sample_vo.mp4");
-        let audio_only = tmp.path().join("sample_audio.mp3");
+        let audio_only = tmp.path().join("sample_audio.wav");
 
         // 1. Video + Audio
         assert!(Command::new("ffmpeg")
             .args([
                 "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=24",
                 "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
-                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"
+                "-c:v", "mpeg4", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"
             ])
             .arg(&video_av)
             .status()
@@ -693,7 +693,7 @@ mod integration_tests {
         assert!(Command::new("ffmpeg")
             .args([
                 "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=24",
-                "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p"
+                "-an", "-c:v", "mpeg4", "-pix_fmt", "yuv420p"
             ])
             .arg(&video_only)
             .status()
@@ -704,7 +704,7 @@ mod integration_tests {
         assert!(Command::new("ffmpeg")
             .args([
                 "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
-                "-c:a", "libmp3lame"
+                "-c:a", "pcm_s16le"
             ])
             .arg(&audio_only)
             .status()

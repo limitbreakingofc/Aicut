@@ -250,6 +250,32 @@ impl AicutModule for SmartClipsModule {
 
     fn actions(&self) -> Vec<Arc<dyn ActionHandler>> {
         vec![
+            Arc::new(TypedAction::<EmptyInput, bool, _>::new(
+                "clips.face_status", "smart-clips", "UltraFace instalado", "Check managed face model.",
+                ActionAnnotations { read_only: true, ..Default::default() }, |ctx, _| Box::pin(async move {
+                    Ok((face_track::installed_face_model(&ctx.kernel).is_ok(), "UltraFace".into(), vec![]))
+                }),
+            )),
+            Arc::new(TypedAction::<EmptyInput, bool, _>::new(
+                "clips.face_install", "smart-clips", "Instalar UltraFace", "Install managed face model.",
+                ActionAnnotations::default(), |ctx, _| Box::pin(async move {
+                    face_track::ensure_face_detector_model(&ctx.kernel).await?;
+                    Ok((true, "UltraFace instalado".into(), vec![]))
+                }),
+            )),
+            Arc::new(TypedAction::<EmptyInput, bool, _>::new(
+                "clips.face_remove", "smart-clips", "Remover UltraFace", "Remove managed face model.",
+                ActionAnnotations { destructive: true, ..Default::default() }, |ctx, _| Box::pin(async move {
+                    let _directory = aicut_core::workspace::lock_downloads(&ctx.kernel.workspace.models_dir)?;
+                    let path = face_track::face_model_path(&ctx.kernel);
+                    for file in [path.with_extension("onnx.part"), path] {
+                        if let Err(e) = std::fs::remove_file(file) {
+                            if e.kind() != std::io::ErrorKind::NotFound { return Err(e.into()); }
+                        }
+                    }
+                    Ok((false, "UltraFace removido".into(), vec![]))
+                }),
+            )),
             Arc::new(TypedAction::<EmptyInput, VisionModelsListOutput, _>::new(
                 "clips.models_list",
                 "smart-clips",

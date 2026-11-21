@@ -455,6 +455,8 @@ pub async fn download_model(
     let dir = whisper_models_dir(&kernel);
     std::fs::create_dir_all(&dir)?;
 
+    let _directory = aicut_core::workspace::lock_downloads(&kernel.workspace.models_dir)?;
+    let stage = aicut_core::workspace::download_stage(&kernel.workspace.models_dir)?;
     let (job, cancel) = kernel.jobs.create_job(
         "transcribe.model_download",
         format!("Baixar modelo {}", spec.display_name),
@@ -467,7 +469,7 @@ pub async fn download_model(
         format!("Baixando {} de {}", spec.filename, spec.download_url),
     );
 
-    let tmp_path = dir.join(format!(".{}.part", spec.filename));
+    let tmp_path = stage.path().join("weights");
     let final_path = dir.join(&spec.filename);
 
     let result: AicutResult<()> = async {
@@ -530,9 +532,6 @@ pub async fn download_model(
         file.flush()?;
         drop(file);
 
-        if final_path.exists() {
-            let _ = std::fs::remove_file(&final_path);
-        }
         std::fs::rename(&tmp_path, &final_path)?;
         Ok(())
     }
@@ -570,6 +569,7 @@ pub fn delete_model(kernel: &AicutKernel, model_id: &str) -> AicutResult<ModelUn
         .find(|m| m.id == model_id)
         .ok_or_else(|| AicutError::not_found(format!("Unknown Whisper model '{model_id}'")))?;
     let dir = whisper_models_dir(kernel);
+    let _directory = aicut_core::workspace::lock_downloads(&kernel.workspace.models_dir)?;
     let candidates = [
         dir.join(&spec.filename),
         dir.join(format!(".{}.part", spec.filename)),
@@ -603,7 +603,7 @@ mod tests {
     fn fake_hw(vram_mb: Option<u64>, ram_mb: u64, accel: AccelBackend) -> HardwareProfile {
         HardwareProfile {
             os: "linux".into(),
-            os_version: "CachyOS Linux".into(),
+            os_version: "Fedora Linux".into(),
             arch: "x86_64".into(),
             platform_tag: "linux-x64".into(),
             cpu_brand: "Test CPU".into(),

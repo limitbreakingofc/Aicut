@@ -1,3 +1,4 @@
+import { DownloadsView } from "./modules/core/DownloadsView";
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import {
   Activity,
@@ -316,6 +317,7 @@ function AicutApp() {
 
   const openSettingsTab = useCallback(
     (tab: SettingsTabId) => {
+      if (tab === "tools") { navigate("downloads"); return; }
       setRoute("settings");
       setSettingsTab(tab);
       syncUi({ active_route: "settings" });
@@ -424,7 +426,7 @@ function AicutApp() {
       },
       {
         id: "cfg:tools",
-        label: "Configurações → Ferramentas",
+        label: "Downloads → Ferramentas",
         description: "Instalar/atualizar FFmpeg, yt-dlp, whisper.cpp e llama-server",
         icon: Wrench,
         group: "Sub-abas",
@@ -670,6 +672,7 @@ function AicutApp() {
             />
           )}
 
+          {route === "downloads" && <DownloadsView jobs={jobs} tools={tools} workspace={workspace} refreshTools={refreshTools} />}
           {route === "settings" && (
             <SettingsView
               activeTab={settingsTab}

@@ -85,7 +85,6 @@ export const AudioMasterView: React.FC<AudioMasterViewProps> = ({
 
   const [audioInfo, setAudioInfo] = useState<AudioConfigOutput | null>(null);
   const [saving, setSaving] = useState(false);
-  const [installingModel, setInstallingModel] = useState(false);
   const [selectedMediaId, setSelectedMediaId] = useState<string>(playableMedia[0]?.id ?? "");
   const [enhancing, setEnhancing] = useState(false);
   const [lastResult, setLastResult] = useState<AudioEnhanceResult | null>(null);
@@ -135,24 +134,6 @@ export const AudioMasterView: React.FC<AudioMasterViewProps> = ({
     }
   };
 
-  const handleInstallRnnoise = async () => {
-    setInstallingModel(true);
-    try {
-      const res = await runAction<AudioConfigOutput>("audio.install_rnnoise");
-      setAudioInfo(res.data);
-      onNotify(
-        "success",
-        "RNNoise Neural instalado",
-        "Modelo gratuito de redução neural de ruído ativo automaticamente em todas as exportações.",
-      );
-    } catch (e) {
-      const msg = e instanceof AicutActionError ? e.message : (e as Error).message;
-      onNotify("error", "Falha ao instalar RNNoise", msg);
-    } finally {
-      setInstallingModel(false);
-    }
-  };
-
   const handleEnhanceMedia = async () => {
     if (!selectedMediaId) return;
     setEnhancing(true);
@@ -187,12 +168,12 @@ export const AudioMasterView: React.FC<AudioMasterViewProps> = ({
           tone="warning"
           title="FFmpeg necessário"
           actions={
-            <button type="button" className="btn btn-primary btn-sm" onClick={() => onNavigate("settings")}>
+            <button type="button" className="btn btn-primary btn-sm" onClick={() => onNavigate("downloads")}>
               Instalar FFmpeg
             </button>
           }
         >
-          Instale o FFmpeg em Configurações → Ferramentas (ou via <code>sudo pacman -S ffmpeg</code>) para habilitar a masterização automática de áudio.
+          Instale o FFmpeg em Downloads → Ferramentas para habilitar a masterização automática de áudio.
         </Callout>
       )}
 
@@ -267,11 +248,8 @@ export const AudioMasterView: React.FC<AudioMasterViewProps> = ({
                     <button
                       type="button"
                       className="btn btn-sm"
-                      disabled={installingModel}
-                      onClick={() => void handleInstallRnnoise()}
-                    >
-                      <BusyIcon busy={installingModel} icon={Download} size={13} />
-                      Baixar modelo RNNoise (85 KB)
+                      onClick={() => onNavigate("downloads")}>
+                      Gerenciar downloads
                     </button>
                   )}
                 </div>

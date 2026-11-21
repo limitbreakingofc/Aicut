@@ -68,7 +68,7 @@ export function StatusBar({
           type="button"
           className="status-item"
           data-tone="warning"
-          title="Ferramentas pendentes em Configurações → Ferramentas"
+          title="Ferramentas pendentes em Downloads → Ferramentas"
           onClick={() => onOpenSettingsTab("tools")}
           onContextMenu={(e) =>
             menu.open(e, [

@@ -3,9 +3,10 @@ import type { RouteId } from "../lib/types";
 
 /** Single source of truth for app navigation: studio workspaces + Settings hub pinned at bottom. */
 
-export const APP_VERSION = "0.11.0";
+export const APP_VERSION = "0.12.0";
 
 export type PrimaryRouteId =
+  | "downloads"
   | "ingest"
   | "library"
   | "transcribe"
@@ -52,7 +53,7 @@ export const ROUTES: RouteMeta[] = [
     id: "transcribe",
     label: "Transcrever",
     title: "Transcrever IA",
-    description: "Whisper local em abas: transcrever, resultados e modelos.",
+    description: "Whisper local em abas: transcrever e resultados.",
     icon: Mic,
     keywords: "whisper legenda srt vtt transcrição modelo gpu fcpxml",
   },
@@ -80,6 +81,7 @@ export const ROUTES: RouteMeta[] = [
     icon: SlidersHorizontal,
     keywords: "audio masterizacao youtube lufs ruido rnnoise compressao volume equalizacao voz",
   },
+  { id: "downloads", label: "Downloads", title: "Downloads", description: "Ferramentas e modelos de IA local", icon: Download },
   {
     id: "settings",
     label: "Configurações",
@@ -114,6 +116,7 @@ export function resolveRouteTarget(id: RouteId): {
     case "smart-clips":
     case "motion-studio":
     case "audio-master":
+    case "downloads":
     case "settings":
       return { route: id };
     default:

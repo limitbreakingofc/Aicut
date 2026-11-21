@@ -196,6 +196,7 @@ pub fn installed_rnnoise_model(models_dir: &Path) -> Option<PathBuf> {
 
 /// Downloads the lightweight (~85 KB) open-source RNNoise neural speech model for FFmpeg `arnndn`.
 pub async fn download_rnnoise_model(kernel: &AicutKernel) -> AicutResult<PathBuf> {
+    let _directory = crate::workspace::lock_downloads(&kernel.workspace.models_dir)?;
     let dest = rnnoise_model_path(&kernel.workspace.models_dir);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
@@ -222,7 +223,8 @@ pub async fn download_rnnoise_model(kernel: &AicutKernel) -> AicutResult<PathBuf
             "Arquivo do modelo RNNoise veio incompleto.",
         ));
     }
-    let tmp = dest.with_extension("rnnn.tmp");
+    let stage = crate::workspace::download_stage(&kernel.workspace.models_dir)?;
+    let tmp = stage.path().join("model");
     std::fs::write(&tmp, &bytes)?;
     std::fs::rename(&tmp, &dest)?;
     Ok(dest)

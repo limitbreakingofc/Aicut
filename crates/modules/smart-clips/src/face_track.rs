@@ -203,8 +203,18 @@ impl FaceDetector {
     }
 }
 
+pub fn face_model_path(kernel: &AicutKernel) -> PathBuf {
+    kernel.workspace.models_dir.join("vision").join(ULTRAFACE_MODEL_FILENAME)
+}
+pub fn installed_face_model(kernel: &AicutKernel) -> AicutResult<PathBuf> {
+    let path = face_model_path(kernel);
+    if path.metadata().is_ok_and(|m| m.len() > 200_000) { Ok(path) }
+    else { Err(AicutError::not_found("Instale UltraFace na aba Downloads.")) }
+}
+
 /// Ensures the tiny (~1.2 MB) UltraFace ONNX model exists locally, downloading it once automatically.
 pub async fn ensure_face_detector_model(kernel: &AicutKernel) -> AicutResult<PathBuf> {
+    let _directory = aicut_core::workspace::lock_downloads(&kernel.workspace.models_dir)?;
     let vision_dir = kernel.workspace.models_dir.join("vision");
     std::fs::create_dir_all(&vision_dir)?;
     let dest = vision_dir.join(ULTRAFACE_MODEL_FILENAME);
@@ -219,7 +229,8 @@ pub async fn ensure_face_detector_model(kernel: &AicutKernel) -> AicutResult<Pat
             Ok(resp) if resp.status().is_success() => {
                 if let Ok(bytes) = resp.bytes().await {
                     if bytes.len() > 200_000 {
-                        let tmp = dest.with_extension("onnx.part");
+                        let stage = aicut_core::workspace::download_stage(&kernel.workspace.models_dir)?;
+                        let tmp = stage.path().join("model");
                         std::fs::write(&tmp, &bytes)?;
                         if dest.exists() {
                             let _ = std::fs::remove_file(&dest);
@@ -419,7 +430,7 @@ pub async fn compute_dual_tracks(
 
     // Download UltraFace (~1.2 MB) once if missing. If offline/unreachable, content action tracking
     // or static custom rects can still proceed cleanly without failing the render.
-    let model_path = ensure_face_detector_model(kernel).await.ok();
+    let model_path = installed_face_model(kernel).ok();
 
     let tmp_dir = std::env::temp_dir().join(format!("aicut-facetrack-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&tmp_dir)?;

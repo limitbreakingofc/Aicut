@@ -22,5 +22,4 @@ tracing.workspace = true
 tract-onnx.workspace = true
 uuid.workspace = true
 
-[dev-dependencies]
 tempfile.workspace = true

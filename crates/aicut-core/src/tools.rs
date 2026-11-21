@@ -84,6 +84,7 @@ pub enum ArchiveKind {
 }
 
 pub struct ToolManager {
+    mutation: tokio::sync::Mutex<()>,
     bin_dir: PathBuf,
     hardware: HardwareProfile,
     definitions: RwLock<HashMap<String, ToolDefinition>>,
@@ -106,6 +107,7 @@ impl ToolManager {
             .unwrap_or_else(|_| reqwest::Client::new());
 
         Self {
+            mutation: Default::default(),
             bin_dir,
             hardware,
             definitions: RwLock::new(HashMap::new()),
@@ -143,6 +145,15 @@ impl ToolManager {
     /// Resolves a binary path: checks Aicut's managed `bin_dir` (and `bin_dir/whisper`), then system PATH.
     pub fn resolve_binary(&self, binary_name: &str) -> Option<(PathBuf, bool)> {
         let managed_name = platform_binary_name(binary_name);
+        let bundle = match binary_name {
+            "ffmpeg" | "ffprobe" => Some("ffmpeg-bundle"),
+            "yt-dlp" => Some("yt-dlp-bundle"),
+            _ => None,
+        };
+        if let Some(dir) = bundle {
+            let path = self.bin_dir.join(dir).join(&managed_name);
+            if path.is_file() { return Some((path, true)); }
+        }
         let direct = self.bin_dir.join(&managed_name);
         if direct.is_file() {
             return Some((direct, true));
@@ -208,7 +219,7 @@ impl ToolManager {
                 };
                 let hw_note = match accel {
                     AccelBackend::CudaNvenc => {
-                        "GPU NVIDIA detectada: suporte NVENC/NVDEC acelerado por hardware (também aproveita `pacman -S ffmpeg` se já instalado no sistema)."
+                        "GPU NVIDIA detectada: suporte NVENC/NVDEC acelerado por hardware com um build do FFmpeg que inclua esses encoders."
                     }
                     AccelBackend::AmfDirectml => {
                         "GPU AMD detectada: build Linux GPL otimizada com VAAPI/libx264."
@@ -232,11 +243,11 @@ impl ToolManager {
                         .unwrap_or_else(|| "NVIDIA".to_string());
                     let note = if self.hardware.cuda_runtime_installed {
                         format!(
-                            "GPU NVIDIA ({cuda_label}) + CUDA Runtime detectados: prioriza build Linux CUDA/Vulkan (ou `whisper-cli` nativo do Arch/CachyOS no PATH)."
+                            "GPU NVIDIA ({cuda_label}) + CUDA Runtime detectados: prioriza build Linux CUDA/Vulkan (ou `whisper-cli` já disponível no PATH)."
                         )
                     } else {
                         format!(
-                            "GPU NVIDIA ({cuda_label}) detectada: usa Vulkan/Linux oficial ou `whisper.cpp-cuda` nativo do Arch/CachyOS se instalado."
+                            "GPU NVIDIA ({cuda_label}) detectada: usa Vulkan/Linux oficial ou `whisper-cli` com suporte a CUDA, se instalado."
                         )
                     };
                     (format!("whisper.cpp Linux x64 ({cuda_label})"), note)
@@ -268,7 +279,7 @@ impl ToolManager {
                     } else {
                         (
                             format!("llama.cpp Linux x64 Vulkan (GPU NVIDIA {cuda_label})"),
-                            "GPU NVIDIA detectada no Linux: usa aceleração Vulkan na GPU sem precisar do toolkit CUDA completo (instale `sudo pacman -S cuda` para habilitar backend CUDA nativo).".to_string(),
+                            "Prioriza CUDA com o runtime fornecido pela release quando compatível com o driver. Usa Vulkan como alternativa.".to_string(),
                         )
                     }
                 }
@@ -305,19 +316,8 @@ impl ToolManager {
         let (installed, binary_path, managed_by_aicut, installed_version) = match resolved {
             Some((path, managed)) => {
                 // For managed whisper.cpp or llama.cpp, read stored version marker if available
-                let marker_ver = if def.id == "whisper" && managed {
-                    std::fs::read_to_string(self.bin_dir.join("whisper").join(".version"))
-                        .ok()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                } else if def.id == "llama-server" && managed {
-                    std::fs::read_to_string(self.bin_dir.join("llama").join(".version"))
-                        .ok()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                } else {
-                    None
-                };
+                let marker_ver = path.parent().filter(|p| managed && *p != self.bin_dir)
+                    .and_then(|dir| std::fs::read_to_string(dir.join(".version")).ok());
                 let ver = match marker_ver {
                     Some(v) => Some(v),
                     None => probe_binary_version(&path, &def.version_args).await,
@@ -413,6 +413,34 @@ impl ToolManager {
 
     /// Installs or updates a tool automatically choosing the optimal build for the detected hardware.
     pub async fn install_or_update(&self, tool_id: &str, actor: ActorKind) -> AicutResult<ToolStatus> {
+        self.install_version(tool_id, None, actor).await
+    }
+
+    pub async fn uninstall(&self, tool_id: &str) -> AicutResult<ToolStatus> {
+        let _guard = self.mutation.lock().await;
+        let _directory = crate::workspace::lock_downloads(&self.bin_dir)?;
+        let names: &[&str] = match tool_id {
+            "whisper" => &["whisper", "whisper-cli"],
+            "llama-server" => &["llama", "llama-server"],
+            "yt-dlp" => &["yt-dlp-bundle", "yt-dlp"],
+            "ffmpeg" | "ffprobe" => &["ffmpeg-bundle", "ffmpeg", "ffprobe"],
+            _ => return Err(AicutError::invalid_input("Ferramenta desconhecida")),
+        };
+        for name in names {
+            let path = self.bin_dir.join(name);
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.is_dir() && matches!(*name, "whisper" | "llama" | "yt-dlp-bundle" | "ffmpeg-bundle") => std::fs::remove_dir_all(path)?,
+                Ok(_) => std::fs::remove_file(path)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        self.status_of(tool_id).await
+    }
+
+    pub async fn install_version(&self, tool_id: &str, version: Option<&str>, actor: ActorKind) -> AicutResult<ToolStatus> {
+        let _guard = self.mutation.lock().await;
+        let _directory = crate::workspace::lock_downloads(&self.bin_dir)?;
         let def = self
             .definitions
             .read()
@@ -443,7 +471,7 @@ impl ToolManager {
         self.jobs.mark_running(&job.id, "resolving_release");
 
         let outcome: AicutResult<ToolStatus> = async {
-            let resolved = match &target_def.strategy {
+            let resolved = if let Some(tag) = version { self.tagged_release(&target_def.id, tag).await? } else { match &target_def.strategy {
                 ToolInstallStrategy::YtDlpOfficialRelease => self.resolve_ytdlp_release().await?,
                 ToolInstallStrategy::FfmpegHardwareBundle => self.resolve_ffmpeg_release().await?,
                 ToolInstallStrategy::WhisperCppOfficialRelease => {
@@ -464,7 +492,7 @@ impl ToolManager {
                         ),
                     ));
                 }
-            };
+            }};
 
             self.jobs.append_log(
                 &job.id,
@@ -479,7 +507,8 @@ impl ToolManager {
             self.jobs
                 .append_log(&job.id, format!("Baixando de {}", resolved.url));
 
-            let tmp_path = self.bin_dir.join(format!(".download-{}.tmp", job.id));
+            let stage = crate::workspace::download_stage(&self.bin_dir)?;
+            let tmp_path = stage.path().join("download");
             self.download_file(&resolved.url, &tmp_path, &job.id, &cancel)
                 .await?;
 
@@ -493,47 +522,35 @@ impl ToolManager {
                 },
             );
 
-            match resolved.archive_kind {
+            let payload = stage.path().join("payload");
+            std::fs::create_dir(&payload)?;
+            let folder = match resolved.archive_kind {
                 ArchiveKind::SingleBinary => {
-                    let final_path = self.bin_dir.join(platform_binary_name(&target_def.binary_name));
-                    replace_file(&tmp_path, &final_path)?;
-                    make_executable(&final_path)?;
+                    let binary = payload.join(&target_def.binary_name);
+                    std::fs::rename(&tmp_path, &binary)?;
+                    make_executable(&binary)?;
+                    "yt-dlp-bundle"
                 }
-                ArchiveKind::FfmpegTarXz => {
-                    extract_ffmpeg_from_tarxz(&tmp_path, &self.bin_dir)?;
-                    let _ = std::fs::remove_file(&tmp_path);
-                }
-                ArchiveKind::FfmpegTarGz => {
-                    extract_ffmpeg_from_targz(&tmp_path, &self.bin_dir)?;
-                    let _ = std::fs::remove_file(&tmp_path);
-                }
-                ArchiveKind::WhisperZip => {
-                    let whisper_dir = self.bin_dir.join("whisper");
-                    extract_whisper_from_zip(&tmp_path, &whisper_dir)?;
-                    let _ = std::fs::write(whisper_dir.join(".version"), &resolved.version);
-                    let _ = std::fs::remove_file(&tmp_path);
-                }
-                ArchiveKind::WhisperTarGz => {
-                    let whisper_dir = self.bin_dir.join("whisper");
-                    extract_whisper_from_targz(&tmp_path, &whisper_dir)?;
-                    let _ = std::fs::write(whisper_dir.join(".version"), &resolved.version);
-                    let _ = std::fs::remove_file(&tmp_path);
-                }
-                ArchiveKind::LlamaZip => {
-                    let llama_dir = self.bin_dir.join("llama");
-                    extract_llama_from_zip(&tmp_path, &llama_dir)?;
-                    let _ = std::fs::remove_file(&tmp_path);
-                    let _ = std::fs::write(llama_dir.join(".version"), &resolved.version);
-                }
-                ArchiveKind::LlamaTarGz => {
-                    let llama_dir = self.bin_dir.join("llama");
-                    extract_llama_from_targz(&tmp_path, &llama_dir)?;
-                    let _ = std::fs::write(llama_dir.join(".version"), &resolved.version);
-                    let _ = std::fs::remove_file(&tmp_path);
-                }
+                ArchiveKind::FfmpegTarXz => { extract_ffmpeg_from_tarxz(&tmp_path, &payload)?; "ffmpeg-bundle" }
+                ArchiveKind::FfmpegTarGz => { extract_ffmpeg_from_targz(&tmp_path, &payload)?; "ffmpeg-bundle" }
+                ArchiveKind::WhisperZip => { extract_whisper_from_zip(&tmp_path, &payload)?; "whisper" }
+                ArchiveKind::WhisperTarGz => { extract_whisper_from_targz(&tmp_path, &payload)?; "whisper" }
+                ArchiveKind::LlamaZip => { extract_llama_from_zip(&tmp_path, &payload)?; "llama" }
+                ArchiveKind::LlamaTarGz => { extract_llama_from_targz(&tmp_path, &payload)?; "llama" }
+            };
+            if let Some(url) = &resolved.companion_url {
+                let runtime = stage.path().join("cudart.tar.gz");
+                self.download_file(url, &runtime, &job.id, &cancel).await?;
+                extract_llama_from_targz(&runtime, &payload)?;
             }
+            if !payload.join(&target_def.binary_name).is_file() || (folder == "ffmpeg-bundle" && !payload.join("ffprobe").is_file()) {
+                return Err(AicutError::invalid_input("O pacote está incompleto."));
+            }
+            std::fs::write(payload.join(".version"), &resolved.version)?;
+            let dest = self.bin_dir.join(folder);
+            crate::workspace::publish_directory(&payload, &dest)?;
 
-            if let Ok(mut cache) = self.latest_cache.write() {
+            if let (None, Ok(mut cache)) = (version, self.latest_cache.write()) {
                 cache.insert(target_def.id.clone(), resolved.version.clone());
                 if target_def.id == "ffmpeg" {
                     cache.insert("ffprobe".to_string(), resolved.version);
@@ -569,6 +586,59 @@ impl ToolManager {
                 Err(err)
             }
         }
+    }
+
+    fn release_repo(tool: &str) -> AicutResult<&'static str> {
+        Ok(match tool {
+            "ffmpeg" => "BtbN/FFmpeg-Builds",
+            "yt-dlp" => "yt-dlp/yt-dlp",
+            "whisper" => "ggml-org/whisper.cpp",
+            "llama-server" => "ggml-org/llama.cpp",
+            _ => return Err(AicutError::invalid_input("Ferramenta sem releases.")),
+        })
+    }
+
+    pub async fn versions(&self, tool: &str) -> AicutResult<Vec<String>> {
+        let repo = Self::release_repo(tool)?;
+        let releases: Vec<serde_json::Value> = self.http.get(format!("https://api.github.com/repos/{repo}/releases?per_page=30"))
+            .send().await.and_then(|r| r.error_for_status()).map_err(|e| AicutError::internal(e.to_string()))?
+            .json().await.map_err(|e| AicutError::internal(e.to_string()))?;
+        Ok(releases.iter().filter(|r| self.release_asset(tool, r).is_ok())
+            .filter_map(|r| r["tag_name"].as_str().map(str::to_owned)).collect())
+    }
+
+    async fn tagged_release(&self, tool: &str, tag: &str) -> AicutResult<ResolvedDownload> {
+        if tag.is_empty() || tag.len() > 100 || !tag.bytes().all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b)) || tag == "." || tag == ".." {
+            return Err(AicutError::invalid_input("Informe uma tag de release válida."));
+        }
+        let repo = Self::release_repo(tool)?;
+        let api = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
+        let release: serde_json::Value = self.http.get(api).send().await
+            .and_then(|r| r.error_for_status()).map_err(|e| AicutError::internal(e.to_string()))?
+            .json().await.map_err(|e| AicutError::internal(e.to_string()))?;
+        self.release_asset(tool, &release)
+    }
+
+    fn release_asset(&self, tool: &str, release: &serde_json::Value) -> AicutResult<ResolvedDownload> {
+        let tag = release["tag_name"].as_str().ok_or_else(|| AicutError::invalid_input("Sem tag"))?;
+        let assets = release["assets"].as_array().ok_or_else(|| AicutError::invalid_input("Release sem arquivos."))?;
+        let hw = &self.hardware;
+        let asset = match tool {
+            "whisper" => select_best_whisper_asset(assets, &hw.platform_tag, hw.recommended_accel, hw.cuda_major_minor(), hw.cuda_runtime_installed)
+                .map(|(n,u,k)| (n,u,None,k)),
+            "llama-server" => select_best_llama_assets(assets, &hw.platform_tag, hw.recommended_accel, hw.cuda_major_minor(), hw.cuda_runtime_installed),
+            _ => assets.iter().find_map(|a| {
+                let name = a["name"].as_str()?;
+                let kind = match tool {
+                    "yt-dlp" if name == "yt-dlp_linux" => ArchiveKind::SingleBinary,
+                    "ffmpeg" if name.ends_with("linux64-gpl.tar.xz") => ArchiveKind::FfmpegTarXz,
+                    _ => return None,
+                };
+                Some((name.to_owned(), a["browser_download_url"].as_str()?.to_owned(), None, kind))
+            }),
+        };
+        let (build_label, url, companion_url, archive_kind) = asset.ok_or_else(|| AicutError::invalid_input("Release sem binário compatível com este hardware."))?;
+        Ok(ResolvedDownload { build_label, url, companion_url, archive_kind, version: tag.to_owned() })
     }
 
     async fn resolve_ytdlp_release(&self) -> AicutResult<ResolvedDownload> {
@@ -624,23 +694,10 @@ impl ToolManager {
     }
 
     async fn resolve_ffmpeg_release(&self) -> AicutResult<ResolvedDownload> {
-        let tag = self.hardware.platform_tag.as_str();
-        match tag {
-            "linux-arm64" => Ok(ResolvedDownload {
-                url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz".to_string(),
-                companion_url: None,
-                version: "latest-linuxarm64-gpl".to_string(),
-                build_label: "ffmpeg-master-latest-linuxarm64-gpl.tar.xz".to_string(),
-                archive_kind: ArchiveKind::FfmpegTarXz,
-            }),
-            _ => Ok(ResolvedDownload {
-                url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz".to_string(),
-                companion_url: None,
-                version: "latest-linux64-gpl".to_string(),
-                build_label: "ffmpeg-master-latest-linux64-gpl.tar.xz (NVENC + CUDA + VAAPI)".to_string(),
-                archive_kind: ArchiveKind::FfmpegTarXz,
-            }),
-        }
+        let tag = self.versions("ffmpeg").await?.into_iter()
+            .find(|tag| tag.starts_with("autobuild-"))
+            .ok_or_else(|| AicutError::not_found("Nenhuma versão datada do FFmpeg disponível."))?;
+        self.tagged_release("ffmpeg", &tag).await
     }
 
     /// Queries the latest releases of `ggml-org/whisper.cpp` (skipping source-only tags)
@@ -883,7 +940,7 @@ pub fn select_best_whisper_asset(
                 let is_linux = lower.contains("ubuntu") || lower.contains("linux");
                 if is_archive
                     && is_linux
-                    && lower.contains(arch_token)
+                    && (lower.contains(arch_token) || lower.contains("x86_64") || lower.contains("amd64"))
                     && (lower.contains("cuda") || lower.contains("cublas"))
                 {
                     let ver = parse_cuda_version_from_asset(&lower).unwrap_or((0, 0));
@@ -1002,7 +1059,7 @@ pub fn select_best_llama_assets(
                     && lower.starts_with("llama-")
                     && is_linux
                     && lower.contains("cuda")
-                    && lower.contains(arch_token)
+                    && (lower.contains(arch_token) || lower.contains("x86_64") || lower.contains("amd64"))
                 {
                     let ver = parse_cuda_version_from_asset(&lower).unwrap_or((0, 0));
                     Some((ver, n, u))
@@ -1027,7 +1084,9 @@ pub fn select_best_llama_assets(
         };
 
         let (_, name, url) = chosen;
-        Some((name.clone(), url.clone(), None, kind_for(name)))
+        let companion = entries.iter().find(|(candidate, _)| candidate == &format!("cudart-{name}")).map(|(_, url)| url.clone());
+        if !has_cuda_runtime && (driver_cuda.is_none() || companion.is_none()) { return None; }
+        Some((name.clone(), url.clone(), companion, kind_for(name)))
     };
 
     match platform_tag {
@@ -1039,7 +1098,7 @@ pub fn select_best_llama_assets(
         }),
         _ => {
             // 1. NVIDIA + installed Linux CUDA runtime (`/opt/cuda` or `/usr/lib/libcudart.so`): highest compatible CUDA build.
-            if accel == AccelBackend::CudaNvenc && has_cuda_runtime {
+            if accel == AccelBackend::CudaNvenc {
                 if let Some(m) = pick_best_linux_cuda("x64") {
                     return Some(m);
                 }
@@ -1437,9 +1496,15 @@ mod tests {
         let nv12 = select_best_llama_assets(&assets, "linux-x64", AccelBackend::CudaNvenc, Some((12, 6)), true).unwrap();
         assert_eq!(nv12.0, "llama-b5500-bin-ubuntu-cuda-12.4-x64.tar.gz");
 
-        // NVIDIA without CUDA runtime (typical fresh CachyOS with `nvidia-utils`) picks Vulkan GPU build immediately!
+        // NVIDIA without CUDA runtime picks Vulkan GPU build immediately!
         let nv_vk = select_best_llama_assets(&assets, "linux-x64", AccelBackend::CudaNvenc, Some((13, 0)), false).unwrap();
         assert_eq!(nv_vk.0, "llama-b5500-bin-ubuntu-vulkan-x64.tar.gz");
+
+        let mut bundled = assets.clone();
+        bundled.push(serde_json::json!({"name": "cudart-llama-b5500-bin-ubuntu-cuda-12.4-x64.tar.gz", "browser_download_url": "https://x/runtime.tar.gz"}));
+        let nv_bundled = select_best_llama_assets(&bundled, "linux-x64", AccelBackend::CudaNvenc, Some((12, 6)), false).unwrap();
+        assert_eq!(nv_bundled.0, "llama-b5500-bin-ubuntu-cuda-12.4-x64.tar.gz");
+        assert_eq!(nv_bundled.2.as_deref(), Some("https://x/runtime.tar.gz"));
 
         // AMD picks Vulkan
         let amd = select_best_llama_assets(&assets, "linux-x64", AccelBackend::AmfDirectml, None, false).unwrap();

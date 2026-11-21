@@ -6,33 +6,25 @@ on:
   pull_request:
 
 jobs:
-  build-linux:
-    name: Linux Tests, CLI & AppImage Build (Ubuntu 22.04 -> Arch/CachyOS Compatible)
-    runs-on: ubuntu-22.04
+  build-fedora:
+    name: Fedora ${{ matrix.fedora }} tests and RPM build
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        fedora: [44, 45]
+    container: fedora:${{ matrix.fedora }}
+    defaults:
+      run:
+        shell: bash
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Linux Tauri v2, GStreamer & FFmpeg Dependencies
+      - name: Install Fedora build and media dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            ffmpeg \
-            libwebkit2gtk-4.1-dev \
-            build-essential \
-            curl \
-            wget \
-            file \
-            patchelf \
-            squashfs-tools \
-            libxdo-dev \
-            libssl-dev \
-            libgtk-3-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            gstreamer1.0-plugins-base \
-            gstreamer1.0-plugins-good \
-            gstreamer1.0-plugins-bad \
-            gstreamer1.0-libav
+          dnf install -y gcc gcc-c++ make pkgconf-pkg-config git curl file \
+            webkit2gtk4.1-devel gtk3-devel libappindicator-gtk3-devel \
+            openssl-devel librsvg2-devel libxdo-devel rpm-build \
+            ffmpeg-free gstreamer1-plugins-base gstreamer1-plugins-good
+
+      - uses: actions/checkout@v4
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -40,7 +32,7 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 12
+          version: 10
 
       - uses: actions/setup-node@v4
         with:
@@ -52,15 +44,15 @@ jobs:
 
       - name: Install, Typecheck & Build Web UI
         run: |
-          pnpm install
+          pnpm install --frozen-lockfile
           pnpm typecheck:web
           pnpm build:web
 
       - name: Build Aicut CLI (Linux x86_64)
         run: cargo build --release -p aicut-cli
 
-      - name: Build Tauri v2 Linux AppImage
-        env:
-          NO_STRIP: "true"
-          APPIMAGE_EXTRACT_AND_RUN: "1"
-        run: pnpm tauri:build
+      - name: Build and verify Fedora RPM
+        run: |
+          pnpm tauri:build
+          rpm -qpl apps/desktop/src-tauri/target/release/bundle/rpm/*.rpm
+          dnf install -y apps/desktop/src-tauri/target/release/bundle/rpm/*.rpm

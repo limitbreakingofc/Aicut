@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::engine::{resolve_gemini_api_key, SETTING_GEMINI_DIRECTOR_MODEL, SETTING_GEMINI_SCAN_MODEL};
 use crate::face_track::{
-    detect_pip_webcam_zero_border, ensure_face_detector_model, select_dominant_face_cluster,
+    detect_pip_webcam_zero_border, installed_face_model, select_dominant_face_cluster,
     FaceBox, FaceDetector, PixelRect,
 };
 use crate::frames::probe_duration_sec;
@@ -453,7 +453,7 @@ pub async fn extract_framing_preview(
         )
         .await;
         if let (Ok(model_path), false) = (
-            ensure_face_detector_model(kernel).await,
+            installed_face_model(kernel),
             sampled_paths.is_empty(),
         ) {
             let trim = input.border_trim_pct.clamp(0.01, 0.12) as f64;
@@ -576,7 +576,7 @@ pub async fn review_webcam_framing(
         ));
     }
 
-    let model_path = ensure_face_detector_model(kernel).await.ok();
+    let model_path = installed_face_model(kernel).ok();
     let local_qa = tokio::task::spawn_blocking(move || -> AicutResult<LocalWebcamQa> {
         let imgs: Vec<RgbImage> = sample_paths
             .iter()

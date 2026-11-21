@@ -323,7 +323,7 @@ pub fn build_live_hyperframes_document(comp: &AicutComposition) -> String {
     )
 }
 
-/// Finds an installed Chromium-based browser on Linux (Arch / CachyOS / Ubuntu / Flatpak)
+/// Finds an installed Chromium-based browser on Fedora Linux
 /// for deterministic headless RGBA HyperFrames rendering via CDP.
 pub fn find_system_chromium() -> Option<PathBuf> {
     if let Ok(env_bin) = std::env::var("AICUT_CHROMIUM_BIN") {
@@ -392,7 +392,7 @@ where
     let Some(chromium_bin) = find_system_chromium() else {
         return Err(AicutError::dependency_missing(
             "chromium",
-            "Nenhum navegador Chromium/Chrome/Brave encontrado para renderizar as animações do Motion Studio. No CachyOS/Arch instale com: sudo pacman -S chromium",
+            "Nenhum navegador Chromium/Chrome/Brave encontrado para renderizar as animações do Motion Studio. No Fedora, instale com sudo dnf install chromium.",
         ));
     };
 

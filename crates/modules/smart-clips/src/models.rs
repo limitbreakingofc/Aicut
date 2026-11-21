@@ -471,7 +471,11 @@ pub async fn download_vision_model(
     })?;
 
     let dir = model_dir_for(&kernel, &spec.id);
-    std::fs::create_dir_all(&dir)?;
+    let _directory = aicut_core::workspace::lock_downloads(&kernel.workspace.models_dir)?;
+    std::fs::create_dir_all(vision_models_dir(&kernel))?;
+    let stage = aicut_core::workspace::download_stage(&kernel.workspace.models_dir)?;
+    let payload = stage.path().join("model");
+    std::fs::create_dir(&payload)?;
 
     let (job, cancel) = kernel.jobs.create_job(
         "clips.model_download",
@@ -485,8 +489,8 @@ pub async fn download_vision_model(
         let http = kernel.tools.http_client();
         let (model_url, mmproj_url, resolved_mmproj_name) = resolve_hf_pair_urls(http, &spec).await;
 
-        let model_dst = dir.join(&spec.model_filename);
-        let mmproj_dst = dir.join(&resolved_mmproj_name);
+        let model_dst = payload.join(&spec.model_filename);
+        let mmproj_dst = payload.join(&resolved_mmproj_name);
 
         if !model_dst.is_file() {
             kernel.jobs.append_log(
@@ -524,6 +528,7 @@ pub async fn download_vision_model(
             .await?;
         }
 
+        aicut_core::workspace::publish_directory(&payload, &dir)?;
         list_vision_models(&kernel)
             .into_iter()
             .find(|m| m.id == spec.id)
@@ -633,6 +638,7 @@ pub fn delete_vision_model(
     kernel: &AicutKernel,
     model_id: &str,
 ) -> AicutResult<VisionModelUninstallResult> {
+    let _directory = aicut_core::workspace::lock_downloads(&kernel.workspace.models_dir)?;
     let _spec = find_spec(model_id).ok_or_else(|| {
         AicutError::not_found(format!("Unknown local vision model '{model_id}'"))
     })?;
@@ -679,7 +685,7 @@ mod tests {
     fn fake_hw(accel: AccelBackend, vram_mb: Option<u64>, ram_mb: u64) -> HardwareProfile {
         HardwareProfile {
             os: "linux".into(),
-            os_version: "CachyOS Linux".into(),
+            os_version: "Fedora Linux".into(),
             arch: "x86_64".into(),
             platform_tag: "linux-x64".into(),
             cpu_brand: "Test CPU".into(),

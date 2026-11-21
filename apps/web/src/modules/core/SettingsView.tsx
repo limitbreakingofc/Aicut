@@ -109,10 +109,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 }) => {
   const menu = useContextMenu();
 
-  // Tools state
-  const [checking, setChecking] = useState(false);
-  const [updatingAll, setUpdatingAll] = useState(false);
-  const [busyTool, setBusyTool] = useState<string | null>(null);
 
   // AI & Keys state (single source of truth for Cortes Shorts, Enquadramento & Motion Studio)
   const [aiConfig, setAiConfig] = useState<ClipsConfig | null>(null);
@@ -121,14 +117,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [geminiDirectorModel, setGeminiDirectorModel] = useState("auto");
   const [savingAi, setSavingAi] = useState(false);
   const [visionModels, setVisionModels] = useState<VisionModelStatus[]>([]);
-  const [totalVisionBytes, setTotalVisionBytes] = useState(0);
   const [selectedLocalModel, setSelectedLocalModel] = useState("");
-  const [installingLlama, setInstallingLlama] = useState(false);
-  const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
-  const [uninstallingModel, setUninstallingModel] = useState<string | null>(null);
 
-  const llamaTool = tools.find((t) => t.id === "llama-server");
-  const primaryGpu = hardware?.gpus[0] ?? null;
 
   const loadAiConfig = useCallback(async () => {
     try {
@@ -146,7 +136,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
       const mList = modelsRes.data.models ?? [];
       setVisionModels(mList);
-      setTotalVisionBytes(modelsRes.data.total_installed_bytes ?? 0);
       setSelectedLocalModel((curr) => {
         if (curr && mList.some((m) => m.id === curr && m.installed)) return curr;
         const firstInst = mList.find((m) => m.installed);
@@ -183,110 +172,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   }
 
-  async function handleInstallLlama() {
-    setInstallingLlama(true);
-    try {
-      const res = await runAction("tools.install", { tool_id: "llama-server" });
-      await onRefreshTools();
-      onNotify("success", "llama.cpp server pronto!", res.summary);
-    } catch (e) {
-      onNotify("error", "Falha ao instalar llama-server", (e as Error).message);
-    } finally {
-      setInstallingLlama(false);
-    }
-  }
-
-  async function handleDownloadVisionModel(modelId: string) {
-    setDownloadingModel(modelId);
-    try {
-      const res = await runAction<{ job_id?: string }>("clips.model_download", { model_id: modelId, wait: false });
-      onNotify("info", "Download do modelo iniciado", res.summary);
-      setTimeout(() => void loadAiConfig(), 1500);
-    } catch (e) {
-      const msg = e instanceof AicutActionError ? e.message : (e as Error).message;
-      onNotify("error", "Erro ao baixar modelo", msg);
-    } finally {
-      setDownloadingModel(null);
-    }
-  }
-
-  async function handleDeleteVisionModel(modelId: string) {
-    setUninstallingModel(modelId);
-    try {
-      const res = await runAction("clips.model_delete", { model_id: modelId });
-      await loadAiConfig();
-      onNotify("info", "Modelo removido", res.summary);
-    } catch (e) {
-      onNotify("error", "Erro ao remover modelo", (e as Error).message);
-    } finally {
-      setUninstallingModel(null);
-    }
-  }
-
-  async function handleCheckUpdates() {
-    setChecking(true);
-    try {
-      const res = await runAction("tools.check_updates");
-      await onRefreshTools();
-      onNotify("info", "Verificação concluída", res.summary);
-    } catch (e) {
-      onNotify("error", "Erro ao verificar atualizações", (e as Error).message);
-    } finally {
-      setChecking(false);
-    }
-  }
-
-  async function handleInstallTool(toolId: string, label: string) {
-    setBusyTool(toolId);
-    try {
-      const res = await runAction("tools.install", { tool_id: toolId });
-      await onRefreshTools();
-      onNotify("success", `${label} pronto!`, res.summary);
-    } catch (e) {
-      onNotify("error", `Falha ao instalar/atualizar ${label}`, (e as Error).message);
-    } finally {
-      setBusyTool(null);
-    }
-  }
-
-  async function handleUpdateAll() {
-    setUpdatingAll(true);
-    try {
-      await runAction("tools.update_all");
-      await onRefreshTools();
-      onNotify("success", "Ferramentas atualizadas", "As melhores versões para seu hardware foram instaladas.");
-    } catch (e) {
-      onNotify("error", "Erro ao atualizar ferramentas", (e as Error).message);
-    } finally {
-      setUpdatingAll(false);
-    }
-  }
-
-  const installLabel = (tool: ToolStatus) =>
-    !tool.installed ? "Instalar melhor versão" : tool.update_available ? "Atualizar" : "Reinstalar";
-
-  const toolMenu = (tool: ToolStatus): MenuItems => [
-    { type: "label", label: `${tool.display_name} · ${tool.owner_module}` },
-    {
-      label: installLabel(tool),
-      icon: Download,
-      disabled: busyTool === tool.id || updatingAll,
-      onSelect: () => void handleInstallTool(tool.id, tool.display_name),
-    },
-    { type: "separator" },
-    tool.binary_path && {
-      label: "Copiar caminho do binário",
-      icon: Copy,
-      onSelect: () => void copyToClipboard(tool.binary_path ?? "", onNotify, "Caminho do binário"),
-    },
-    tool.installed_version && {
-      label: "Copiar versão instalada",
-      icon: Copy,
-      onSelect: () => void copyToClipboard(tool.installed_version ?? "", onNotify, "Versão"),
-    },
-    { label: "Copiar build recomendada", icon: Copy, onSelect: () => void copyToClipboard(tool.recommended_build, onNotify, "Build") },
-  ];
-
   const paths: Array<{ label: string; value: string; icon: typeof Folder }> = workspace
     ? [
         { label: "Downloads (yt-dlp)", value: workspace.downloads_dir, icon: Download },
@@ -299,7 +184,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     : [];
 
   const activeJobsCount = jobs.filter((j) => j.status === "queued" || j.status === "running").length;
-  const toolsNeedAttention = tools.filter((t) => !t.installed || t.update_available).length;
 
   return (
     <div className="stack">
@@ -309,7 +193,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         onChange={onTabChange}
         items={[
           { id: "ai", label: "IA & Chaves", icon: Sparkles },
-          { id: "tools", label: "Ferramentas", icon: Wrench, count: toolsNeedAttention || undefined },
           { id: "system", label: "Sistema", icon: Cpu },
           { id: "integrations", label: "Integrações", icon: Bot },
           { id: "modules", label: "Módulos", icon: Blocks, count: modules.length || undefined },
@@ -389,180 +272,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </Field>
             </div>
           ) : (
-            <div className="stack">
-              <div className="row row-between wrap text-xs secondary">
-                <span className="row gap-xs">
-                  <Cpu size={13} className="text-accent" aria-hidden />
-                  {primaryGpu
-                    ? `${primaryGpu.name}${primaryGpu.vram_mb ? ` (${Math.round(primaryGpu.vram_mb / 1024)} GB VRAM)` : ""}`
-                    : "Modo CPU"}
-                  {hardware?.cuda_version ? ` · CUDA ${hardware.cuda_version}` : ""}
-                </span>
-                <span className="row gap-xs">
-                  <HardDrive size={13} aria-hidden /> {formatBytes(totalVisionBytes)} em disco
-                </span>
-              </div>
-
-              <Callout
-                tone={llamaTool?.installed ? "success" : "warning"}
-                title={`Motor llama.cpp server · ${llamaTool?.installed ? "pronto" : "não instalado"}`}
-                actions={
-                  <button
-                    type="button"
-                    className={`btn btn-sm ${llamaTool?.installed ? "" : "btn-primary"}`}
-                    disabled={installingLlama}
-                    onClick={() => void handleInstallLlama()}
-                  >
-                    <BusyIcon busy={installingLlama} icon={Download} size={13} />
-                    {llamaTool?.installed ? "Atualizar" : "Instalar auto"}
-                  </button>
-                }
-              >
-                {llamaTool?.recommended_build ?? "Detecta automaticamente CUDA / Vulkan / CPU"}
-              </Callout>
-
-              <div className="stack stack-sm">
-                {visionModels.map((m) => {
-                  const isActive = selectedLocalModel === m.id;
-                  return (
-                    <div key={m.id} className="inset stack stack-sm">
-                      <div className="row row-between wrap gap-xs">
-                        <div className="row wrap gap-xs">
-                          <span className="strong text-sm">{m.display_name}</span>
-                          {m.recommended && (
-                            <Badge tone="accent" icon={Award}>
-                              recomendado
-                            </Badge>
-                          )}
-                          <Badge>{m.quality_tier}</Badge>
-                        </div>
-                        <span className="muted text-xs">{(m.size_mb / 1024).toFixed(1)} GB</span>
-                      </div>
-                      <div className="secondary text-xs">{m.quality_notes}</div>
-                      <div className={`text-xs ${m.compatible ? "text-success" : "text-warning"}`}>{m.compatibility_reason}</div>
-                      <div className="row gap-xs">
-                        {m.installed ? (
-                          <>
-                            <button
-                              type="button"
-                              className={`btn btn-sm ${isActive ? "btn-primary" : ""}`}
-                              onClick={() => {
-                                setSelectedLocalModel(m.id);
-                                void handleSaveAiConfig("local_free", m.id);
-                              }}
-                            >
-                              {isActive ? <CircleCheck aria-hidden /> : <Play aria-hidden />}
-                              {isActive ? "Ativo" : "Usar este"}
-                            </button>
-                            <button
-                              type="button"
-                              className="btn btn-sm"
-                              disabled={uninstallingModel === m.id}
-                              onClick={() => void handleDeleteVisionModel(m.id)}
-                            >
-                              <BusyIcon busy={uninstallingModel === m.id} icon={Trash2} size={13} />
-                              Desinstalar
-                            </button>
-                          </>
-                        ) : (
-                          <button
-                            type="button"
-                            className="btn btn-primary btn-sm"
-                            disabled={downloadingModel !== null}
-                            onClick={() => void handleDownloadVisionModel(m.id)}
-                          >
-                            <BusyIcon busy={downloadingModel === m.id} icon={Download} size={13} />
-                            Baixar ({(m.size_mb / 1024).toFixed(1)} GB)
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
+            <Field label="Modelo visual instalado">
+              <select className="select" value={selectedLocalModel} onChange={e => {setSelectedLocalModel(e.target.value); void handleSaveAiConfig("local_free", e.target.value);}}>
+                <option value="">Automático</option>
+                {visionModels.filter(m => m.installed).map(m => <option key={m.id} value={m.id}>{m.display_name}</option>)}
+              </select>
+              <button className="btn btn-sm" onClick={() => onNavigate("downloads")}>Gerenciar downloads</button>
+            </Field>
           )}
-        </Panel>
-      )}
-
-      {/* TAB 2: FERRAMENTAS */}
-      {activeTab === "tools" && (
-        <Panel
-          title="Ferramentas gerenciadas"
-          icon={Wrench}
-          flush
-          actions={
-            <>
-              <button type="button" className="btn btn-sm" disabled={checking} onClick={handleCheckUpdates}>
-                <BusyIcon busy={checking} icon={RefreshCw} size={13} />
-                Verificar atualizações
-              </button>
-              <button type="button" className="btn btn-primary btn-sm" disabled={updatingAll} onClick={handleUpdateAll}>
-                <BusyIcon busy={updatingAll} icon={Download} size={13} />
-                Instalar / atualizar tudo
-              </button>
-            </>
-          }
-        >
-          <div className="table-wrap">
-            <table className="table tools-table">
-              <thead>
-                <tr>
-                  <th>ferramenta</th>
-                  <th className="col-fit">status</th>
-                  <th className="col-fit c-opt">módulo</th>
-                  <th>build ideal p/ seu pc</th>
-                  <th className="col-fit" aria-label="Ações" />
-                </tr>
-              </thead>
-              <tbody>
-                {tools.map((tool) => {
-                  const isBusy = busyTool === tool.id || updatingAll;
-                  return (
-                    <tr key={tool.id} onContextMenu={(e) => menu.open(e, toolMenu(tool))}>
-                      <td className="tool-cell">
-                        <div className="row gap-xs">
-                          <span className="strong">{tool.display_name}</span>
-                          {tool.managed_by_aicut && <Badge tone="info">gerenciado</Badge>}
-                        </div>
-                        <div className="secondary text-xs">{tool.description}</div>
-                        {tool.binary_path && <div className="muted text-xs break-all">{tool.binary_path}</div>}
-                      </td>
-                      <td className="col-fit">
-                        {tool.installed ? (
-                          <Badge tone={tool.update_available ? "warning" : "success"} icon={CircleCheck}>
-                            {tool.installed_version ? `v${tool.installed_version}` : "instalado"}
-                            {tool.update_available && tool.latest_version ? ` → ${tool.latest_version}` : ""}
-                          </Badge>
-                        ) : (
-                          <Badge tone="danger">não instalado</Badge>
-                        )}
-                      </td>
-                      <td className="col-fit muted c-opt">{tool.owner_module}</td>
-                      <td className="tool-build">
-                        <div className="text-sm">{tool.recommended_build}</div>
-                        <div className="muted text-xs">{tool.hardware_note}</div>
-                      </td>
-                      <td className="col-fit">
-                        <span className="row gap-xs">
-                          <button
-                            type="button"
-                            className={`btn btn-sm ${!tool.installed || tool.update_available ? "btn-primary" : ""}`}
-                            disabled={isBusy}
-                            onClick={() => handleInstallTool(tool.id, tool.display_name)}
-                          >
-                            <BusyIcon busy={isBusy} icon={Download} size={13} />
-                            {installLabel(tool)}
-                          </button>
-                          <MoreButton items={() => toolMenu(tool)} />
-                        </span>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
         </Panel>
       )}
 

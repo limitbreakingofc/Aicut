@@ -6,6 +6,7 @@ export type MediaKind = "video" | "video_only" | "audio" | "subtitle" | "timelin
 export type MediaSourceType = "download" | "local" | "generated";
 export type JobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 export type RouteId =
+  | "downloads"
   | "ingest"
   | "library"
   | "transcribe"

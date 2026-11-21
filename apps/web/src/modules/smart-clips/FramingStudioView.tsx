@@ -548,12 +548,12 @@ export const FramingStudioView: React.FC<FramingStudioViewProps> = ({
           tone="warning"
           title="FFmpeg necessário"
           actions={
-            <button type="button" className="btn btn-primary btn-sm" onClick={() => onNavigate("settings")}>
+            <button type="button" className="btn btn-primary btn-sm" onClick={() => onNavigate("downloads")}>
               Instalar em Ferramentas
             </button>
           }
         >
-          Instale o FFmpeg em Configurações → Ferramentas para carregar o preview do vídeo.
+          Instale o FFmpeg em Downloads → Ferramentas para carregar o preview do vídeo.
         </Callout>
       )}
 

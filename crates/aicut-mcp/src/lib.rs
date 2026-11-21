@@ -106,7 +106,7 @@ pub async fn handle_mcp_request(
                         "name": "aicut",
                         "version": env!("CARGO_PKG_VERSION")
                     },
-                    "instructions": "Aicut is a modular native Linux media & AI studio (Arch/CachyOS & NVIDIA CUDA/NVENC). You have full human-parity control over downloads (yt-dlp), local video/audio imports, the Media Library, transcription, Smart Clips, Motion Studio, background jobs, hardware/tool updates, and live desktop UI navigation."
+                    "instructions": "Aicut is a modular native Fedora Linux media & AI studio (NVIDIA CUDA/NVENC). You have full human-parity control over downloads (yt-dlp), local video/audio imports, the Media Library, transcription, Smart Clips, Motion Studio, background jobs, hardware/tool updates, and live desktop UI navigation."
                 }),
             )
         }

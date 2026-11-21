@@ -341,7 +341,7 @@ async fn openapi_handler(State(state): State<ServerState>) -> impl IntoResponse 
         "info": {
             "title": "Aicut Local AI & Media API",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "Modular native Linux media studio API (Arch/CachyOS & NVIDIA CUDA/NVENC) with full human-parity AI control over yt-dlp downloads, local video/audio imports, Library, Jobs, Tools/Hardware, and live UI."
+            "description": "Modular native Fedora Linux media studio API (NVIDIA CUDA/NVENC) with full human-parity AI control over yt-dlp downloads, local video/audio imports, Library, Jobs, Tools/Hardware, and live UI."
         },
         "servers": [{ "url": state.base_url }],
         "paths": paths

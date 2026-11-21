@@ -424,7 +424,7 @@ export const IngestView: React.FC<IngestViewProps> = ({ tools, jobs, onNavigate,
               tone="warning"
               title="Ferramentas recomendadas pendentes"
               actions={
-                <button type="button" className="btn btn-primary btn-sm" onClick={() => onNavigate("settings")}>
+                <button type="button" className="btn btn-primary btn-sm" onClick={() => onNavigate("downloads")}>
                   Instalar em Configurações
                 </button>
               }
