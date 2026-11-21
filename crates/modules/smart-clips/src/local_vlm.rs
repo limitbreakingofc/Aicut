@@ -12,13 +12,13 @@ use uuid::Uuid;
 
 use crate::engine::SETTING_LOCAL_VISION_MODEL;
 use crate::frames::{
-    extract_candidate_frames, extract_storyboard_sheets, format_transcript_window, plan_windows,
-    TimeWindow,
+    extract_candidate_frames, extract_storyboard_sheets, format_transcript_window,
+    has_usable_transcript, plan_windows, TimeWindow,
 };
 use crate::models::resolve_any_installed_vision_model;
 use crate::prompts::{
-    build_pass_a_prompt, build_pass_b_prompt, extract_json_object, CandidateWindow, PassAResponse,
-    PassBResponse, RawClipPlan,
+    build_pass_a_prompt, build_pass_b_prompt, build_transcript_pass_a_prompt, extract_json_object,
+    validate_pass_b_response, CandidateWindow, PassAResponse, PassBResponse, RawClipPlan,
 };
 
 /// RAII guard guaranteeing `llama-server` is always terminated and GPU VRAM is freed
@@ -400,104 +400,210 @@ pub async fn analyze_with_local_vlm(
         );
     }
 
-    // 10-minute windows with 3-minute overlap keep local context sharp & dense even on multi-hour lives
-    let windows = plan_windows(duration_sec, 600.0, 180.0);
-    if windows.is_empty() {
-        return Ok(Vec::new());
-    }
-
     let (pass_a_sheets, pass_a_tr_chars, pass_b_frames, pass_b_tr_chars) = if ctx_size >= 16_384 {
-        (3usize, 6_500usize, 6usize, 6_000usize)
+        (3usize, 14_000usize, 6usize, 6_000usize)
     } else if ctx_size >= 12_288 {
-        (3usize, 5_000usize, 6usize, 4_800usize)
+        (3usize, 10_000usize, 6usize, 4_800usize)
     } else {
-        (2usize, 3_800usize, 4usize, 3_600usize)
+        (2usize, 6_500usize, 4usize, 3_600usize)
     };
 
     let mut all_candidates: Vec<CandidateWindow> = Vec::new();
-    let total_windows = windows.len();
+    let use_transcript_fast_path = has_usable_transcript(transcript);
 
-    // ---- PASS A: Storyboard Visual Scan (3x3 Contact Sheets) ----
-    for (idx, win) in windows.iter().enumerate() {
-        if cancel.is_cancelled() {
-            return Err(AicutError::cancelled("Analise visual local cancelada."));
+    if use_transcript_fast_path {
+        // ---- STAGE 1 (FAST PATH): Transcript-First Candidate Discovery on GPU ----
+        let windows = plan_windows(duration_sec, 900.0, 180.0);
+        if windows.is_empty() {
+            return Ok(Vec::new());
         }
-        let pct = 18.0 + (idx as f64 / total_windows as f64) * 38.0;
-        kernel.jobs.update_progress(
+        let total_windows = windows.len();
+        kernel.jobs.append_log(
             job_id,
-            JobProgress {
-                percent: pct,
-                stage: "local_vlm_scan".into(),
-                message: Some(format!(
-                    "Passagem A ({}/{total_windows}): analisando storyboards visuais localmente...",
-                    idx + 1
-                )),
-                ..Default::default()
-            },
+            format!(
+                "Etapa 1 otimizada (Local GPU): mapeando cortes candidatos pela transcricao ({total_windows} bloco(s)) antes da validacao visual completa."
+            ),
         );
 
-        let sheet_dir = tmp_dir.join(format!("sheets_{idx}"));
-        let sheets = extract_storyboard_sheets(
-            ffmpeg_bin,
-            video_path,
-            win.start_sec,
-            win.duration_sec(),
-            &sheet_dir,
-            pass_a_sheets,
-        )
-        .await?;
+        for (idx, win) in windows.iter().enumerate() {
+            if cancel.is_cancelled() {
+                return Err(AicutError::cancelled("Analise local cancelada."));
+            }
+            let pct = 18.0 + (idx as f64 / total_windows as f64) * 22.0;
+            kernel.jobs.update_progress(
+                job_id,
+                JobProgress {
+                    percent: pct,
+                    stage: "transcript_discovery".into(),
+                    message: Some(format!(
+                        "Etapa 1 ({}/{total_windows}): identificando cortes pela transcricao ({})...",
+                        idx + 1,
+                        server.active_device
+                    )),
+                    ..Default::default()
+                },
+            );
 
-        let image_paths: Vec<PathBuf> = sheets.iter().map(|(_, _, p)| p.clone()).collect();
-        let excerpt =
-            format_transcript_window(transcript, win.start_sec, win.end_sec, pass_a_tr_chars);
-        let prompt = build_pass_a_prompt(
-            user_description,
-            win.start_sec,
-            win.end_sec,
-            max_clip_sec,
-            (max_clips + 2).min(6),
-            &excerpt,
-            true,
-        );
+            let excerpt =
+                format_transcript_window(transcript, win.start_sec, win.end_sec, pass_a_tr_chars);
+            let prompt = build_transcript_pass_a_prompt(
+                user_description,
+                win.start_sec,
+                win.end_sec,
+                max_clip_sec,
+                min_clip_sec,
+                (max_clips + 3).min(8),
+                &excerpt,
+            );
 
-        match chat_multimodal_json(http, &server.base_url, &image_paths, &prompt).await {
-            Ok(raw_text) => {
-                if let Some(json_str) = extract_json_object(&raw_text) {
-                    if let Ok(parsed) = serde_json::from_str::<PassAResponse>(json_str) {
-                        for mut cand in parsed.candidates {
-                            if win.start_sec > 30.0 && cand.end_sec <= win.duration_sec() + 10.0 {
-                                cand.start_sec += win.start_sec;
-                                cand.end_sec += win.start_sec;
+            match chat_multimodal_json_cancellable(http, &server.base_url, &[], &prompt, cancel)
+                .await
+            {
+                Ok(raw_text) => {
+                    if let Some(json_str) = extract_json_object(&raw_text) {
+                        if let Ok(parsed) = serde_json::from_str::<PassAResponse>(json_str) {
+                            for mut cand in parsed.candidates {
+                                if win.start_sec > 30.0
+                                    && cand.end_sec <= win.duration_sec() + 10.0
+                                {
+                                    cand.start_sec += win.start_sec;
+                                    cand.end_sec += win.start_sec;
+                                }
+                                all_candidates.push(cand);
                             }
-                            all_candidates.push(cand);
                         }
                     }
                 }
+                Err(err) => {
+                    if cancel.is_cancelled() {
+                        return Err(AicutError::cancelled("Analise local cancelada."));
+                    }
+                    kernel.jobs.append_log(
+                        job_id,
+                        format!(
+                            "Aviso na janela {}/{total_windows} ({:.0}s-{:.0}s): {} — continuando.",
+                            idx + 1,
+                            win.start_sec,
+                            win.end_sec,
+                            err.message
+                        ),
+                    );
+                    if total_windows == 1 {
+                        return Err(err);
+                    }
+                }
             }
-            Err(err) => {
-                kernel.jobs.append_log(
-                    job_id,
-                    format!(
-                        "Aviso na janela {}/{total_windows} ({:.0}s-{:.0}s): {} — continuando proximas janelas.",
-                        idx + 1,
-                        win.start_sec,
-                        win.end_sec,
-                        err.message
-                    ),
-                );
-                if total_windows == 1 {
-                    return Err(err);
+        }
+    } else {
+        // ---- FALLBACK STAGE 1 (No Transcript): Storyboard Visual Scan ----
+        let windows = plan_windows(duration_sec, 600.0, 180.0);
+        if windows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let total_windows = windows.len();
+        kernel.jobs.append_log(
+            job_id,
+            "Sem transcricao na Biblioteca: executando varredura por storyboards visuais (dica: transcreva o video antes para acelerar muito).",
+        );
+
+        for (idx, win) in windows.iter().enumerate() {
+            if cancel.is_cancelled() {
+                return Err(AicutError::cancelled("Analise visual local cancelada."));
+            }
+            let pct = 18.0 + (idx as f64 / total_windows as f64) * 32.0;
+            kernel.jobs.update_progress(
+                job_id,
+                JobProgress {
+                    percent: pct,
+                    stage: "local_vlm_scan".into(),
+                    message: Some(format!(
+                        "Etapa 1 ({}/{total_windows}): analisando storyboards visuais localmente...",
+                        idx + 1
+                    )),
+                    ..Default::default()
+                },
+            );
+
+            let sheet_dir = tmp_dir.join(format!("sheets_{idx}"));
+            let sheets = extract_storyboard_sheets(
+                ffmpeg_bin,
+                video_path,
+                win.start_sec,
+                win.duration_sec(),
+                &sheet_dir,
+                pass_a_sheets,
+            )
+            .await?;
+
+            let image_paths: Vec<PathBuf> = sheets.iter().map(|(_, _, p)| p.clone()).collect();
+            let excerpt =
+                format_transcript_window(transcript, win.start_sec, win.end_sec, pass_a_tr_chars);
+            let prompt = build_pass_a_prompt(
+                user_description,
+                win.start_sec,
+                win.end_sec,
+                max_clip_sec,
+                (max_clips + 2).min(6),
+                &excerpt,
+                true,
+            );
+
+            match chat_multimodal_json_cancellable(
+                http,
+                &server.base_url,
+                &image_paths,
+                &prompt,
+                cancel,
+            )
+            .await
+            {
+                Ok(raw_text) => {
+                    if let Some(json_str) = extract_json_object(&raw_text) {
+                        if let Ok(parsed) = serde_json::from_str::<PassAResponse>(json_str) {
+                            for mut cand in parsed.candidates {
+                                if win.start_sec > 30.0
+                                    && cand.end_sec <= win.duration_sec() + 10.0
+                                {
+                                    cand.start_sec += win.start_sec;
+                                    cand.end_sec += win.start_sec;
+                                }
+                                all_candidates.push(cand);
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    if cancel.is_cancelled() {
+                        return Err(AicutError::cancelled("Analise visual local cancelada."));
+                    }
+                    kernel.jobs.append_log(
+                        job_id,
+                        format!(
+                            "Aviso na janela {}/{total_windows} ({:.0}s-{:.0}s): {} — continuando proximas janelas.",
+                            idx + 1,
+                            win.start_sec,
+                            win.end_sec,
+                            err.message
+                        ),
+                    );
+                    if total_windows == 1 {
+                        return Err(err);
+                    }
                 }
             }
         }
     }
 
     if all_candidates.is_empty() {
+        kernel.jobs.append_log(
+            job_id,
+            "Etapa 1 concluida sem candidatos aderentes a descricao informada.",
+        );
         return Ok(Vec::new());
     }
 
     all_candidates.sort_by(|a, b| b.score.cmp(&a.score));
-    let refine_limit = (max_clips + 2).min(6);
+    let refine_limit = (max_clips + 3).min(8);
     let mut top_candidates: Vec<CandidateWindow> = Vec::new();
     for cand in all_candidates {
         let overlaps = top_candidates.iter().any(|p| {
@@ -513,33 +619,55 @@ pub async fn analyze_with_local_vlm(
         }
     }
 
-    // ---- PASS B: Frame-by-Frame Surgical Refinement ----
+    kernel.jobs.append_log(
+        job_id,
+        format!(
+            "Etapa 1 concluida: {} candidato(s) selecionado(s) para avaliacao visual completa (aprovar ou descartar).",
+            top_candidates.len()
+        ),
+    );
+
+    // ---- STAGE 2: Full Visual Quality Validation (Approve -> Generate, or Discard) ----
     let mut final_raw_clips: Vec<RawClipPlan> = Vec::new();
+    let mut discarded_count: usize = 0;
     let total_cands = top_candidates.len().max(1);
 
     for (idx, cand) in top_candidates.iter().enumerate() {
         if cancel.is_cancelled() {
-            return Err(AicutError::cancelled("Refinamento local cancelado."));
+            return Err(AicutError::cancelled("Validacao local cancelada."));
         }
-        let pct = 58.0 + (idx as f64 / total_cands as f64) * 32.0;
+        if final_raw_clips.len() >= max_clips {
+            kernel.jobs.append_log(
+                job_id,
+                format!(
+                    "Meta de {max_clips} corte(s) validado(s) atingida — encerrando validacao antecipadamente."
+                ),
+            );
+            break;
+        }
+        let pct = 45.0 + (idx as f64 / total_cands as f64) * 45.0;
         kernel.jobs.update_progress(
             job_id,
             JobProgress {
                 percent: pct,
                 stage: "local_vlm_director".into(),
                 message: Some(format!(
-                    "Passagem B ({}/{total_cands}): refinando corte coerente inicio-meio-fim...",
-                    idx + 1
+                    "Etapa 2 ({}/{total_cands}): avaliando qualidade visual completa de '{}'...",
+                    idx + 1,
+                    cand.title
                 )),
                 ..Default::default()
             },
         );
 
+        let pad_start = (cand.start_sec - 15.0).max(0.0);
+        let max_win_end = (pad_start + max_clip_sec + 45.0).min(duration_sec);
         let win = TimeWindow {
-            start_sec: (cand.start_sec - 15.0).max(0.0),
-            end_sec: (cand.end_sec + 15.0).min(duration_sec),
+            start_sec: pad_start,
+            end_sec: (cand.end_sec + 15.0).min(max_win_end).min(duration_sec),
         };
         if win.duration_sec() < 10.0 {
+            discarded_count += 1;
             continue;
         }
 
@@ -563,7 +691,7 @@ pub async fn analyze_with_local_vlm(
         let detailed_tr =
             format_transcript_window(transcript, win.start_sec, win.end_sec, pass_b_tr_chars);
         let hint = format!(
-            "Titulo sugerido: {} | Intervalo aproximado: {:.1}s-{:.1}s | Gancho: {} | Visual: {} | Tempos dos frames enviados: {}",
+            "Titulo sugerido: {} | Intervalo aproximado: {:.1}s-{:.1}s | Gancho: {} | Contexto: {} | Tempos dos frames enviados: {}",
             cand.title,
             cand.start_sec,
             cand.end_sec,
@@ -582,49 +710,119 @@ pub async fn analyze_with_local_vlm(
             &detailed_tr,
         );
 
-        if let Ok(raw_text) =
-            chat_multimodal_json(http, &server.base_url, &frame_paths, &prompt).await
+        match chat_multimodal_json_cancellable(
+            http,
+            &server.base_url,
+            &frame_paths,
+            &prompt,
+            cancel,
+        )
+        .await
         {
-            if let Some(json_str) = extract_json_object(&raw_text) {
-                if let Ok(parsed) = serde_json::from_str::<PassBResponse>(json_str) {
-                    for mut clip in parsed.clips {
-                        for seg in &mut clip.segments {
-                            if win.start_sec > 25.0 && seg.end_sec <= win.duration_sec() + 10.0 {
-                                seg.start_sec += win.start_sec;
-                                seg.end_sec += win.start_sec;
+            Ok(raw_text) => {
+                if let Some(json_str) = extract_json_object(&raw_text) {
+                    if let Ok(parsed) = serde_json::from_str::<PassBResponse>(json_str) {
+                        match validate_pass_b_response(&parsed) {
+                            Ok(clips) => {
+                                for mut clip in clips {
+                                    for seg in &mut clip.segments {
+                                        if win.start_sec > 25.0
+                                            && seg.end_sec <= win.duration_sec() + 10.0
+                                        {
+                                            seg.start_sec += win.start_sec;
+                                            seg.end_sec += win.start_sec;
+                                        }
+                                    }
+                                    kernel.jobs.append_log(
+                                        job_id,
+                                        format!(
+                                            "[APROVADO] Corte '{}' (aderencia={}, visual={}, arco={}, gancho={})",
+                                            clip.title,
+                                            clip.scores.match_description,
+                                            clip.scores.visual_interest,
+                                            clip.scores.narrative_coherence,
+                                            clip.scores.hook_strength,
+                                        ),
+                                    );
+                                    final_raw_clips.push(clip);
+                                }
+                            }
+                            Err(reason) => {
+                                discarded_count += 1;
+                                kernel.jobs.append_log(
+                                    job_id,
+                                    format!(
+                                        "[DESCARTADO] Candidato #{}: '{}' — {reason}",
+                                        idx + 1,
+                                        cand.title
+                                    ),
+                                );
                             }
                         }
-                        final_raw_clips.push(clip);
+                    } else {
+                        discarded_count += 1;
                     }
+                } else {
+                    discarded_count += 1;
                 }
+            }
+            Err(err) => {
+                if cancel.is_cancelled() {
+                    return Err(AicutError::cancelled("Validacao local cancelada."));
+                }
+                discarded_count += 1;
+                kernel.jobs.append_log(
+                    job_id,
+                    format!(
+                        "[DESCARTADO] Candidato #{}: '{}' — erro na validacao local: {}",
+                        idx + 1,
+                        cand.title,
+                        err.message
+                    ),
+                );
             }
         }
     }
+
+    kernel.jobs.append_log(
+        job_id,
+        format!(
+            "Validacao completa finalizada: {} corte(s) aprovado(s), {} descartado(s).",
+            final_raw_clips.len(),
+            discarded_count
+        ),
+    );
 
     // `server` drops here automatically -> kills llama-server and frees 100% of VRAM
     Ok(final_raw_clips)
 }
 
-async fn chat_multimodal_json(
+async fn chat_multimodal_json_cancellable(
     http: &reqwest::Client,
     base_url: &str,
     image_paths: &[PathBuf],
     prompt: &str,
+    cancel: &CancellationToken,
 ) -> AicutResult<String> {
+    if cancel.is_cancelled() {
+        return Err(AicutError::cancelled("Analise local cancelada."));
+    }
     let mut b64_images: Vec<String> = Vec::with_capacity(image_paths.len());
     for img_path in image_paths {
         let bytes = tokio::fs::read(img_path).await?;
         b64_images.push(base64::engine::general_purpose::STANDARD.encode(&bytes));
     }
-    chat_multimodal_b64_json(
-        http,
-        base_url,
-        &b64_images,
-        "Voce e um editor de video multimodal especialista em Shorts coerentes. Responda SEMPRE com JSON valido apenas.",
-        prompt,
-        1800,
-    )
-    .await
+    tokio::select! {
+        _ = cancel.cancelled() => Err(AicutError::cancelled("Analise local cancelada.")),
+        res = chat_multimodal_b64_json(
+            http,
+            base_url,
+            &b64_images,
+            "Voce e um editor de video multimodal especialista em Shorts coerentes. Responda SEMPRE com JSON valido apenas.",
+            prompt,
+            1800,
+        ) => res,
+    }
 }
 
 async fn chat_multimodal_b64_json(

@@ -78,7 +78,16 @@ pub async fn probe_duration_sec(ffprobe_bin: &Path, input_path: &Path) -> AicutR
         .ok_or_else(|| AicutError::internal("Could not parse valid duration from ffprobe output"))
 }
 
-/// Builds a lightweight MP4 proxy (low-res, low-fps, mono audio) for native multimodal upload to Gemini.
+/// Returns true when a transcript has enough timestamped content to drive Stage-1 discovery.
+pub fn has_usable_transcript(transcript: Option<&TranscriptRecord>) -> bool {
+    match transcript {
+        Some(tr) => tr.segments.len() >= 2 || tr.full_text.trim().len() >= 80,
+        None => false,
+    }
+}
+
+/// Builds a lightweight MP4 proxy (low-res, low-fps, mono audio) for native multimodal upload to Gemini,
+/// supporting immediate cancellation via `CancellationToken`.
 #[allow(clippy::too_many_arguments)]
 pub async fn build_video_proxy_chunk(
     ffmpeg_bin: &Path,
@@ -88,12 +97,16 @@ pub async fn build_video_proxy_chunk(
     target_height: u32,
     fps: f64,
     out_mp4: &Path,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> AicutResult<()> {
+    if cancel.is_cancelled() {
+        return Err(AicutError::cancelled("Geracao de proxy cancelada."));
+    }
     let vf = format!("fps={fps:.3},scale=-2:{target_height}:flags=fast_bilinear");
     let mut cmd = Command::new(ffmpeg_bin);
     configure_tokio_command(&mut cmd);
-    let out = cmd
-        .args(["-y", "-ss", &format!("{start_sec:.3}"), "-i"])
+    cmd.kill_on_drop(true)
+        .args(["-nostdin", "-y", "-ss", &format!("{start_sec:.3}"), "-i"])
         .arg(input_path)
         .args([
             "-t",
@@ -119,10 +132,17 @@ pub async fn build_video_proxy_chunk(
             "-movflags",
             "+faststart",
         ])
-        .arg(out_mp4)
-        .output()
-        .await
-        .map_err(|e| AicutError::internal(format!("Failed running FFmpeg proxy: {e}")))?;
+        .arg(out_mp4);
+
+    let out = tokio::select! {
+        _ = cancel.cancelled() => {
+            let _ = std::fs::remove_file(out_mp4);
+            return Err(AicutError::cancelled("Geracao de proxy cancelada."));
+        }
+        res = cmd.output() => {
+            res.map_err(|e| AicutError::internal(format!("Failed running FFmpeg proxy: {e}")))?
+        }
+    };
 
     if !out.status.success() || !out_mp4.is_file() {
         let stderr = String::from_utf8_lossy(&out.stderr);

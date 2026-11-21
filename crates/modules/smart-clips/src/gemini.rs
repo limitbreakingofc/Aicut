@@ -4,12 +4,15 @@ use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
 use crate::frames::{
-    build_video_proxy_chunk, format_transcript_window, plan_windows, TimeWindow,
+    build_video_proxy_chunk, format_transcript_window, has_usable_transcript, plan_windows,
+    TimeWindow,
 };
 use crate::prompts::{
-    build_pass_a_prompt, build_pass_b_prompt, extract_json_object, CandidateWindow, PassAResponse,
-    PassBResponse, RawClipPlan,
+    build_pass_a_prompt, build_pass_b_prompt, build_transcript_pass_a_prompt, extract_json_object,
+    validate_pass_b_response, CandidateWindow, PassAResponse, PassBResponse, RawClipPlan,
 };
+
+const GEMINI_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[derive(Debug, Clone)]
 pub struct GeminiConfig {
@@ -54,141 +57,260 @@ pub async fn analyze_with_gemini(
         ),
     );
 
-    // 25-minute windows with 3-minute overlap so 3-minute stories never get split across chunks
-    let windows = plan_windows(duration_sec, 1500.0, 180.0);
-    if windows.is_empty() {
-        return Ok(Vec::new());
-    }
-
     let mut all_candidates: Vec<CandidateWindow> = Vec::new();
-    let total_windows = windows.len();
+    let use_transcript_fast_path = has_usable_transcript(transcript);
 
-    // ---- PASS A: Native Video+Audio Discovery with Gemini Flash ----
-    for (idx, win) in windows.iter().enumerate() {
-        if cancel.is_cancelled() {
-            return Err(AicutError::cancelled("Analise Gemini cancelada."));
+    if use_transcript_fast_path {
+        // ---- STAGE 1 (FAST PATH): Transcript-First Candidate Discovery (zero full-video upload) ----
+        let windows = plan_windows(duration_sec, 1800.0, 180.0);
+        if windows.is_empty() {
+            return Ok(Vec::new());
         }
-        let pct_base = 15.0 + (idx as f64 / total_windows as f64) * 40.0;
-        kernel.jobs.update_progress(
+        let total_windows = windows.len();
+        kernel.jobs.append_log(
             job_id,
-            JobProgress {
-                percent: pct_base,
-                stage: "gemini_scan".into(),
-                message: Some(format!(
-                    "Passagem A ({}/{total_windows}): gerando proxy leve e assistindo via {scan_model}...",
-                    idx + 1,
-                )),
-                ..Default::default()
-            },
+            format!(
+                "Etapa 1 otimizada: mapeando cortes candidatos pela transcricao ({total_windows} bloco(s)) antes da validacao audiovisual completa."
+            ),
         );
 
-        let proxy_path = tmp_dir.join(format!("gemini_win_{idx}.mp4"));
-        // Use 360p 0.5fps for very long videos (>1h), 480p 1fps for normal videos
-        let (height, fps) = if duration_sec > 3600.0 {
-            (360, 0.5)
-        } else {
-            (480, 1.0)
-        };
-        build_video_proxy_chunk(
-            ffmpeg_bin,
-            video_path,
-            win.start_sec,
-            win.duration_sec(),
-            height,
-            fps,
-            &proxy_path,
-        )
-        .await?;
+        for (idx, win) in windows.iter().enumerate() {
+            if cancel.is_cancelled() {
+                return Err(AicutError::cancelled("Analise Gemini cancelada."));
+            }
+            let pct_base = 15.0 + (idx as f64 / total_windows as f64) * 20.0;
+            kernel.jobs.update_progress(
+                job_id,
+                JobProgress {
+                    percent: pct_base,
+                    stage: "transcript_discovery".into(),
+                    message: Some(format!(
+                        "Etapa 1 ({}/{total_windows}): identificando cortes pela transcricao com {scan_model}...",
+                        idx + 1,
+                    )),
+                    ..Default::default()
+                },
+            );
 
-        let uploaded = upload_video_to_gemini(
-            http,
-            &cfg.api_key,
-            &proxy_path,
-            &format!("aicut-win-{idx}.mp4"),
-            cancel,
-        )
-        .await?;
+            let excerpt = format_transcript_window(transcript, win.start_sec, win.end_sec, 48_000);
+            let prompt = build_transcript_pass_a_prompt(
+                user_description,
+                win.start_sec,
+                win.end_sec,
+                max_clip_sec,
+                min_clip_sec,
+                (max_clips + 4).min(12),
+                &excerpt,
+            );
 
-        let excerpt = format_transcript_window(transcript, win.start_sec, win.end_sec, 28_000);
-        let prompt = build_pass_a_prompt(
-            user_description,
-            win.start_sec,
-            win.end_sec,
-            max_clip_sec,
-            (max_clips + 3).min(10),
-            &excerpt,
-            false,
-        );
+            let raw_text = generate_text_only_with_fallback(
+                http,
+                &cfg.api_key,
+                &scan_model,
+                &ranked_models,
+                &prompt,
+                cancel,
+            )
+            .await?;
 
-        let gen_res = generate_with_video_file_with_fallback(
-            http,
-            &cfg.api_key,
-            &scan_model,
-            &ranked_models,
-            &uploaded.uri,
-            &prompt,
-        )
-        .await;
-
-        // Always clean up temporary file from Gemini Files API and disk
-        let _ = delete_gemini_file(http, &cfg.api_key, &uploaded.name).await;
-        let _ = std::fs::remove_file(&proxy_path);
-
-        let raw_text = gen_res?;
-        if let Some(json_str) = extract_json_object(&raw_text) {
-            if let Ok(parsed) = serde_json::from_str::<PassAResponse>(json_str) {
-                for mut cand in parsed.candidates {
-                    // Normalize relative timestamps if model returned window-relative times on chunk > 0
-                    if win.start_sec > 30.0 && cand.end_sec <= win.duration_sec() + 10.0 {
-                        cand.start_sec += win.start_sec;
-                        cand.end_sec += win.start_sec;
+            if let Some(json_str) = extract_json_object(&raw_text) {
+                if let Ok(parsed) = serde_json::from_str::<PassAResponse>(json_str) {
+                    for mut cand in parsed.candidates {
+                        if win.start_sec > 30.0 && cand.end_sec <= win.duration_sec() + 10.0 {
+                            cand.start_sec += win.start_sec;
+                            cand.end_sec += win.start_sec;
+                        }
+                        all_candidates.push(cand);
                     }
-                    all_candidates.push(cand);
+                }
+            }
+        }
+    } else {
+        // ---- FALLBACK STAGE 1 (No Transcript): Lightweight Visual Proxy Scan ----
+        let windows = plan_windows(duration_sec, 1200.0, 180.0);
+        if windows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let total_windows = windows.len();
+        kernel.jobs.append_log(
+            job_id,
+            "Sem transcricao na Biblioteca: executando varredura visual leve para descobrir candidatos (dica: transcreva o video antes para deixar este processo muito mais rapido).",
+        );
+
+        for (idx, win) in windows.iter().enumerate() {
+            if cancel.is_cancelled() {
+                return Err(AicutError::cancelled("Analise Gemini cancelada."));
+            }
+            let pct_base = 15.0 + (idx as f64 / total_windows as f64) * 25.0;
+            kernel.jobs.update_progress(
+                job_id,
+                JobProgress {
+                    percent: pct_base,
+                    stage: "gemini_scan".into(),
+                    message: Some(format!(
+                        "Etapa 1 ({}/{total_windows}): gerando proxy leve para varredura visual...",
+                        idx + 1,
+                    )),
+                    ..Default::default()
+                },
+            );
+
+            let proxy_path = tmp_dir.join(format!("gemini_win_{idx}.mp4"));
+            let (height, fps) = if duration_sec > 1800.0 {
+                (360, 0.5)
+            } else {
+                (480, 1.0)
+            };
+            build_video_proxy_chunk(
+                ffmpeg_bin,
+                video_path,
+                win.start_sec,
+                win.duration_sec(),
+                height,
+                fps,
+                &proxy_path,
+                cancel,
+            )
+            .await?;
+
+            kernel.jobs.update_progress(
+                job_id,
+                JobProgress {
+                    percent: pct_base + 8.0,
+                    stage: "gemini_scan".into(),
+                    message: Some(format!(
+                        "Etapa 1 ({}/{total_windows}): enviando proxy e analisando com {scan_model}...",
+                        idx + 1,
+                    )),
+                    ..Default::default()
+                },
+            );
+
+            let uploaded = upload_video_to_gemini(
+                http,
+                &cfg.api_key,
+                &proxy_path,
+                &format!("aicut-win-{idx}.mp4"),
+                cancel,
+            )
+            .await?;
+
+            let excerpt = format_transcript_window(transcript, win.start_sec, win.end_sec, 28_000);
+            let prompt = build_pass_a_prompt(
+                user_description,
+                win.start_sec,
+                win.end_sec,
+                max_clip_sec,
+                (max_clips + 3).min(10),
+                &excerpt,
+                false,
+            );
+
+            let gen_res = generate_with_video_file_with_fallback(
+                http,
+                &cfg.api_key,
+                &scan_model,
+                &ranked_models,
+                &uploaded.uri,
+                &prompt,
+                cancel,
+            )
+            .await;
+
+            let _ = delete_gemini_file(http, &cfg.api_key, &uploaded.name).await;
+            let _ = std::fs::remove_file(&proxy_path);
+
+            let raw_text = gen_res?;
+            if let Some(json_str) = extract_json_object(&raw_text) {
+                if let Ok(parsed) = serde_json::from_str::<PassAResponse>(json_str) {
+                    for mut cand in parsed.candidates {
+                        if win.start_sec > 30.0 && cand.end_sec <= win.duration_sec() + 10.0 {
+                            cand.start_sec += win.start_sec;
+                            cand.end_sec += win.start_sec;
+                        }
+                        all_candidates.push(cand);
+                    }
                 }
             }
         }
     }
 
     if all_candidates.is_empty() {
+        kernel.jobs.append_log(
+            job_id,
+            "Etapa 1 concluida sem candidatos aderentes a descricao informada.",
+        );
         return Ok(Vec::new());
     }
 
-    // Sort candidates by score descending and keep top (max_clips + 2) for surgical Pass B
+    // Sort candidates by score descending and pick distinct top candidates for full audiovisual QA
     all_candidates.sort_by(|a, b| b.score.cmp(&a.score));
-    let refine_limit = (max_clips + 2).min(8);
-    let top_candidates: Vec<CandidateWindow> = select_distinct_candidates(all_candidates, refine_limit);
+    let refine_limit = (max_clips + 3).min(10);
+    let top_candidates: Vec<CandidateWindow> =
+        select_distinct_candidates(all_candidates, refine_limit);
+    kernel.jobs.append_log(
+        job_id,
+        format!(
+            "Etapa 1 concluida: {} candidato(s) selecionado(s) para avaliacao completa de qualidade (video + audio).",
+            top_candidates.len()
+        ),
+    );
 
-    // ---- PASS B: High-Fidelity Shorts Director with Gemini Pro ----
+    // ---- STAGE 2: Full Audiovisual Quality Validation (Approve -> Generate, or Discard) ----
     let mut final_raw_clips: Vec<RawClipPlan> = Vec::new();
+    let mut discarded_count: usize = 0;
     let total_cands = top_candidates.len().max(1);
 
     for (idx, cand) in top_candidates.iter().enumerate() {
         if cancel.is_cancelled() {
-            return Err(AicutError::cancelled("Refinamento Gemini cancelado."));
+            return Err(AicutError::cancelled("Validacao Gemini cancelada."));
         }
-        let pct = 58.0 + (idx as f64 / total_cands as f64) * 32.0;
+        if final_raw_clips.len() >= max_clips {
+            kernel.jobs.append_log(
+                job_id,
+                format!(
+                    "Meta de {max_clips} corte(s) validado(s) atingida — encerrando validacao antecipadamente."
+                ),
+            );
+            break;
+        }
+
+        let pct = 40.0 + (idx as f64 / total_cands as f64) * 50.0;
+        let pad_start = (cand.start_sec - 15.0).max(0.0);
+        let max_win_end = (pad_start + max_clip_sec + 45.0).min(duration_sec);
+        let pad_end = (cand.end_sec + 15.0).min(max_win_end).min(duration_sec);
+        let win = TimeWindow {
+            start_sec: pad_start,
+            end_sec: pad_end,
+        };
+        if win.duration_sec() < 10.0 {
+            discarded_count += 1;
+            kernel.jobs.append_log(
+                job_id,
+                format!(
+                    "[DESCARTADO] Candidato #{}: '{}' — janela muito curta ({:.1}s).",
+                    idx + 1,
+                    cand.title,
+                    win.duration_sec()
+                ),
+            );
+            continue;
+        }
+
         kernel.jobs.update_progress(
             job_id,
             JobProgress {
                 percent: pct,
                 stage: "gemini_director".into(),
                 message: Some(format!(
-                    "Passagem B ({}/{total_cands}): refinando arco inicio-meio-fim com {director_model}...",
+                    "Etapa 2 ({}/{total_cands}): extraindo trecho ({:.0}s) de '{}' para analise completa...",
                     idx + 1,
+                    win.duration_sec(),
+                    cand.title,
                 )),
                 ..Default::default()
             },
         );
-
-        let pad_start = (cand.start_sec - 20.0).max(0.0);
-        let pad_end = (cand.end_sec + 20.0).min(duration_sec);
-        let win = TimeWindow {
-            start_sec: pad_start,
-            end_sec: pad_end,
-        };
-        if win.duration_sec() < 10.0 {
-            continue;
-        }
 
         let refine_proxy = tmp_dir.join(format!("gemini_refine_{idx}.mp4"));
         build_video_proxy_chunk(
@@ -196,11 +318,25 @@ pub async fn analyze_with_gemini(
             video_path,
             win.start_sec,
             win.duration_sec(),
-            720,
+            480,
             2.0,
             &refine_proxy,
+            cancel,
         )
         .await?;
+
+        kernel.jobs.update_progress(
+            job_id,
+            JobProgress {
+                percent: pct + (20.0 / total_cands as f64),
+                stage: "gemini_director".into(),
+                message: Some(format!(
+                    "Etapa 2 ({}/{total_cands}): avaliando qualidade completa (video+audio) com {director_model}...",
+                    idx + 1,
+                )),
+                ..Default::default()
+            },
+        );
 
         let uploaded = upload_video_to_gemini(
             http,
@@ -213,7 +349,7 @@ pub async fn analyze_with_gemini(
 
         let detailed_tr = format_transcript_window(transcript, win.start_sec, win.end_sec, 18_000);
         let hint = format!(
-            "Titulo sugerido: {} | Intervalo aproximado: {:.1}s-{:.1}s | Gancho: {} | Visual: {}",
+            "Titulo sugerido: {} | Intervalo aproximado: {:.1}s-{:.1}s | Gancho: {} | Contexto: {}",
             cand.title, cand.start_sec, cand.end_sec, cand.hook_reason, cand.visual_evidence
         );
         let prompt = build_pass_b_prompt(
@@ -234,28 +370,103 @@ pub async fn analyze_with_gemini(
             &ranked_models,
             &uploaded.uri,
             &prompt,
+            cancel,
         )
         .await;
 
         let _ = delete_gemini_file(http, &cfg.api_key, &uploaded.name).await;
         let _ = std::fs::remove_file(&refine_proxy);
 
-        if let Ok(raw_text) = gen_res {
-            if let Some(json_str) = extract_json_object(&raw_text) {
-                if let Ok(parsed) = serde_json::from_str::<PassBResponse>(json_str) {
-                    for mut clip in parsed.clips {
-                        for seg in &mut clip.segments {
-                            if win.start_sec > 25.0 && seg.end_sec <= win.duration_sec() + 10.0 {
-                                seg.start_sec += win.start_sec;
-                                seg.end_sec += win.start_sec;
+        match gen_res {
+            Ok(raw_text) => {
+                if let Some(json_str) = extract_json_object(&raw_text) {
+                    if let Ok(parsed) = serde_json::from_str::<PassBResponse>(json_str) {
+                        match validate_pass_b_response(&parsed) {
+                            Ok(clips) => {
+                                for mut clip in clips {
+                                    for seg in &mut clip.segments {
+                                        if win.start_sec > 25.0
+                                            && seg.end_sec <= win.duration_sec() + 10.0
+                                        {
+                                            seg.start_sec += win.start_sec;
+                                            seg.end_sec += win.start_sec;
+                                        }
+                                    }
+                                    kernel.jobs.append_log(
+                                        job_id,
+                                        format!(
+                                            "[APROVADO] Corte '{}' (aderencia={}, visual={}, arco={}, gancho={})",
+                                            clip.title,
+                                            clip.scores.match_description,
+                                            clip.scores.visual_interest,
+                                            clip.scores.narrative_coherence,
+                                            clip.scores.hook_strength,
+                                        ),
+                                    );
+                                    final_raw_clips.push(clip);
+                                }
+                            }
+                            Err(reason) => {
+                                discarded_count += 1;
+                                kernel.jobs.append_log(
+                                    job_id,
+                                    format!(
+                                        "[DESCARTADO] Candidato #{}: '{}' — {reason}",
+                                        idx + 1,
+                                        cand.title
+                                    ),
+                                );
                             }
                         }
-                        final_raw_clips.push(clip);
+                    } else {
+                        discarded_count += 1;
+                        kernel.jobs.append_log(
+                            job_id,
+                            format!(
+                                "[DESCARTADO] Candidato #{}: '{}' — resposta fora do formato esperado.",
+                                idx + 1,
+                                cand.title
+                            ),
+                        );
                     }
+                } else {
+                    discarded_count += 1;
+                    kernel.jobs.append_log(
+                        job_id,
+                        format!(
+                            "[DESCARTADO] Candidato #{}: '{}' — resposta sem JSON valido.",
+                            idx + 1,
+                            cand.title
+                        ),
+                    );
                 }
+            }
+            Err(err) => {
+                if cancel.is_cancelled() {
+                    return Err(AicutError::cancelled("Validacao Gemini cancelada."));
+                }
+                discarded_count += 1;
+                kernel.jobs.append_log(
+                    job_id,
+                    format!(
+                        "[DESCARTADO] Candidato #{}: '{}' — falha ao validar no Gemini: {}",
+                        idx + 1,
+                        cand.title,
+                        err.message
+                    ),
+                );
             }
         }
     }
+
+    kernel.jobs.append_log(
+        job_id,
+        format!(
+            "Validacao completa finalizada: {} corte(s) aprovado(s), {} descartado(s).",
+            final_raw_clips.len(),
+            discarded_count
+        ),
+    );
 
     Ok(final_raw_clips)
 }
@@ -288,6 +499,9 @@ async fn upload_video_to_gemini(
     display_name: &str,
     cancel: &CancellationToken,
 ) -> AicutResult<UploadedGeminiFile> {
+    if cancel.is_cancelled() {
+        return Err(AicutError::cancelled("Upload Gemini cancelado."));
+    }
     let bytes = tokio::fs::read(video_path).await?;
     let total_len = bytes.len();
 
@@ -295,8 +509,9 @@ async fn upload_video_to_gemini(
     let start_url = format!(
         "https://generativelanguage.googleapis.com/upload/v1beta/files?key={api_key}"
     );
-    let init_resp = http
+    let init_req = http
         .post(&start_url)
+        .timeout(GEMINI_HTTP_TIMEOUT)
         .header("X-Goog-Upload-Protocol", "resumable")
         .header("X-Goog-Upload-Command", "start")
         .header("X-Goog-Upload-Header-Content-Length", total_len.to_string())
@@ -304,9 +519,12 @@ async fn upload_video_to_gemini(
         .json(&serde_json::json!({
             "file": { "display_name": display_name }
         }))
-        .send()
-        .await
-        .map_err(|e| AicutError::internal(format!("Gemini upload init failed: {e}")))?;
+        .send();
+
+    let init_resp = tokio::select! {
+        _ = cancel.cancelled() => return Err(AicutError::cancelled("Upload Gemini cancelado.")),
+        r = init_req => r.map_err(|e| AicutError::internal(format!("Gemini upload init failed: {e}")))?,
+    };
 
     if !init_resp.status().is_success() {
         let status = init_resp.status();
@@ -325,15 +543,19 @@ async fn upload_video_to_gemini(
         .to_string();
 
     // Step 2: upload video payload
-    let fin_resp = http
+    let fin_req = http
         .post(&upload_url)
+        .timeout(GEMINI_HTTP_TIMEOUT)
         .header("Content-Length", total_len.to_string())
         .header("X-Goog-Upload-Offset", "0")
         .header("X-Goog-Upload-Command", "upload, finalize")
         .body(bytes)
-        .send()
-        .await
-        .map_err(|e| AicutError::internal(format!("Gemini upload payload failed: {e}")))?;
+        .send();
+
+    let fin_resp = tokio::select! {
+        _ = cancel.cancelled() => return Err(AicutError::cancelled("Upload Gemini cancelado.")),
+        r = fin_req => r.map_err(|e| AicutError::internal(format!("Gemini upload payload failed: {e}")))?,
+    };
 
     if !fin_resp.status().is_success() {
         let status = fin_resp.status();
@@ -363,12 +585,18 @@ async fn upload_video_to_gemini(
 
     // Step 3: poll until state == ACTIVE
     let poll_url = format!("https://generativelanguage.googleapis.com/v1beta/{name}?key={api_key}");
-    for _ in 0..90 {
+    for _ in 0..60 {
         if cancel.is_cancelled() {
             let _ = delete_gemini_file(http, api_key, &name).await;
             return Err(AicutError::cancelled("Upload Gemini cancelado."));
         }
-        let check = http.get(&poll_url).send().await;
+        let check = tokio::select! {
+            _ = cancel.cancelled() => {
+                let _ = delete_gemini_file(http, api_key, &name).await;
+                return Err(AicutError::cancelled("Upload Gemini cancelado."));
+            }
+            r = http.get(&poll_url).timeout(std::time::Duration::from_secs(20)).send() => r,
+        };
         if let Ok(resp) = check {
             if let Ok(j) = resp.json::<Value>().await {
                 let state = j.get("state").and_then(|v| v.as_str()).unwrap_or("");
@@ -382,12 +610,71 @@ async fn upload_video_to_gemini(
                 }
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                let _ = delete_gemini_file(http, api_key, &name).await;
+                return Err(AicutError::cancelled("Upload Gemini cancelado."));
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+        }
     }
 
+    let _ = delete_gemini_file(http, api_key, &name).await;
     Err(AicutError::internal(
         "Tempo esgotado aguardando Gemini processar o video proxy.",
     ))
+}
+
+async fn generate_text_only_with_fallback(
+    http: &reqwest::Client,
+    api_key: &str,
+    primary_model: &str,
+    ranked_models: &[String],
+    prompt: &str,
+    cancel: &CancellationToken,
+) -> AicutResult<String> {
+    let mut candidates: Vec<&str> = Vec::new();
+    if !primary_model.trim().is_empty() {
+        candidates.push(primary_model.trim());
+    }
+    for m in ranked_models {
+        if !candidates.contains(&m.as_str()) {
+            candidates.push(m.as_str());
+        }
+    }
+    let body = serde_json::json!({
+        "contents": [{
+            "role": "user",
+            "parts": [{ "text": prompt }]
+        }],
+        "generationConfig": {
+            "temperature": 0.25,
+            "responseMimeType": "application/json"
+        }
+    });
+    let mut last_err: Option<AicutError> = None;
+    for model in candidates {
+        if cancel.is_cancelled() {
+            return Err(AicutError::cancelled("Analise Gemini cancelada."));
+        }
+        match post_gemini_generate_content(http, api_key, model, &body, Some(cancel)).await {
+            Ok(txt) => return Ok(txt),
+            Err(e) => {
+                if cancel.is_cancelled() {
+                    return Err(AicutError::cancelled("Analise Gemini cancelada."));
+                }
+                let msg = e.message.to_lowercase();
+                if msg.contains("api_key_invalid")
+                    || msg.contains("http 401")
+                    || msg.contains("http 403")
+                {
+                    return Err(e);
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| AicutError::internal("Nenhum modelo Gemini disponível.")))
 }
 
 async fn generate_with_video_file_with_fallback(
@@ -397,6 +684,7 @@ async fn generate_with_video_file_with_fallback(
     ranked_models: &[String],
     file_uri: &str,
     prompt: &str,
+    cancel: &CancellationToken,
 ) -> AicutResult<String> {
     let mut candidates: Vec<&str> = Vec::new();
     if !primary_model.trim().is_empty() {
@@ -409,12 +697,20 @@ async fn generate_with_video_file_with_fallback(
     }
     let mut last_err: Option<AicutError> = None;
     for model in candidates {
-        match generate_with_video_file(http, api_key, model, file_uri, prompt).await {
+        if cancel.is_cancelled() {
+            return Err(AicutError::cancelled("Analise Gemini cancelada."));
+        }
+        match generate_with_video_file(http, api_key, model, file_uri, prompt, cancel).await {
             Ok(txt) => return Ok(txt),
             Err(e) => {
-                // Auth errors (400/401/403 API key invalid) shouldn't spin through every model
+                if cancel.is_cancelled() {
+                    return Err(AicutError::cancelled("Analise Gemini cancelada."));
+                }
                 let msg = e.message.to_lowercase();
-                if msg.contains("api_key_invalid") || msg.contains("http 401") || msg.contains("http 403") {
+                if msg.contains("api_key_invalid")
+                    || msg.contains("http 401")
+                    || msg.contains("http 403")
+                {
                     return Err(e);
                 }
                 last_err = Some(e);
@@ -430,6 +726,7 @@ async fn generate_with_video_file(
     model: &str,
     file_uri: &str,
     prompt: &str,
+    cancel: &CancellationToken,
 ) -> AicutResult<String> {
     let body = serde_json::json!({
         "contents": [{
@@ -450,20 +747,21 @@ async fn generate_with_video_file(
         }
     });
 
-    post_gemini_generate_content(http, api_key, model, &body).await
+    post_gemini_generate_content(http, api_key, model, &body, Some(cancel)).await
 }
 
 fn is_transient_gemini_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
 }
 
-/// Shared Gemini `:generateContent` caller with automatic retry/backoff on transient
-/// 503 ("high demand" / UNAVAILABLE), 429, and 5xx spikes + thinking-part filtering.
+/// Shared Gemini `:generateContent` caller with timeout, instant cancellation, automatic retry/backoff
+/// on transient 503 ("high demand" / UNAVAILABLE), 429, and 5xx spikes + thinking-part filtering.
 async fn post_gemini_generate_content(
     http: &reqwest::Client,
     api_key: &str,
     model: &str,
     body: &Value,
+    cancel: Option<&CancellationToken>,
 ) -> AicutResult<String> {
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
@@ -471,15 +769,34 @@ async fn post_gemini_generate_content(
     let backoffs_ms = [1_200u64, 3_000u64];
 
     for attempt in 0..=backoffs_ms.len() {
-        let resp = match http.post(&url).json(body).send().await {
+        if cancel.is_some_and(|c| c.is_cancelled()) {
+            return Err(AicutError::cancelled("Chamada Gemini cancelada."));
+        }
+        let req_fut = http.post(&url).timeout(GEMINI_HTTP_TIMEOUT).json(body).send();
+        let send_res = match cancel {
+            Some(c) => tokio::select! {
+                _ = c.cancelled() => return Err(AicutError::cancelled("Chamada Gemini cancelada.")),
+                r = req_fut => r,
+            },
+            None => req_fut.await,
+        };
+
+        let resp = match send_res {
             Ok(r) => r,
             Err(e) => {
                 if attempt < backoffs_ms.len() {
-                    tokio::time::sleep(std::time::Duration::from_millis(backoffs_ms[attempt])).await;
+                    let sleep = tokio::time::sleep(std::time::Duration::from_millis(backoffs_ms[attempt]));
+                    match cancel {
+                        Some(c) => tokio::select! {
+                            _ = c.cancelled() => return Err(AicutError::cancelled("Chamada Gemini cancelada.")),
+                            _ = sleep => {}
+                        },
+                        None => sleep.await,
+                    }
                     continue;
                 }
                 return Err(AicutError::internal(format!(
-                    "Gemini API ({model}) falha de rede: {e}"
+                    "Gemini API ({model}) falha de rede/timeout: {e}"
                 )));
             }
         };
@@ -496,7 +813,14 @@ async fn post_gemini_generate_content(
 
         let err_txt = resp.text().await.unwrap_or_default();
         if is_transient_gemini_status(status) && attempt < backoffs_ms.len() {
-            tokio::time::sleep(std::time::Duration::from_millis(backoffs_ms[attempt])).await;
+            let sleep = tokio::time::sleep(std::time::Duration::from_millis(backoffs_ms[attempt]));
+            match cancel {
+                Some(c) => tokio::select! {
+                    _ = c.cancelled() => return Err(AicutError::cancelled("Chamada Gemini cancelada.")),
+                    _ = sleep => {}
+                },
+                None => sleep.await,
+            }
             continue;
         }
 
@@ -514,7 +838,11 @@ async fn post_gemini_generate_content(
 
 async fn delete_gemini_file(http: &reqwest::Client, api_key: &str, name: &str) -> AicutResult<()> {
     let url = format!("https://generativelanguage.googleapis.com/v1beta/{name}?key={api_key}");
-    let _ = http.delete(&url).send().await;
+    let _ = http
+        .delete(&url)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await;
     Ok(())
 }
 
@@ -584,7 +912,7 @@ pub async fn generate_with_inline_image(
         }
     });
 
-    post_gemini_generate_content(http, api_key, model, &body).await
+    post_gemini_generate_content(http, api_key, model, &body, None).await
 }
 
 /// Sends a text prompt to an active Gemini model requesting strict JSON output.
@@ -606,7 +934,7 @@ pub async fn generate_json_text(
         }
     });
 
-    post_gemini_generate_content(http, api_key, model, &body).await
+    post_gemini_generate_content(http, api_key, model, &body, None).await
 }
 
 /// Queries the user's Gemini API key for currently available `generateContent` models so deprecated
@@ -765,7 +1093,12 @@ async fn fetch_available_gemini_models(http: &reqwest::Client, api_key: &str) ->
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100&key={api_key}"
     );
-    let Ok(resp) = http.get(&url).send().await else {
+    let Ok(resp) = http
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+    else {
         return Vec::new();
     };
     if !resp.status().is_success() {
@@ -802,6 +1135,7 @@ async fn fetch_available_gemini_models(http: &reqwest::Client, api_key: &str) ->
                 || lower.contains("image")
                 || lower.contains("robotics")
                 || lower.contains("computer-use")
+                || lower.contains("customtools")
                 || lower.contains("aqa")
             {
                 return None;
