@@ -82,17 +82,69 @@ pub async fn render_composition_to_library(
     let hf_fps = 15u32;
     let tmp_hf_dir = std::env::temp_dir().join(format!("aicut-hf-ovl-{short_id}"));
     let hf_overlay_pattern = if wants_hyperframes {
+        let chromium_bin = match kernel.tools.resolve_tool("chromium") {
+            Ok(p) => Some(p),
+            Err(_) => {
+                if let Some(jid) = job_id {
+                    kernel.jobs.update_progress(
+                        jid,
+                        JobProgress {
+                            percent: 12.0,
+                            stage: "installing_chromium".into(),
+                            message: Some(
+                                "Baixando Chrome Headless Shell (1x) para renderizar animações Motion..."
+                                    .into(),
+                            ),
+                            ..Default::default()
+                        },
+                    );
+                    kernel.jobs.append_log(
+                        jid,
+                        "Nenhum Chromium encontrado no sistema — baixando Chrome Headless Shell oficial automaticamente...",
+                    );
+                }
+                match kernel
+                    .tools
+                    .install_or_update("chromium", aicut_core::ActorKind::System)
+                    .await
+                {
+                    Ok(_) => kernel.tools.resolve_tool("chromium").ok(),
+                    Err(install_err) => {
+                        if let Some(jid) = job_id {
+                            kernel.jobs.append_log(
+                                jid,
+                                format!(
+                                    "Falha ao baixar Chrome Headless Shell automaticamente: {}",
+                                    install_err.message
+                                ),
+                            );
+                        }
+                        None
+                    }
+                }
+            }
+        };
+
         if let Some(jid) = job_id {
             kernel.jobs.append_log(
                 jid,
                 format!(
-                    "Capturando animações HyperFrames ({} FPS · {:.1}s) via Chromium headless...",
-                    hf_fps, normalized.duration_sec
+                    "Capturando animações HyperFrames ({} FPS · {:.1}s) via {}...",
+                    hf_fps,
+                    normalized.duration_sec,
+                    chromium_bin
+                        .as_deref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "Chromium headless".to_string())
                 ),
             );
         }
-        let capture_res =
-            capture_hyperframes_rgba_sequence(&normalized, hf_fps, &tmp_hf_dir, |done, total| {
+        let capture_res = capture_hyperframes_rgba_sequence(
+            &normalized,
+            hf_fps,
+            &tmp_hf_dir,
+            chromium_bin.as_deref(),
+            |done, total| {
                 if let Some(jid) = job_id {
                     let pct = 15.0 + (done as f64 / total.max(1) as f64) * 45.0;
                     kernel.jobs.update_progress(
@@ -107,8 +159,9 @@ pub async fn render_composition_to_library(
                         },
                     );
                 }
-            })
-            .await;
+            },
+        )
+        .await;
 
         match capture_res {
             Ok(count) if count > 0 => {
@@ -690,7 +743,14 @@ async fn run_ffmpeg_motion_render(
     }
 
     let hf_input_idx = if let Some((pattern_path, hf_fps)) = hf_overlay {
-        cmd.args(["-framerate", &hf_fps.to_string(), "-i"]).arg(pattern_path);
+        cmd.args([
+            "-thread_queue_size",
+            "64",
+            "-framerate",
+            &hf_fps.to_string(),
+            "-i",
+        ])
+        .arg(pattern_path);
         let idx = next_input_idx;
         next_input_idx += 1;
         let _ = next_input_idx;
@@ -731,6 +791,8 @@ async fn run_ffmpeg_motion_render(
         "aac",
         "-b:a",
         "160k",
+        "-ac",
+        "2",
         "-ar",
         "48000",
         "-movflags",

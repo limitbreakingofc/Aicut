@@ -135,6 +135,19 @@ impl AicutModule for MotionStudioModule {
         }
     }
 
+    fn declared_tools(&self) -> Vec<aicut_core::ToolDefinition> {
+        vec![aicut_core::ToolDefinition {
+            id: "chromium".to_string(),
+            display_name: "Chrome Headless Shell (Motion Studio)".to_string(),
+            description: "Motor Chromium headless oficial do Google (portátil) para renderizar animações HTML/CSS/SVG do Motion Studio com canal alfa RGBA.".to_string(),
+            owner_module: "motion-studio".to_string(),
+            category: "multimedia".to_string(),
+            binary_name: "chrome-headless-shell".to_string(),
+            version_args: vec!["--version".to_string()],
+            strategy: aicut_core::ToolInstallStrategy::ChromeHeadlessShellOfficial,
+        }]
+    }
+
     async fn health(&self, kernel: &Arc<AicutKernel>) -> ModuleHealth {
         if kernel.tools.resolve_tool("ffmpeg").is_ok() {
             ModuleHealth::healthy("Motion Studio pronto (Cenas Dinâmicas + Chat IA + NVENC)")

@@ -352,11 +352,16 @@ pub fn find_system_chromium() -> Option<PathBuf> {
     }
     for candidate in [
         "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
         "/usr/bin/google-chrome-stable",
         "/usr/bin/google-chrome",
         "/usr/bin/brave",
+        "/usr/bin/brave-browser",
         "/usr/bin/vivaldi-stable",
+        "/usr/bin/vivaldi",
+        "/usr/bin/microsoft-edge-stable",
         "/opt/google/chrome/chrome",
+        "/opt/brave.com/brave/brave",
         "/opt/brave-bin/brave",
     ] {
         let p = PathBuf::from(candidate);
@@ -377,23 +382,26 @@ impl Drop for ChildKillGuard {
 }
 
 /// Captures deterministic 1080x1920 transparent RGBA PNG frames (`hf_%05d.png`) from the
-/// HyperFrames HTML/CSS/SVG motion document using system Chromium/Chrome/Brave/Vivaldi via CDP.
-/// Returns a detailed error if no Chromium browser is installed or CDP fails so Motion renders
-/// NEVER silently drop animations.
+/// HyperFrames HTML/CSS/SVG motion document using Aicut-managed `chrome-headless-shell` or
+/// system Chromium/Chrome/Brave/Vivaldi via CDP.
 pub async fn capture_hyperframes_rgba_sequence<F>(
     comp: &AicutComposition,
     fps: u32,
     out_dir: &Path,
+    chromium_override: Option<&Path>,
     mut on_progress: F,
 ) -> AicutResult<usize>
 where
     F: FnMut(usize, usize),
 {
-    let Some(chromium_bin) = find_system_chromium() else {
-        return Err(AicutError::dependency_missing(
-            "chromium",
-            "Nenhum navegador Chromium/Chrome/Brave encontrado para renderizar as animações do Motion Studio. No Fedora, instale com sudo dnf install chromium.",
-        ));
+    let chromium_bin = match chromium_override.filter(|p| p.is_file()) {
+        Some(p) => p.to_path_buf(),
+        None => find_system_chromium().ok_or_else(|| {
+            AicutError::dependency_missing(
+                "chromium",
+                "Nenhum navegador Chromium/Chrome/Brave encontrado para renderizar as animações do Motion Studio. Instale 'Chrome Headless Shell (Motion Studio)' em Downloads -> Ferramentas.",
+            )
+        })?,
     };
 
     std::fs::create_dir_all(out_dir)?;
@@ -412,15 +420,21 @@ where
     let port = pick_free_port()?;
     let file_url = path_to_file_url(&html_path);
 
+    let is_headless_shell = chromium_bin
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.to_lowercase().contains("headless-shell"))
+        .unwrap_or(false);
+
     let mut cmd = Command::new(&chromium_bin);
     configure_tokio_command(&mut cmd);
+    if !is_headless_shell {
+        cmd.args(["--headless=new", "--ozone-platform=headless"]);
+    }
     cmd.args([
-        "--headless=new",
-        "--ozone-platform=headless",
         "--disable-gpu",
         "--no-sandbox",
         "--disable-dev-shm-usage",
-        "--disable-software-rasterizer",
         "--hide-scrollbars",
         "--mute-audio",
         "--disable-extensions",
@@ -428,7 +442,6 @@ where
         "--disable-background-timer-throttling",
         "--disable-renderer-backgrounding",
         "--remote-allow-origins=*",
-        "--default-background-color=00000000",
         &format!("--window-size={},{}", comp.width, comp.height),
         &format!("--remote-debugging-port={port}"),
         &format!("--user-data-dir={}", profile_dir.to_string_lossy()),
@@ -452,14 +465,15 @@ where
         tail.join(" | ")
     };
 
-    // Wait up to 12 seconds for CDP endpoint to come up
+    // Wait up to 15 seconds for CDP endpoint to come up (bypassing any system HTTP_PROXY for localhost)
     let http = reqwest::Client::builder()
+        .no_proxy()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .map_err(|e| AicutError::internal(format!("HTTP client init failed: {e}")))?;
     let list_url = format!("http://127.0.0.1:{port}/json/list");
     let mut ws_url: Option<String> = None;
-    for _ in 0..60 {
+    for _ in 0..75 {
         if let Ok(resp) = http.get(&list_url).send().await {
             if let Ok(targets) = resp.json::<Vec<Value>>().await {
                 if let Some(u) = targets
@@ -479,7 +493,7 @@ where
     let Some(ws_url) = ws_url else {
         let detail = read_stderr_tail();
         return Err(AicutError::internal(format!(
-            "Chromium CDP ({}) não respondeu na porta {port} dentro de 12s.{}",
+            "Chromium CDP ({}) não respondeu na porta {port} dentro de 15s.{}",
             chromium_bin.display(),
             if detail.is_empty() { String::new() } else { format!(" Detalhe: {detail}") }
         )));

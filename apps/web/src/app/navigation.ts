@@ -3,7 +3,7 @@ import type { RouteId } from "../lib/types";
 
 /** Single source of truth for app navigation: studio workspaces + Settings hub pinned at bottom. */
 
-export const APP_VERSION = "0.13.1";
+export const APP_VERSION = "0.13.2";
 
 export type PrimaryRouteId =
   | "downloads"

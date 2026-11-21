@@ -24,6 +24,8 @@ pub enum ToolInstallStrategy {
     WhisperCppOfficialRelease,
     /// Downloads the official ggml-org/llama.cpp Linux release matching GPU/CPU hardware (CUDA / Vulkan / CPU).
     LlamaCppOfficialRelease,
+    /// Downloads Google's official Chrome Headless Shell (`chrome-for-testing`) for deterministic Motion Studio rendering.
+    ChromeHeadlessShellOfficial,
     /// Companion binary provided alongside another managed tool (e.g. ffprobe inside ffmpeg bundle).
     CompanionOf(String),
     /// Placeholder for future module-provided tools.
@@ -87,6 +89,7 @@ pub enum ArchiveKind {
     WhisperTarGz,
     LlamaZip,
     LlamaTarGz,
+    ChromeHeadlessZip,
 }
 
 const RELEASE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
@@ -196,12 +199,63 @@ impl ToolManager {
         if in_llama_dir.is_file() {
             return Some((in_llama_dir, true));
         }
+        let in_chromium_dir = self.bin_dir.join("chromium").join(&managed_name);
+        if in_chromium_dir.is_file() {
+            return Some((in_chromium_dir, true));
+        }
         // Fallback for older whisper.cpp builds where the executable was named `main`
         if binary_name == "whisper-cli" {
             let legacy = self.bin_dir.join("whisper").join(platform_binary_name("main"));
             if legacy.is_file() {
                 return Some((legacy, true));
             }
+        }
+        if binary_name == "chrome-headless-shell" {
+            if let Ok(env_bin) = std::env::var("AICUT_CHROMIUM_BIN") {
+                let p = PathBuf::from(env_bin.trim());
+                if p.is_file() {
+                    return Some((p, false));
+                }
+            }
+            for bin in [
+                "chrome-headless-shell",
+                "chromium",
+                "chromium-browser",
+                "google-chrome-stable",
+                "google-chrome",
+                "brave-browser",
+                "brave",
+                "vivaldi-stable",
+                "vivaldi",
+                "microsoft-edge-stable",
+                "msedge",
+                "ungoogled-chromium",
+            ] {
+                if let Ok(path) = which::which(bin) {
+                    return Some((path, false));
+                }
+            }
+            for candidate in [
+                "/usr/bin/chromium",
+                "/usr/bin/chromium-browser",
+                "/usr/bin/google-chrome-stable",
+                "/usr/bin/google-chrome",
+                "/usr/bin/brave-browser",
+                "/usr/bin/brave",
+                "/usr/bin/vivaldi-stable",
+                "/usr/bin/microsoft-edge-stable",
+                "/opt/google/chrome/chrome",
+                "/opt/brave.com/brave/brave",
+                "/opt/brave-bin/brave",
+                "/opt/vivaldi/vivaldi",
+                "/opt/microsoft/msedge/msedge",
+            ] {
+                let p = PathBuf::from(candidate);
+                if p.is_file() {
+                    return Some((p, false));
+                }
+            }
+            return None;
         }
         if let Ok(path) = which::which(binary_name) {
             return Some((path, false));
@@ -326,6 +380,10 @@ impl ToolManager {
                     "Build oficial Linux x64 otimizada para CPU.".to_string(),
                 ),
             },
+            ToolInstallStrategy::ChromeHeadlessShellOfficial => (
+                "Chrome Headless Shell Linux x64 (Oficial Google)".to_string(),
+                "Motor Chromium headless leve e portátil para renderizar animações RGBA do Motion Studio sem depender de navegador do sistema.".to_string(),
+            ),
             ToolInstallStrategy::Custom { homepage } => (
                 format!("Hardware-matched ({tag})"),
                 format!("Gerenciado pelo módulo proprietário ({homepage})."),
@@ -453,6 +511,13 @@ impl ToolManager {
                         }
                     }
                 }
+                ToolInstallStrategy::ChromeHeadlessShellOfficial => {
+                    if let Ok(resolved) = self.resolve_chrome_headless_release().await {
+                        if let Ok(mut cache) = self.latest_cache.write() {
+                            cache.insert(def.id.clone(), resolved.version);
+                        }
+                    }
+                }
                 ToolInstallStrategy::CompanionOf(_) | ToolInstallStrategy::Custom { .. } => {}
             }
         }
@@ -474,6 +539,7 @@ impl ToolManager {
         let names: &[&str] = match tool_id {
             "whisper" => &["whisper", "whisper-cli"],
             "llama-server" => &["llama", "llama-server"],
+            "chromium" => &["chromium", "chrome-headless-shell"],
             "yt-dlp" => &["yt-dlp-bundle", "yt-dlp"],
             "ffmpeg" | "ffprobe" => &["ffmpeg-bundle", "ffmpeg", "ffprobe", ".ffmpeg-extract-tmp", ".ffmpeg.new", ".ffprobe.new"],
             _ => return Err(AicutError::invalid_input("Ferramenta desconhecida")),
@@ -481,7 +547,7 @@ impl ToolManager {
         for name in names {
             let path = self.bin_dir.join(name);
             match std::fs::symlink_metadata(&path) {
-                Ok(meta) if meta.is_dir() && matches!(*name, "whisper" | "llama" | "yt-dlp-bundle" | "ffmpeg-bundle" | ".ffmpeg-extract-tmp") => std::fs::remove_dir_all(path)?,
+                Ok(meta) if meta.is_dir() && matches!(*name, "whisper" | "llama" | "chromium" | "yt-dlp-bundle" | "ffmpeg-bundle" | ".ffmpeg-extract-tmp") => std::fs::remove_dir_all(path)?,
                 Ok(_) => std::fs::remove_file(path)?,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
                 Err(e) => return Err(e.into()),
@@ -531,6 +597,9 @@ impl ToolManager {
                 }
                 ToolInstallStrategy::LlamaCppOfficialRelease => {
                     self.resolve_llama_release().await?
+                }
+                ToolInstallStrategy::ChromeHeadlessShellOfficial => {
+                    self.resolve_chrome_headless_release().await?
                 }
                 ToolInstallStrategy::CompanionOf(_) => {
                     return Err(AicutError::internal("Companion tool resolution loop"));
@@ -589,6 +658,7 @@ impl ToolManager {
                 ArchiveKind::WhisperTarGz => { extract_whisper_from_targz(&tmp_path, &payload)?; "whisper" }
                 ArchiveKind::LlamaZip => { extract_llama_from_zip(&tmp_path, &payload)?; "llama" }
                 ArchiveKind::LlamaTarGz => { extract_llama_from_targz(&tmp_path, &payload)?; "llama" }
+                ArchiveKind::ChromeHeadlessZip => { extract_chrome_headless_from_zip(&tmp_path, &payload)?; "chromium" }
             };
             if let Some(url) = &resolved.companion_url {
                 let runtime = stage.path().join("cudart.tar.gz");
@@ -926,6 +996,10 @@ impl ToolManager {
     }
 
     pub async fn versions(&self, tool: &str) -> AicutResult<Vec<String>> {
+        if tool == "chromium" {
+            let resolved = self.resolve_chrome_headless_release().await?;
+            return Ok(vec![resolved.version]);
+        }
         let repo = Self::release_repo(tool)?;
         let mut out = Vec::new();
         if tool == "whisper"
@@ -961,6 +1035,17 @@ impl ToolManager {
             || tag == ".."
         {
             return Err(AicutError::invalid_input("Informe uma tag de release válida."));
+        }
+        if tool == "chromium" {
+            return Ok(ResolvedDownload {
+                url: format!(
+                    "https://storage.googleapis.com/chrome-for-testing-public/{tag}/linux64/chrome-headless-shell-linux64.zip"
+                ),
+                companion_url: None,
+                version: tag.to_string(),
+                build_label: format!("chrome-headless-shell-linux64 ({tag})"),
+                archive_kind: ArchiveKind::ChromeHeadlessZip,
+            });
         }
         if tool == "whisper"
             && self.hardware.platform_tag == "linux-x64"
@@ -1183,6 +1268,63 @@ impl ToolManager {
     /// Linux GPU/CPU binary archive (CUDA when runtime is present or bundled, Vulkan for out-of-the-box NVIDIA/AMD/Intel GPU, or CPU fallback).
     async fn resolve_llama_release(&self) -> AicutResult<ResolvedDownload> {
         self.resolve_latest_from_repo("llama-server", 10, None).await
+    }
+
+    /// Queries Google's official Chrome for Testing API for the latest Stable Linux x64
+    /// `chrome-headless-shell` standalone zip (used by Motion Studio for deterministic RGBA rendering).
+    async fn resolve_chrome_headless_release(&self) -> AicutResult<ResolvedDownload> {
+        let resp = self
+            .http
+            .get("https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json")
+            .send()
+            .await
+            .map_err(|e| {
+                AicutError::internal(format!(
+                    "Falha ao consultar versões do Chrome Headless Shell: {e}"
+                ))
+            })?;
+        if !resp.status().is_success() {
+            return Err(AicutError::internal(format!(
+                "Chrome for Testing API retornou HTTP {}",
+                resp.status().as_u16()
+            )));
+        }
+        let json: serde_json::Value = resp.json().await.map_err(|e| {
+            AicutError::internal(format!("Resposta inválida do Chrome for Testing: {e}"))
+        })?;
+        let stable = json
+            .get("channels")
+            .and_then(|c| c.get("Stable"))
+            .ok_or_else(|| AicutError::internal("Canal Stable não encontrado no Chrome for Testing"))?;
+        let version = stable
+            .get("version")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AicutError::internal("Versão Stable ausente no Chrome for Testing"))?
+            .to_string();
+        let url = stable
+            .get("downloads")
+            .and_then(|d| d.get("chrome-headless-shell"))
+            .and_then(|arr| arr.as_array())
+            .and_then(|arr| {
+                arr.iter().find_map(|item| {
+                    if item.get("platform").and_then(|p| p.as_str()) == Some("linux64") {
+                        item.get("url").and_then(|u| u.as_str()).map(str::to_owned)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .ok_or_else(|| {
+                AicutError::not_found("Download linux64 do chrome-headless-shell não encontrado.")
+            })?;
+
+        Ok(ResolvedDownload {
+            url,
+            companion_url: None,
+            version: version.clone(),
+            build_label: format!("chrome-headless-shell-linux64 ({version})"),
+            archive_kind: ArchiveKind::ChromeHeadlessZip,
+        })
     }
 
     async fn download_file(
@@ -1841,6 +1983,53 @@ fn extract_llama_from_targz(archive_path: &Path, llama_dir: &Path) -> AicutResul
                 replace_file(&tmp_out, &out_path)?;
                 make_executable(&out_path)?;
             }
+        }
+    }
+    Ok(())
+}
+
+/// Safely extracts Google's `chrome-headless-shell-linux64.zip` into `chromium_dir`,
+/// stripping the single top-level folder prefix and preserving subdirectories (`locales/`, etc.).
+fn extract_chrome_headless_from_zip(zip_path: &Path, chromium_dir: &Path) -> AicutResult<()> {
+    std::fs::create_dir_all(chromium_dir)?;
+    let file = std::fs::File::open(zip_path)?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| AicutError::internal(format!("Failed reading chrome-headless-shell zip: {e}")))?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| AicutError::internal(format!("Zip entry error: {e}")))?;
+        let Some(enclosed) = entry.enclosed_name().map(|p| p.to_path_buf()) else {
+            continue;
+        };
+        let mut comps = enclosed.components();
+        // Strip top-level folder (e.g. `chrome-headless-shell-linux64/`)
+        let _first = comps.next();
+        let rel: PathBuf = comps.collect();
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        let out_path = chromium_dir.join(&rel);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path)?;
+            continue;
+        }
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut out = std::fs::File::create(&out_path)?;
+        std::io::copy(&mut entry, &mut out)?;
+        out.flush()?;
+        let fname = out_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if fname == "chrome-headless-shell"
+            || fname == "chrome_crashpad_handler"
+            || fname.contains(".so")
+        {
+            make_executable(&out_path)?;
         }
     }
     Ok(())
