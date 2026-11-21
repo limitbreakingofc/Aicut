@@ -1221,6 +1221,13 @@ impl MediaRepository {
         }
     }
 
+    pub fn clear_selected_model(&self, key: &str, model_id: &str) -> AicutResult<()> {
+        let conn = self.conn.lock().map_err(|_| AicutError::internal("DB lock poisoned"))?;
+        conn.execute("DELETE FROM kv_settings WHERE key = ?1 AND value_json = ?2",
+            params![key, serde_json::to_string(model_id)?])?;
+        Ok(())
+    }
+
     pub fn set_setting(&self, key: &str, value: &Value) -> AicutResult<()> {
         let conn = self
             .conn

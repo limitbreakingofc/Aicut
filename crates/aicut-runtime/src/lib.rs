@@ -835,6 +835,7 @@ impl AicutModule for AudioMasterModule {
                             _ => (),
                         }
                     }
+                    aicut_core::workspace::remove_empty_category(&ctx.kernel.workspace.models_dir.join("audio"))?;
                     Ok((serde_json::json!({}), "RNNoise removido".into(), vec![]))
                 }),
             )),

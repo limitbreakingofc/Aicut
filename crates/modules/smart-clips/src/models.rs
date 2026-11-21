@@ -643,7 +643,9 @@ pub fn delete_vision_model(
         AicutError::not_found(format!("Unknown local vision model '{model_id}'"))
     })?;
     let dir = model_dir_for(kernel, model_id);
+    kernel.repo.clear_selected_model(crate::engine::SETTING_LOCAL_VISION_MODEL, model_id)?;
     if !dir.exists() {
+        aicut_core::workspace::remove_empty_category(&vision_models_dir(kernel))?;
         return Ok(VisionModelUninstallResult {
             model_id: model_id.to_string(),
             deleted: false,
@@ -668,6 +670,7 @@ pub fn delete_vision_model(
         }
     }
     std::fs::remove_dir_all(&dir)?;
+    aicut_core::workspace::remove_empty_category(&vision_models_dir(kernel))?;
 
     Ok(VisionModelUninstallResult {
         model_id: model_id.to_string(),

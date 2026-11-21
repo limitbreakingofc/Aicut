@@ -41,6 +41,15 @@ pub fn lock_downloads(root: &Path) -> AicutResult<std::fs::File> {
     Ok(directory)
 }
 
+/// Remove a category after its last managed item has gone.
+pub fn remove_empty_category(path: &Path) -> AicutResult<()> {
+    match std::fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub fn download_stage(root: &Path) -> AicutResult<tempfile::TempDir> {
     Ok(tempfile::Builder::new().prefix(".aicut-stage-").tempdir_in(root)?)
 }

@@ -31,11 +31,16 @@ export function DownloadsView({ jobs, tools, workspace, refreshTools }: Props) {
   }
   useEffect(() => { void reload().catch(e => setMessage(e.message)); }, []);
 
-  async function execute(action: string, input = {}) {
+  async function execute(action: string, input: Record<string, unknown> = {}) {
     setBusy(action);
     setMessage("");
     try {
       const result = await runAction(action, input);
+      if (action === "transcribe.model_delete") {
+        try {
+          if (localStorage.getItem("aicut_whisper_model") === input.model_id) localStorage.removeItem("aicut_whisper_model");
+        } catch { /* Storage may be disabled in the webview. */ }
+      }
       setMessage(result.summary);
     } catch (e) {
       setMessage((e as Error).message);

@@ -579,13 +579,18 @@ pub fn delete_model(kernel: &AicutKernel, model_id: &str) -> AicutResult<ModelUn
     let mut freed_bytes: u64 = 0;
     let mut removed_files = Vec::new();
     for path in candidates {
-        if path.is_file() {
-            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            std::fs::remove_file(&path)?;
-            freed_bytes += size;
-            removed_files.push(path.to_string_lossy().to_string());
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) => {
+                std::fs::remove_file(&path)?;
+                freed_bytes += meta.len();
+                removed_files.push(path.to_string_lossy().to_string());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e.into()),
         }
     }
+    kernel.repo.clear_selected_model("default_whisper_model", model_id)?;
+    aicut_core::workspace::remove_empty_category(&dir)?;
 
     Ok(ModelUninstallResult {
         model_id: spec.id,

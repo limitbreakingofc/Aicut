@@ -423,13 +423,13 @@ impl ToolManager {
             "whisper" => &["whisper", "whisper-cli"],
             "llama-server" => &["llama", "llama-server"],
             "yt-dlp" => &["yt-dlp-bundle", "yt-dlp"],
-            "ffmpeg" | "ffprobe" => &["ffmpeg-bundle", "ffmpeg", "ffprobe"],
+            "ffmpeg" | "ffprobe" => &["ffmpeg-bundle", "ffmpeg", "ffprobe", ".ffmpeg-extract-tmp", ".ffmpeg.new", ".ffprobe.new"],
             _ => return Err(AicutError::invalid_input("Ferramenta desconhecida")),
         };
         for name in names {
             let path = self.bin_dir.join(name);
             match std::fs::symlink_metadata(&path) {
-                Ok(meta) if meta.is_dir() && matches!(*name, "whisper" | "llama" | "yt-dlp-bundle" | "ffmpeg-bundle") => std::fs::remove_dir_all(path)?,
+                Ok(meta) if meta.is_dir() && matches!(*name, "whisper" | "llama" | "yt-dlp-bundle" | "ffmpeg-bundle" | ".ffmpeg-extract-tmp") => std::fs::remove_dir_all(path)?,
                 Ok(_) => std::fs::remove_file(path)?,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
                 Err(e) => return Err(e.into()),

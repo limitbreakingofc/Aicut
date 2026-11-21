@@ -273,6 +273,7 @@ impl AicutModule for SmartClipsModule {
                             if e.kind() != std::io::ErrorKind::NotFound { return Err(e.into()); }
                         }
                     }
+                    aicut_core::workspace::remove_empty_category(&ctx.kernel.workspace.models_dir.join("vision"))?;
                     Ok((false, "UltraFace removido".into(), vec![]))
                 }),
             )),
